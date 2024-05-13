@@ -18,6 +18,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -124,6 +125,30 @@ func realMain() error {
 	if version {
 		fmt.Printf("Build version: %s\n", startupVersion)
 		os.Exit(0)
+	}
+
+	etherLen = 1200;
+	/// XXX BREAK
+	daemon, err := net.ResolveUnixAddr("unixgram", "/var/hercules.sock")
+	fmt.Println(daemon, err)
+	local, err := net.ResolveUnixAddr("unixgram", "/var/herculesmon.sock")
+	fmt.Println(local, err)
+	os.Remove("/var/herculesmon.sock")
+	usock, err := net.ListenUnixgram("unixgram", local)
+	fmt.Println(usock, err)
+
+	for {
+		buf := make([]byte, 2000)
+		fmt.Println("read...")
+		n, a, err := usock.ReadFromUnix(buf)
+		fmt.Println(n, a, err)
+		if n > 0 {
+			replyPath, err := getReplyPathHeader(buf)
+			fmt.Println(replyPath, err)
+			// the interface index is handled C-internally
+			b := SerializePath(replyPath)
+			usock.WriteToUnix(b, a)
+		}
 	}
 
 	if err := configureLogger(flags.verbose); err != nil {
@@ -245,6 +270,7 @@ func configureLogger(verbosity string) error {
 
 // Assumes config to be strictly valid.
 func mainTx(config *HerculesSenderConfig) (err error) {
+	mainServerSend(config)
 	// since config is valid, there can be no errors here:
 	etherLen = config.MTU
 	localAddress, _ := snet.ParseUDPAddr(config.LocalAddress)
@@ -283,6 +309,7 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 
 // Assumes config to be strictly valid.
 func mainRx(config *HerculesReceiverConfig) error {
+	return mainServer(config)
 	// since config is valid, there can be no errors here:
 	etherLen = config.MTU
 	interfaces, _ := config.interfaces()
@@ -303,6 +330,63 @@ func mainRx(config *HerculesReceiverConfig) error {
 	printSummary(stats, aggregateStats)
 	<-done // wait for path stats to be flushed
 	herculesClose(session)
+	return nil
+}
+
+func mainServer(config *HerculesReceiverConfig) error {
+	// since config is valid, there can be no errors here:
+	etherLen = config.MTU
+	interfaces, _ := config.interfaces()
+	localAddr, _ := snet.ParseUDPAddr(config.LocalAddress)
+	server := herculesInitServer(interfaces, localAddr, config.Queue, config.MTU)
+
+	fmt.Println("mainServer(go)", etherLen, interfaces, localAddr)
+
+	// aggregateStats := aggregateStats{}
+	done := make(chan struct{}, 1)
+	// go statsDumper(session, false, config.DumpInterval, &aggregateStats, config.PerPathStatsFile, config.ExpectNumPaths, done, config.PCCBenchMarkDuration)
+	// go cleanupOnSignal(session)
+	herculesMain(server, config.OutputFile, config.getXDPMode(), config.NumThreads, config.ConfigureQueues, config.AcceptTimeout)
+	done <- struct{}{}
+	// printSummary(stats, aggregateStats)
+	<-done // wait for path stats to be flushed
+	// herculesClose(server)
+	return nil
+}
+func mainServerSend(config *HerculesSenderConfig) (err error) {
+	// since config is valid, there can be no errors here:
+	etherLen = config.MTU
+	localAddress, _ := snet.ParseUDPAddr(config.LocalAddress)
+	interfaces, _ := config.interfaces()
+	destinations := config.destinations()
+
+	pm, err := initNewPathManager(
+		interfaces,
+		destinations,
+		localAddress,
+		uint64(config.RateLimit)*uint64(config.MTU))
+	if err != nil {
+		return err
+	}
+
+	pm.choosePaths()
+	server := herculesInitServer(interfaces, localAddress, config.Queue, config.MTU)
+	pm.pushPathsServer(server)
+	if !pm.canSendToAllDests() {
+		return errors.New("some destinations are unreachable, abort")
+	}
+
+	// aggregateStats := aggregateStats{}
+	done := make(chan struct{}, 1)
+	// go statsDumper(session, true, config.DumpInterval, &aggregateStats, config.PerPathStatsFile, config.NumPathsPerDest*len(config.Destinations), done, config.PCCBenchMarkDuration)
+	// go cleanupOnSignal(session)
+	herculesMainServer(server, config.TransmitFile, config.FileOffset, config.FileLength,
+		destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode(),
+		config.NumThreads)
+	done <- struct{}{}
+	// printSummary(stats, aggregateStats)
+	<-done // wait for path stats to be flushed
+	// herculesClose(session)
 	return nil
 }
 

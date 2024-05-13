@@ -27,46 +27,53 @@ typedef __u8 u8;
 
 #ifndef NDEBUG
 #define debug_printf(fmt, ...) printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
+#define debug_quit(fmt, ...)                                                   \
+  do {                                                                         \
+    printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__,       \
+           ##__VA_ARGS__);                                                     \
+    exit_with_error(NULL, 1);                                                  \
+  } while (0);
 #else
 #define debug_printf(...) ;
+#define debug_quit(...) ;
 #endif
 
 #ifndef likely
 # define likely(x)              __builtin_expect(!!(x), 1)
 #endif
 
-inline u16 umin16(u16 a, u16 b)
+static inline u16 umin16(u16 a, u16 b)
 {
 	return (a < b) ? a : b;
 }
 
-inline u16 umax16(u16 a, u16 b)
+static inline u16 umax16(u16 a, u16 b)
 {
 	return (a > b) ? a : b;
 }
 
-inline u32 umin32(u32 a, u32 b)
+static inline u32 umin32(u32 a, u32 b)
 {
 	return (a < b) ? a : b;
 }
 
-inline u32 umax32(u32 a, u32 b)
+static inline u32 umax32(u32 a, u32 b)
 {
 	return (a > b) ? a : b;
 }
 
-inline u64 umin64(u64 a, u64 b)
+static inline u64 umin64(u64 a, u64 b)
 {
 	return (a < b) ? a : b;
 }
 
-inline u64 umax64(u64 a, u64 b)
+static inline u64 umax64(u64 a, u64 b)
 {
 	return (a > b) ? a : b;
 }
 
 
-inline u64 get_nsecs(void)
+static inline u64 get_nsecs(void)
 {
 	struct timespec ts;
 
@@ -74,7 +81,7 @@ inline u64 get_nsecs(void)
 	return ts.tv_sec * 1000000000UL + ts.tv_nsec;
 }
 
-inline void sleep_until(u64 ns)
+static inline void sleep_until(u64 ns)
 {
 	struct timespec req;
 	req.tv_sec = (time_t)(ns / 1000000000UL);
@@ -82,7 +89,7 @@ inline void sleep_until(u64 ns)
 	clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &req, NULL);
 }
 
-inline void sleep_nsecs(u64 ns)
+static inline void sleep_nsecs(u64 ns)
 {
 	// Use clock_nanosleep to avoid drift by repeated interrupts. See NOTES in man(2) nanosleep.
 	sleep_until(get_nsecs() + ns);

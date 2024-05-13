@@ -18,9 +18,11 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <linux/types.h>
+#include <stdint.h>
 
 #define MAX_NUM_SOCKETS 256
 #define HERCULES_MAX_HEADERLEN 256
+
 
 struct hercules_path_header {
 	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
@@ -41,6 +43,7 @@ struct hercules_path {
 	atomic_bool replaced;
 };
 
+
 // Connection information
 struct hercules_app_addr {
 	/** SCION IA. In network byte order. */
@@ -54,8 +57,9 @@ struct hercules_app_addr {
 typedef __u64 ia;
 
 
+struct hercules_server;
 struct hercules_session *hercules_init(int *ifindices, int num_ifaces, struct hercules_app_addr local_addr, int queue, int mtu);
-void hercules_close(struct hercules_session *session);
+void hercules_close(struct hercules_server *server);
 
 struct path_stats_path {
     __u64 total_packets;
@@ -104,8 +108,25 @@ hercules_tx(struct hercules_session *session, const char *filename, int offset, 
             const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests,
             const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode, int num_threads);
 
+struct receiver_state;
 // Initiate receiver, waiting for a transmitter to initiate the file transfer.
 struct hercules_stats hercules_rx(struct hercules_session *session, const char *filename, int xdp_mode,
                                   bool configure_queues, int accept_timeout, int num_threads, bool is_pcc_benchmark);
+
+
+struct rx_print_args{
+	struct hercules_session *session;
+	struct xsk_socket_info *xsk;
+	struct send_queue *rxq;
+};
+
+struct hercules_server *
+hercules_init_server(int *ifindices, int num_ifaces,
+                     const struct hercules_app_addr local_addr, int queue,
+                     int mtu);
+void hercules_main(struct hercules_server *server, int xdp_mode);
+void hercules_main_sender(struct hercules_server *server, int xdp_mode, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc);
+void print_rbudp_pkt(const char *pkt, bool recv);
+struct hercules_session *make_session(struct hercules_server *server);
 
 #endif // __HERCULES_H__

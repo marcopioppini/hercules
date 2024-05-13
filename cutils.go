@@ -14,7 +14,7 @@
 
 package main
 
-// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE
+// #cgo CFLAGS: -O1 -Wall -DDEBUG -D_GNU_SOURCE
 // #cgo LDFLAGS: ${SRCDIR}/bpf/src/libbpf.a -lm -lelf -pthread -lz
 // #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
 // #include "hercules.h"
@@ -38,6 +38,7 @@ import (
 	log "github.com/inconshreveable/log15"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/snet"
+	"github.com/scionproto/scion/pkg/snet/path"
 	"github.com/scionproto/scion/private/topology"
 	"github.com/vishvananda/netlink"
 )
@@ -57,6 +58,10 @@ type HerculesSession struct {
 	session *C.struct_hercules_session
 }
 
+type HerculesServer struct {
+	server *C.struct_hercules_server
+}
+
 type pathStats struct {
 	statsBuffer *C.struct_path_stats
 }
@@ -70,11 +75,25 @@ func herculesInit(interfaces []*net.Interface, local *snet.UDPAddr, queue int, M
 	for _, iface := range interfaces {
 		ifIndices = append(ifIndices, iface.Index)
 	}
-	ifacesC := toCIntArray(ifIndices)
+	fmt.Println("init: ifindices", ifIndices);
+	// ifacesC := toCIntArray(ifIndices)
 	herculesSession := &HerculesSession{
-		session: C.hercules_init(&ifacesC[0], C.int(len(interfaces)), toCAddr(local), C.int(queue), C.int(MTU)),
+		// session: C.hercules_init(&ifacesC[0], C.int(len(interfaces)), toCAddr(local), C.int(queue), C.int(MTU)),
 	}
 	return herculesSession
+}
+
+func herculesInitServer(interfaces []*net.Interface, local *snet.UDPAddr, queue int, MTU int) *HerculesServer {
+	var ifIndices []int
+	for _, iface := range interfaces {
+		ifIndices = append(ifIndices, iface.Index)
+	}
+	ifacesC := toCIntArray(ifIndices)
+	// fmt.Println("init: ifindices", ifIndices);
+	herculesServer := &HerculesServer{
+		server: C.hercules_init_server(&ifacesC[0], C.int(len(interfaces)), toCAddr(local), C.int(queue), C.int(MTU)),
+	}
+	return herculesServer
 }
 
 func herculesTx(session *HerculesSession, filename string, offset int, length int, destinations []*Destination,
@@ -102,6 +121,17 @@ func herculesTx(session *HerculesSession, filename string, offset int, length in
 		C.int(numThreads),
 	), nil)
 }
+func herculesMainServer(server *HerculesServer, filename string, offset int, length int, destinations []*Destination,
+	pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int, numThreads int) {
+	cFilename := C.CString(filename)
+	defer C.free(unsafe.Pointer(cFilename))
+
+	cDests := make([]C.struct_hercules_app_addr, len(destinations))
+	for d, dest := range destinations {
+		cDests[d] = toCAddr(dest.hostAddr)
+	}
+	C.hercules_main_sender(server.server, C.int(xdpMode), &cDests[0], &pm.cStruct.pathsPerDest[0], C.int(len(destinations)), &pm.cStruct.numPathsPerDst[0], pm.cStruct.maxNumPathsPerDst, C.int(maxRateLimit), C.bool(enablePCC))
+}
 
 func herculesRx(session *HerculesSession, filename string, xdpMode int, numThreads int, configureQueues bool, acceptTimeout int, isPCCBenchmark bool) herculesStats {
 	cFilename := C.CString(filename)
@@ -112,8 +142,13 @@ func herculesRx(session *HerculesSession, filename string, xdpMode int, numThrea
 	)
 }
 
+func herculesMain(server *HerculesServer, filename string, xdpMode int, numThreads int, configureQueues bool, acceptTimeout int) {
+	// XXX ignoring arguments
+	C.hercules_main(server.server, C.int(xdpMode))
+}
+
 func herculesClose(session *HerculesSession) {
-	C.hercules_close(session.session)
+	// C.hercules_close(session.session)
 }
 
 func makePerPathStatsBuffer(numPaths int) *pathStats {
@@ -228,6 +263,8 @@ func getReplyPathHeader(buf []byte) (*HerculesPathHeader, error) {
 		sourcePkt.Path = replyPath
 	}
 
+	sourcePkt.Path = path.Empty{}
+
 	udpPkt, ok := sourcePkt.Payload.(snet.UDPPayload)
 	if !ok {
 		return nil, errors.New("error decoding SCION/UDP")
@@ -295,6 +332,18 @@ func toCPath(iface *net.Interface, from *HerculesPathHeader, to *C.struct_hercul
 	to.enabled = C.atomic_bool(enabled)
 }
 
+func SerializePath(from *HerculesPathHeader) []byte {
+	out := make([]byte, 0, 1500);
+	fmt.Println(out)
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(from.Header)))
+	fmt.Println(out)
+	out = append(out, from.Header...)
+	fmt.Println(out)
+	out = binary.LittleEndian.AppendUint16(out, from.PartialChecksum)
+	fmt.Println(out)
+	return out;
+}
+
 func toCAddr(addr *snet.UDPAddr) C.struct_hercules_app_addr {
 	out := C.struct_hercules_app_addr{}
 	bufIA := toCIA(addr.IA)
@@ -305,6 +354,7 @@ func toCAddr(addr *snet.UDPAddr) C.struct_hercules_app_addr {
 	C.memcpy(unsafe.Pointer(&out.ia), unsafe.Pointer(&bufIA), C.sizeof_ia)
 	C.memcpy(unsafe.Pointer(&out.ip), unsafe.Pointer(&bufIP[0]), 4)
 	C.memcpy(unsafe.Pointer(&out.port), unsafe.Pointer(&bufPort[0]), 2)
+	fmt.Println(out)
 	return out
 }
 
@@ -557,6 +607,24 @@ func sendICMP(iface *net.Interface, srcIP net.IP, dstIP net.IP) (err error) {
 
 // TODO rewrite path pushing: prepare in Go buffers then have a single call where C fetches them
 func (pm *PathManager) pushPaths(session *HerculesSession) {
+	C.acquire_path_lock()
+	defer C.free_path_lock()
+	syncTime := time.Now()
+
+	// prepare and copy header to C
+	for d, dst := range pm.dsts {
+		if pm.syncTime.After(dst.modifyTime) {
+			continue
+		}
+
+		dst.pushPaths(d, d*pm.numPathSlotsPerDst)
+	}
+
+	pm.syncTime = syncTime
+	//C.push_hercules_tx_paths(herculesSession.session) not needed atm
+}
+
+func (pm *PathManager) pushPathsServer(server *HerculesServer) {
 	C.acquire_path_lock()
 	defer C.free_path_lock()
 	syncTime := time.Now()

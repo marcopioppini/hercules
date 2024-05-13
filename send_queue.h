@@ -28,7 +28,8 @@ struct send_queue_unit {
 	u32 chunk_idx[SEND_QUEUE_ENTRIES_PER_UNIT];
 	u8 rcvr[SEND_QUEUE_ENTRIES_PER_UNIT];
 	u8 paths[SEND_QUEUE_ENTRIES_PER_UNIT];
-	char a[CACHELINE_SIZE - SEND_QUEUE_ENTRIES_PER_UNIT * SEND_QUEUE_ENTRY_SIZE]; // force padding to 64 bytes
+	u32 ts;
+	char a[CACHELINE_SIZE - 6 - SEND_QUEUE_ENTRIES_PER_UNIT * SEND_QUEUE_ENTRY_SIZE]; // force padding to 64 bytes
 };
 
 // single producer, multi consumer queue

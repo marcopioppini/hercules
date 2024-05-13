@@ -2,6 +2,7 @@
 // Copyright(c) 2017 - 2018 Intel Corporation.
 // Copyright(c) 2019 ETH Zurich.
 
+#include <limits.h>
 #include <linux/bpf.h>
 #include <net/ethernet.h>
 #include <netinet/ip.h>
@@ -130,6 +131,17 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 		return XDP_PASS;
 	}
 	offset += sizeof(struct udphdr);
+
+	const __u32 *idx = (__u32 *)(data+offset);
+	if (idx + 1 > (__u32 *)data_end){
+		// bounds check for verifier
+		return XDP_PASS;
+	}
+	if (*idx == UINT_MAX){
+		// Pass control packets so they end up in the control socket
+		// instead of an XDP socket
+		return XDP_PASS;
+	}
 
 	// write the payload offset to the first word, so that the user space program can continue from there.
 	*(__u32 *)data = offset;

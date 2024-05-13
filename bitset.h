@@ -39,7 +39,7 @@ void bitset__create(struct bitset *s, u32 num);
 void bitset__destroy(struct bitset *s);
 
 // Returns true iff the bit at index i in bitmap is set
-inline bool bitset__check(struct bitset *s, u32 i)
+static inline bool bitset__check(struct bitset *s, u32 i)
 {
 	assert(i < s->num);
 	return (s->bitmap[i / HERCULES_BITSET_WORD_BITS]) & (1u << i % HERCULES_BITSET_WORD_BITS);
@@ -47,7 +47,7 @@ inline bool bitset__check(struct bitset *s, u32 i)
 
 // set bit at index i in bitmap.
 // Returns the previous state of the bit.
-inline bool bitset__set_mt_safe(struct bitset *s, u32 i)
+static inline bool bitset__set_mt_safe(struct bitset *s, u32 i)
 {
 	pthread_spin_lock(&s->lock);
 	libbpf_smp_rmb();
@@ -72,7 +72,7 @@ inline bool bitset__set_mt_safe(struct bitset *s, u32 i)
 
 // set bit at index i in bitmap.
 // This function is not thread-safe.
-inline bool bitset__set(struct bitset *s, u32 i)
+static inline bool bitset__set(struct bitset *s, u32 i)
 {
 	const bool prev = bitset__check(s, i);
 	s->bitmap[i / HERCULES_BITSET_WORD_BITS] |= (1 << i % HERCULES_BITSET_WORD_BITS);
@@ -88,7 +88,7 @@ inline bool bitset__set(struct bitset *s, u32 i)
 
 // unset bit at index i in bitmap.
 // Returns the previous state of the bit.
-inline bool bitset__unset(struct bitset *s, u32 i)
+static inline bool bitset__unset(struct bitset *s, u32 i)
 {
 	const bool prev = bitset__check(s, i);
 	s->bitmap[i / HERCULES_BITSET_WORD_BITS] &= ~(1u << i % HERCULES_BITSET_WORD_BITS);
@@ -100,7 +100,7 @@ inline bool bitset__unset(struct bitset *s, u32 i)
 
 // Reset the bitmap
 // Unsets all entries in bitmap and reset the number of elements in the set
-inline void bitset__reset(struct bitset *s)
+static inline void bitset__reset(struct bitset *s)
 {
 	// due to rounding, need to use the same formula as for allocation
 	memset(s->bitmap, 0,
@@ -111,7 +111,7 @@ inline void bitset__reset(struct bitset *s)
 // Find next entry in the set.
 // Returns lowest index i greater or equal than pos such that bit i is set, or
 // s->num if no such index exists.
-inline u32 bitset__scan(struct bitset *s, u32 pos)
+static inline u32 bitset__scan(struct bitset *s, u32 pos)
 {
 	// TODO: profile the entire application and rewrite this function to use bitscan ops
 	for(u32 i = pos; i < s->max_set; ++i) {
@@ -125,7 +125,7 @@ inline u32 bitset__scan(struct bitset *s, u32 pos)
 // Find next entry NOT in the set.
 // Returns lowest index i greater or equal than pos such that bit i is NOT set,
 // or s->num if no such index exists.
-inline u32 bitset__scan_neg(struct bitset *s, u32 pos)
+static inline u32 bitset__scan_neg(struct bitset *s, u32 pos)
 {
 	for(u32 i = pos; i < s->num; ++i) {
 		if(!bitset__check(s, i)) {
@@ -138,7 +138,7 @@ inline u32 bitset__scan_neg(struct bitset *s, u32 pos)
 // Find nth entry NOT in the set.
 // Returns nth lowest index i greater or equal than pos such that bit i is NOT set,
 // or s->num if no such index exists.
-inline u32 bitset__scan_neg_n(struct bitset *s, u32 pos, u32 n)
+static inline u32 bitset__scan_neg_n(struct bitset *s, u32 pos, u32 n)
 {
 	for(u32 i = pos; i < s->num; ++i) {
 		if(!bitset__check(s, i)) {

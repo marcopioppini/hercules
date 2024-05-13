@@ -14,11 +14,13 @@
 
 #include "send_queue.h"
 #include "hercules.h"
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
 void init_send_queue(struct send_queue *queue, u32 num_entries)
 {
+	assert(sizeof(struct send_queue_unit) == 64);
 	queue->units_base = (struct send_queue_unit *)calloc(num_entries + 1, sizeof(struct send_queue_unit));
 	// make sure units are aligned to cache lines
 	u32 offset = (size_t)queue->units_base % CACHELINE_SIZE;

@@ -16,6 +16,13 @@ hercules: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.
 		startupVersion=$$(git rev-parse --abbrev-ref HEAD)"-untagged-"$$(git describe --tags --dirty --always); \
 	docker exec hercules-builder go build -ldflags "-X main.startupVersion=$${startupVersion}"
 
+herculesC: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.o bpf_prgm/pass.o bpf/src/libbpf.a
+	@# update modification dates in assembly, so that the new version gets loaded
+	@sed -i -e "s/\(load bpf_prgm_pass\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/pass.c | head -c 32)/g" bpf_prgms.s
+	@sed -i -e "s/\(load bpf_prgm_redirect_userspace\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/redirect_userspace.c | head -c 32)/g" bpf_prgms.s
+	docker exec hercules-builder cc -g -O0 -std=gnu99 -o runHercules -DDEBUG -D_GNU_SOURCE *.c bpf_prgms.s -Lbpf/src -lbpf -lm -lelf -pthread -lz
+	docker exec hercules-builder sh -c "cd monitor; go build -o ../runMonitor ."
+
 bpf_prgm/%.ll: bpf_prgm/%.c builder
 	docker exec hercules-builder clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -O2 -emit-llvm -c -g -o $@ $<
 
