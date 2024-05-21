@@ -43,6 +43,7 @@ static inline int frame_queue__init(struct frame_queue *fq, u16 size)
 
 static inline u16 frame_queue__prod_reserve(struct frame_queue *fq, u16 num)
 {
+	debug_printf("Empty slots in fq %llu", fq->cons - fq->prod);
 	return umin16(atomic_load(&fq->cons) - fq->prod, num);
 }
 
@@ -54,10 +55,14 @@ static inline void frame_queue__prod_fill(struct frame_queue *fq, u16 offset, u6
 static inline void frame_queue__push(struct frame_queue *fq, u16 num)
 {
 	atomic_fetch_add(&fq->prod, num);
+	u64 now = atomic_load(&fq->prod) - atomic_load(&fq->cons) + fq->size;
+	debug_printf("Frames in fq after push %llu", now);
 }
 
 static inline u16 frame_queue__cons_reserve(struct frame_queue *fq, u16 num)
 {
+	/* debug_printf("Reserve prod %llu, cons %llu", fq->prod, fq->cons); */
+	debug_printf("Frames in fq %llu", fq->prod - fq->cons + fq->size);
 	return umin16(atomic_load(&fq->prod) - fq->cons + fq->size, num);
 }
 

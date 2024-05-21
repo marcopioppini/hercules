@@ -77,6 +77,8 @@ struct rbudp_initial_pkt {
 	__u64 timestamp;
 	__u8 path_index;
 	__u8 flags;
+	__u32 name_len;
+	__u8 name[];
 };
 
 #define HANDSHAKE_FLAG_SET_RETURN_PATH 0x1u
