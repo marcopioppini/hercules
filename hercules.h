@@ -23,6 +23,8 @@
 #define MAX_NUM_SOCKETS 256
 #define HERCULES_MAX_HEADERLEN 256
 
+#define HERCULES_MAX_PKTSIZE 9000
+
 
 struct hercules_path_header {
 	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
@@ -123,8 +125,8 @@ struct rx_print_args{
 struct hercules_server *
 hercules_init_server(int *ifindices, int num_ifaces,
                      const struct hercules_app_addr local_addr, int queue,
-                     int mtu);
-void hercules_main(struct hercules_server *server, int xdp_mode);
+                     int xdp_mode, int n_threads, bool configure_queues);
+void hercules_main(struct hercules_server *server);
 void hercules_main_sender(struct hercules_server *server, int xdp_mode, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc);
 void print_rbudp_pkt(const char *pkt, bool recv);
 struct hercules_session *make_session(struct hercules_server *server);

@@ -22,6 +22,8 @@ bool monitor_get_new_job(int sockfd, char *name);
 // TODO
 bool monitor_update_job(int sockfd, int job_id);
 
+int monitor_bind_daemon_socket();
+
 // Messages used for communication between the Hercules daemon and monitor
 // via unix socket. Queries are sent by the daemon, Replies by the monitor.
 #pragma pack(push)

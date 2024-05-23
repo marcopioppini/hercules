@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <unistd.h>
 
 bool monitor_get_reply_path(int sockfd, char *rx_sample_buf, int rx_sample_len,
                             struct hercules_path *path) {
@@ -96,4 +97,23 @@ bool monitor_get_new_job(int sockfd, char *name) {
   }
   strncpy(name, reply->filename, reply->filename_len);
   return true;
+}
+
+#define HERCULES_DAEMON_SOCKET_PATH "/var/hercules.sock"
+// Bind the socket for the daemon. The file is deleted if already present.
+// Returns the file descriptor if successful, 0 otherwise.
+int monitor_bind_daemon_socket(){
+  int usock = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (usock <= 0){
+    return 0;
+  }
+  struct sockaddr_un name;
+  name.sun_family = AF_UNIX;
+  strcpy(name.sun_path, HERCULES_DAEMON_SOCKET_PATH);
+  unlink(HERCULES_DAEMON_SOCKET_PATH);
+  int ret = bind(usock, &name, sizeof(name));
+  if (ret){
+    return 0;
+  }
+  return usock;
 }

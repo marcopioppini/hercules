@@ -4,6 +4,7 @@
 
 // Enable extra warnings; cannot be enabled in CFLAGS because cgo generates a
 // ton of warnings that can apparantly not be suppressed.
+#include <endian.h>
 #pragma GCC diagnostic warning "-Wextra"
 
 #include "hercules.h"
@@ -36,6 +37,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <float.h>
+#include <arpa/inet.h>
 #include "linux/bpf_util.h"
 
 #include "bpf/src/libbpf.h"
@@ -118,8 +120,9 @@ struct hercules_interface {
 
 struct hercules_config {
 	u32 xdp_flags;
+	int xdp_mode;
+	bool configure_queues;
 	struct hercules_app_addr local_addr;
-	int ether_size;
 };
 
 enum session_state {
@@ -148,11 +151,10 @@ struct hercules_session {
 
 struct hercules_server {
 	struct hercules_config config;
-	int control_sockfd;
-	int *ifindices;
-	struct hercules_app_addr local_addr;
+	int control_sockfd; // AF_PACKET socket used for control traffic
 	int queue;
-	int mtu;
+	int n_threads;
+	struct rx_p_args **worker_args;
 	struct hercules_session *session_tx; //Current TX session
 	u64 session_tx_counter;
 	struct hercules_session *session_rx; //Current RX session
@@ -163,10 +165,7 @@ struct hercules_server {
 	int max_paths;
 	int rate_limit;
 	bool enable_pcc;
-	int n_pending;
-	char pending[5][20];
-	struct xsk_umem_info *umem;
-	struct xsk_socket_info *xsk;
+	int *ifindices;
 	int num_ifaces;
 	struct hercules_interface ifaces[];
 };
@@ -333,7 +332,7 @@ static void __exit_with_error(struct hercules_server *server, int error, const c
 	exit(EXIT_FAILURE);
 }
 
-#define exit_with_error(session, error) __exit_with_error(session, error, __FILE__, __func__, __LINE__)
+#define exit_with_error(server, error) __exit_with_error(server, error, __FILE__, __func__, __LINE__)
 
 static void close_xsk(struct xsk_socket_info *xsk)
 {
@@ -736,18 +735,17 @@ static struct xsk_umem_info *xsk_configure_umem(struct hercules_server *server, 
 
 static struct xsk_umem_info *xsk_configure_umem_server(struct hercules_server *server, u32 ifidx, void *buffer, u64 size)
 {
-	debug_printf("xsk_configure_umem_server");
 	struct xsk_umem_info *umem;
 	int ret;
 
 	umem = calloc(1, sizeof(*umem));
 	if(!umem)
-		exit_with_error(NULL, errno);
+		exit_with_error(server, errno);
 
 	ret = xsk_umem__create(&umem->umem, buffer, size, &umem->fq, &umem->cq,
 	                       NULL);
 	if(ret)
-		exit_with_error(NULL, -ret);
+		exit_with_error(server, -ret);
 
 	umem->buffer = buffer;
 	umem->iface = &server->ifaces[ifidx];
@@ -755,7 +753,7 @@ static struct xsk_umem_info *xsk_configure_umem_server(struct hercules_server *s
 	// pushed in submit_initial_tx_frames() (assumption in pop_completion_ring() and handle_send_queue_unit())
 	ret = frame_queue__init(&umem->available_frames, XSK_RING_PROD__DEFAULT_NUM_DESCS);
 	if(ret)
-		exit_with_error(NULL, ret);
+		exit_with_error(server, ret);
 	pthread_spin_init(&umem->lock, 0);
 	return umem;
 }
@@ -778,6 +776,11 @@ static void kick_all_tx(struct hercules_server *server, struct hercules_interfac
 {
 	for(u32 s = 0; s < iface->num_sockets; s++) {
 		kick_tx(server, iface->xsks[s]);
+	}
+}
+static void kick_tx_server(struct hercules_server *server){
+	for (int i = 0; i < server->num_ifaces; i++){
+		kick_all_tx(server, &server->ifaces[i]);
 	}
 }
 
@@ -1378,11 +1381,10 @@ static bool tx_handle_cts(struct sender_state *tx_state, const char *cts, size_t
 /* } */
 
 static void
-tx_send_initial(struct hercules_server *server, const struct hercules_path *path, char *filename, size_t filesize, u32 chunklen,
-				unsigned long timestamp, u32 path_index, bool set_return_path)
+tx_send_initial(struct hercules_server *server, const struct hercules_path *path, char *filename, size_t filesize, u32 chunklen, unsigned long timestamp, u32 path_index, bool set_return_path)
 {
 	debug_printf("Sending initial");
-	char buf[server->config.ether_size];
+	char buf[HERCULES_MAX_PKTSIZE];
 	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
 
 	struct hercules_control_packet pld = {
@@ -1848,23 +1850,24 @@ static inline void allocate_tx_frames(struct hercules_server *server,
 }
 
 struct tx_send_p_args {
-	struct sender_state *tx_state;
+	struct hercules_server *server;
 	struct xsk_socket_info *xsks[];
 };
 
 static void tx_send_p(void *arg) {
-  struct hercules_server *server = arg;
+	struct tx_send_p_args *args = arg;
+  struct hercules_server *server = args->server;
   while (1) {
     struct hercules_session *session_tx = atomic_load(&server->session_tx);
     if (session_tx == NULL || atomic_load(&session_tx->state) != SESSION_STATE_RUNNING) {
       /* debug_printf("Invalid session, dropping sendq unit"); */
-	  kick_tx(server, &server->xsk[0]);
+	  kick_tx_server(server);
       continue;
     }
     struct send_queue_unit unit;
     int ret = send_queue_pop(session_tx->send_queue, &unit);
     if (!ret) {
-      kick_tx(server, &server->xsk[0]);
+      kick_tx_server(server);
       continue;
     }
 	u32 num_chunks_in_unit = 0;
@@ -1877,7 +1880,7 @@ static void tx_send_p(void *arg) {
 	debug_printf("unit has %d chunks", num_chunks_in_unit);
     u64 frame_addrs[server->num_ifaces][SEND_QUEUE_ENTRIES_PER_UNIT];
     memset(frame_addrs, 0xFF, sizeof(frame_addrs));
-	for (int i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++){
+	for (u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++){
 		if (i >= num_chunks_in_unit){
 			debug_printf("not using unit slot %d", i);
 			frame_addrs[0][i] = 0;
@@ -1887,10 +1890,10 @@ static void tx_send_p(void *arg) {
     allocate_tx_frames(server, frame_addrs);
 	debug_printf("done allocating frames");
 	// At this point we claimed 7 frames (as many as can fit in a sendq unit)
-    tx_handle_send_queue_unit(server, session_tx->tx_state, &server->xsk,
+    tx_handle_send_queue_unit(server, session_tx->tx_state, args->xsks,
                               frame_addrs, &unit);
 	/* assert(num_chunks_in_unit == 7); */
-	kick_tx(server, &server->xsk[0]);
+	kick_tx_server(server);
   }
 }
 
@@ -2328,7 +2331,7 @@ static void rx_send_rtt_ack(struct hercules_server *server, struct receiver_stat
 		return;
 	}
 
-	char buf[server->config.ether_size];
+	char buf[HERCULES_MAX_PKTSIZE];
 	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
 
 	struct hercules_control_packet control_pkt = {
@@ -2492,7 +2495,7 @@ static void rx_send_cts_ack(struct hercules_server *server, struct receiver_stat
 		return;
 	}
 
-	char buf[server->config.ether_size];
+	char buf[HERCULES_MAX_PKTSIZE];
 	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
 
 	struct hercules_control_packet control_pkt = {
@@ -2510,7 +2513,7 @@ static void rx_send_cts_ack(struct hercules_server *server, struct receiver_stat
 
 static void rx_send_ack_pkt(struct hercules_server *server, struct hercules_control_packet *control_pkt,
                             struct hercules_path *path) {
-	char buf[server->config.ether_size];
+	char buf[HERCULES_MAX_PKTSIZE];
 	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *)control_pkt,
@@ -2585,7 +2588,7 @@ static void rx_send_path_nacks(struct hercules_server *server, struct receiver_s
 		return;
 	}
 
-	char buf[server->config.ether_size];
+	char buf[HERCULES_MAX_PKTSIZE];
 	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
 
 	// XXX: could write ack payload directly to buf, but
@@ -2665,18 +2668,20 @@ static void rx_trickle_nacks(void *arg) {
 }
 
 struct rx_p_args {
-	struct receiver_state *rx_state;
+	struct hercules_server *server;
 	struct xsk_socket_info *xsks[];
 };
 
 static void *rx_p(void *arg) {
-  debug_printf("rx_p");
-  struct hercules_server *server = arg;
-  /* int num_ifaces = server->num_ifaces; */
+  struct rx_p_args *args = arg;
+  struct hercules_server *server = args->server;
+  int num_ifaces = server->num_ifaces;
+  u32 i = 0;
   while (1) {
-	struct hercules_session *session_rx = atomic_load(&server->session_rx);
+    struct hercules_session *session_rx = atomic_load(&server->session_rx);
     if (session_rx != NULL && session_rx->state == SESSION_STATE_RUNNING) {
-      rx_receive_batch(session_rx->rx_state, server->xsk);
+      rx_receive_batch(session_rx->rx_state, args->xsks[i % num_ifaces]);
+      i++;
     }
   }
   return NULL;
@@ -3061,7 +3066,7 @@ static void xsk_map__add_xsk(struct hercules_server *server, xskmap map, int ind
 /*
  * Load a BPF program redirecting IP traffic to the XSK.
  */
-static void load_xsk_redirect_userspace(struct hercules_server *server, int num_threads)
+static void load_xsk_redirect_userspace(struct hercules_server *server, struct rx_p_args *args[], int num_threads)
 {
 	debug_printf("Loading XDP program for redirection");
 	for(int i = 0; i < server->num_ifaces; i++) {
@@ -3077,7 +3082,7 @@ static void load_xsk_redirect_userspace(struct hercules_server *server, int num_
 			exit_with_error(server, -xsks_map_fd);
 		}
 		for(int s = 0; s < num_threads; s++) {
-			xsk_map__add_xsk(server, xsks_map_fd, s, server->xsk);
+			xsk_map__add_xsk(server, xsks_map_fd, s, args[s]->xsks[i]);
 		}
 
 		// push XSKs meta
@@ -3185,47 +3190,49 @@ static void *tx_p(void *arg) {
 /* 	return session; */
 /* } */
 
-struct hercules_server *hercules_init_server(int *ifindices, int num_ifaces, const struct hercules_app_addr local_addr, int queue, int mtu){
-	debug_printf("init_server, %d interfaces, queue %d, mtu %d", num_ifaces, queue, mtu);
-	struct hercules_server *server;
-	server = calloc(1, sizeof(*server) + num_ifaces * sizeof(*server->ifaces));
-	if (server == NULL){
-		debug_quit("init calloc");
-	}
-	printf("local %llx %x %x\n", local_addr.ia, local_addr.ip, local_addr.port);
-	server->ifindices = ifindices;
-	server->num_ifaces = num_ifaces;
-	server->local_addr = local_addr;
-	server->queue = queue;
-	server->mtu = mtu;
-	server->session_rx = NULL;
-	server->session_tx = NULL;
-	server->session_tx_counter = 0;
+struct hercules_server *
+hercules_init_server(int *ifindices, int num_ifaces,
+                     const struct hercules_app_addr local_addr, int queue,
+                     int xdp_mode, int n_threads, bool configure_queues) {
+  struct hercules_server *server;
+  server = calloc(1, sizeof(*server) + num_ifaces * sizeof(*server->ifaces));
+  if (server == NULL) {
+    exit_with_error(NULL, ENOMEM);
+  }
+  debug_printf("local address %llx %x %x", local_addr.ia, local_addr.ip,
+               local_addr.port);
+  server->ifindices = ifindices;
+  server->num_ifaces = num_ifaces;
+  server->queue = queue;
+  server->n_threads = n_threads;
+  server->session_rx = NULL;
+  server->session_tx = NULL;
+  server->session_tx_counter = 0;
+  server->worker_args = calloc(server->n_threads, sizeof(struct rx_p_args *));
+  server->config.local_addr = local_addr;
+  server->config.configure_queues = configure_queues;
 
-	for(int i = 0; i < num_ifaces; i++) {
-		debug_printf("iter %d", i);
-		server->ifaces[i] = (struct hercules_interface) {
-				.queue = queue,
-				.ifid = ifindices[i],
-				.ethtool_rule = -1,
-		};
-		if_indextoname(ifindices[i], server->ifaces[i].ifname);
-		debug_printf("using queue %d on interface %s", server->ifaces[i].queue, server->ifaces[i].ifname);
-	}
+  for (int i = 0; i < num_ifaces; i++) {
+    server->ifaces[i] = (struct hercules_interface){
+        .queue = queue,
+        .ifid = ifindices[i],
+        .ethtool_rule = -1,
+    };
+    if_indextoname(ifindices[i], server->ifaces[i].ifname);
+    debug_printf("using queue %d on interface %s", server->ifaces[i].queue,
+                 server->ifaces[i].ifname);
+  }
 
-	pthread_spin_init(&usock_lock, PTHREAD_PROCESS_PRIVATE);
+  pthread_spin_init(&usock_lock, PTHREAD_PROCESS_PRIVATE);
 
-	server->config.ether_size = mtu;
-	server->config.local_addr = local_addr;
   server->control_sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
-  assert(server->control_sockfd != -1);
+  if (server->control_sockfd == -1) {
+    exit_with_error(server, 0);
+  }
 
-	debug_printf("init complete");
-	return server;
+  debug_printf("init complete");
+  return server;
 }
-
-
-
 
 struct path_stats *make_path_stats_buffer(int num_paths) {
     struct path_stats *path_stats = calloc(1, sizeof(*path_stats) + num_paths * sizeof(path_stats->paths[0]));
@@ -3634,61 +3641,89 @@ static void socket_handler(void *arg) {
   }
 }
 
-static void xdp_setup(struct hercules_server *server, int xdp_mode){
-  // Prepare UMEM for XSK socket
-  void *umem_buf;
-  int ret = posix_memalign(&umem_buf, getpagesize(),
-                           NUM_FRAMES * XSK_UMEM__DEFAULT_FRAME_SIZE);
-  if (ret) {
-    debug_quit("Allocating umem buffer");
-  }
-  debug_printf("Allocated umem buffer");
-  struct xsk_umem_info *umem = xsk_configure_umem_server(
-      server, 0, umem_buf, NUM_FRAMES * XSK_UMEM__DEFAULT_FRAME_SIZE);
-  debug_printf("Configured umem");
-  server->ifaces[0].xsks = calloc(1, sizeof(*server->ifaces[0].xsks));
-  server->ifaces[0].umem = umem;
-  submit_initial_tx_frames(NULL, umem);
-  submit_initial_rx_frames(NULL, umem);
-  debug_printf("umem created");
-  debug_printf("umem interface %d %s, queue %d", umem->iface->ifid,
-               umem->iface->ifname, umem->iface->queue);
+static void xdp_setup(struct hercules_server *server) {
+  for (int i = 0; i < server->num_ifaces; i++) {
+    debug_printf("Preparing interface %d", i);
+    // Prepare UMEM for XSK sockets
+    void *umem_buf;
+    int ret = posix_memalign(&umem_buf, getpagesize(),
+                             NUM_FRAMES * XSK_UMEM__DEFAULT_FRAME_SIZE);
+    if (ret) {
+      exit_with_error(server, ENOMEM);
+    }
+    debug_printf("Allocated umem buffer");
 
-  // Create XSK socket
-  struct xsk_socket_info *xsk;
-  xsk = calloc(1, sizeof(*xsk));
-  if (!xsk) {
-    debug_quit("xsk calloc");
-  }
-  xsk->umem = umem;
+    struct xsk_umem_info *umem = xsk_configure_umem_server(
+        server, i, umem_buf, NUM_FRAMES * XSK_UMEM__DEFAULT_FRAME_SIZE);
+    debug_printf("Configured umem");
 
-  assert(server->ifaces[0].ifid == umem->iface->ifid);
-  struct xsk_socket_config cfg;
-  cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
-  cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
-  cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
-  cfg.xdp_flags = server->config.xdp_flags;
-  cfg.bind_flags = xdp_mode;
-  ret = xsk_socket__create_shared(&xsk->xsk, "ens5f0", 0, umem->umem, &xsk->rx,
-                                  &xsk->tx, &umem->fq, &umem->cq, &cfg);
-  if (ret) {
-    debug_quit("xsk socket create");
+    server->ifaces[i].xsks =
+        calloc(server->n_threads, sizeof(*server->ifaces[i].xsks));
+    server->ifaces[i].umem = umem;
+    submit_initial_tx_frames(server, umem);
+    submit_initial_rx_frames(server, umem);
+    debug_printf("umem interface %d %s, queue %d", umem->iface->ifid,
+                 umem->iface->ifname, umem->iface->queue);
+    if (server->ifaces[i].ifid != umem->iface->ifid) {
+      debug_printf(
+          "cannot configure XSK on interface %d with queue on interface %d",
+          server->ifaces[i].ifid, umem->iface->ifid);
+      exit_with_error(server, EINVAL);
+    }
+
+    // Create XSK sockets
+    for (int t = 0; t < server->n_threads; t++) {
+      struct xsk_socket_info *xsk;
+      xsk = calloc(1, sizeof(*xsk));
+      if (!xsk) {
+        exit_with_error(server, ENOMEM);
+      }
+      xsk->umem = umem;
+
+      struct xsk_socket_config cfg;
+      cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
+      cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+      cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+      cfg.xdp_flags = server->config.xdp_flags;
+      cfg.bind_flags = server->config.xdp_mode;
+      ret = xsk_socket__create_shared(&xsk->xsk, server->ifaces[i].ifname,
+                                      server->queue, umem->umem, &xsk->rx,
+                                      &xsk->tx, &umem->fq, &umem->cq, &cfg);
+      if (ret) {
+        exit_with_error(server, -ret);
+      }
+      ret = bpf_get_link_xdp_id(server->ifaces[i].ifid,
+                                &server->ifaces[i].prog_id,
+                                server->config.xdp_flags);
+      if (ret) {
+        exit_with_error(server, -ret);
+      }
+      server->ifaces[i].xsks[t] = xsk;
+    }
   }
-  server->xsk = xsk;
-  debug_printf("xsk socket created");
-  load_xsk_redirect_userspace(server, 1);
+  for (int t = 0; t < server->n_threads; t++){
+	  server->worker_args[t] = malloc(sizeof(*server->worker_args) + server->num_ifaces*sizeof(*server->worker_args[t]->xsks));
+	  if (server->worker_args[t] == NULL){
+		  exit_with_error(server, ENOMEM);
+	  }
+	  server->worker_args[t]->server = server;
+	  for (int i = 0; i < server->num_ifaces; i++){
+		  server->worker_args[t]->xsks[i] = server->ifaces[i].xsks[t];
+	  }
+  }
+
+  load_xsk_redirect_userspace(server, server->worker_args, server->n_threads);
+  // TODO this is not set anywhere?
+  if (server->config.configure_queues){
+	  configure_rx_queues(server);
+  }
   debug_printf("XSK stuff complete");
-  // SETUP COMPLETE
-  server->ifaces[0].xsks = &xsk;
-  server->umem = umem;
 }
 
-void hercules_main(struct hercules_server *server, int xdp_mode) {
+void hercules_main(struct hercules_server *server) {
   debug_printf("Hercules main");
-  debug_printf("#ifaces %d, mtu %d, queue %d", server->num_ifaces, server->mtu,
-               server->queue);
 
-  xdp_setup(server, xdp_mode);
+  xdp_setup(server);
 
 
   // Start socket handler thread
@@ -3697,10 +3732,9 @@ void hercules_main(struct hercules_server *server, int xdp_mode) {
 
 
   // Start event receiver thread
-debug_printf("Starting event receiver thread");
+  debug_printf("Starting event receiver thread");
   pthread_t events = start_thread(NULL, events_p, server);
 
-  // XXX only needed for PCC
   // Start the NACK sender thread
   debug_printf("starting NACK trickle thread");
   pthread_t trickle_nacks = start_thread(NULL, rx_trickle_nacks, server);
@@ -3710,13 +3744,19 @@ debug_printf("Starting event receiver thread");
   pthread_t trickle_acks = start_thread(NULL, rx_trickle_acks, server);
 
 
-  // Start the RX worker thread
-  debug_printf("starting thread rx_p");
-  pthread_t rx_p_thread = start_thread(NULL, rx_p, server);
+  // Start the RX worker threads
+  pthread_t rx_workers[server->n_threads];
+  for (int i = 0; i < server->n_threads; i++) {
+    debug_printf("starting thread rx_p %d", i);
+    rx_workers[i] = start_thread(NULL, rx_p, server->worker_args[i]);
+  }
 
-  // Start the TX worker thread
-  debug_printf("starting thread tx_send_p");
-  pthread_t tx_send_p_thread = start_thread(NULL, tx_send_p, server);
+  // Start the TX worker threads
+  pthread_t tx_workers[server->n_threads];
+  for (int i = 0; i < server->n_threads; i++) {
+    debug_printf("starting thread tx_send_p %d", i);
+    tx_workers[i] = start_thread(NULL, tx_send_p, server->worker_args[i]);
+  }
 
   // Start the TX scheduler thread
   debug_printf("starting thread tx_p");
@@ -3727,49 +3767,116 @@ debug_printf("Starting event receiver thread");
   }
 }
 
+void usage(){
+	fprintf(stderr, "usage: ?? TODO\n");
+	exit(1);
+}
+
+// TODO what's up with multiple interfaces?
+#define HERCULES_MAX_INTERFACES 1
 int main(int argc, char *argv[]) {
-  usock = socket(AF_UNIX, SOCK_DGRAM, 0);
-  assert(usock > 0);
-  struct sockaddr_un name;
-  name.sun_family = AF_UNIX;
-  strcpy(name.sun_path, "/var/hercules.sock");
-  unlink("/var/hercules.sock");
-  int ret = bind(usock, &name, sizeof(name));
-  assert(!ret);
-
-  int ifindices[1] = {3};
-  int num_ifaces = 1;
-  struct hercules_app_addr local_addr = {
-      .ia = 0xe20f0100aaff1100ULL, .ip = 0x232a8c0UL, .port = 0x7b00};
-  struct hercules_app_addr receiver = local_addr;
+  // Options:
+  // -i interface
+  // -l listen address
+  // -z XDP zerocopy mode
+  // -q queue
+  // -t TX worker threads
+  // -r RX worker threads
+  unsigned int if_idxs[HERCULES_MAX_INTERFACES]; // XXX 10 should be enough
+  int n_interfaces = 0;
+  struct hercules_app_addr listen_addr = {.ia = 0, .ip = 0, .port = 0};
+  int xdp_mode = XDP_COPY;
   int queue = 0;
-  int mtu = 1200;
-  if (argc == 2 && strcmp(argv[1], "TX") == 0) {
-    // Sender
-    // scionlab1, 192.168.50.1:123
-    local_addr.ip = 0x132a8c0UL;
+  int tx_threads = 1;
+  int rx_threads = 1;
+  int opt;
+  while ((opt = getopt(argc, argv, "i:l:q:t:r:z")) != -1) {
+    switch (opt) {
+    case 'i':
+      debug_printf("Using interface %s", optarg);
+      if (n_interfaces >= HERCULES_MAX_INTERFACES) {
+        fprintf(stderr, "Too many interfaces specified\n");
+        exit(1);
+      }
+      if_idxs[n_interfaces] = if_nametoindex(optarg);
+      if (if_idxs[n_interfaces] == 0) {
+        fprintf(stderr, "No such interface: %s\n", optarg);
+        exit(1);
+      }
+      n_interfaces++;
+      break;
+    case 'l':;
+      // Expect something of the form: 17-ffaa:1:fe2,192.168.50.2:123
+      u64 ia;
+      u16 *ia_ptr = (u16 *)&ia;
+      char ip_str[100];
+      u32 ip;
+      u16 port;
+      int ret = sscanf(optarg, "%hu-%hx:%hx:%hx,%99[^:]:%hu", ia_ptr + 3,
+                       ia_ptr + 2, ia_ptr + 1, ia_ptr + 0, ip_str, &port);
+      if (ret != 6) {
+        fprintf(stderr, "Error parsing listen address\n");
+        exit(1);
+      }
+      listen_addr.ia = htobe64(ia);
+      listen_addr.port = htons(port);
+      ret = inet_pton(AF_INET, ip_str, &listen_addr.ip);
+      if (ret != 1) {
+        fprintf(stderr, "Error parsing listen address\n");
+        exit(1);
+      }
+      break;
+    case 'q':
+      queue = strtol(optarg, NULL, 10);
+      if (errno == EINVAL || errno == ERANGE) {
+        fprintf(stderr, "Error parsing queue\n");
+        exit(1);
+      }
+      break;
+    case 't':
+      tx_threads = strtol(optarg, NULL, 10);
+      if (errno == EINVAL || errno == ERANGE) {
+        fprintf(stderr, "Error parsing number of tx threads\n");
+        exit(1);
+      }
+      break;
+    case 'r':
+      rx_threads = strtol(optarg, NULL, 10);
+      if (errno == EINVAL || errno == ERANGE) {
+        fprintf(stderr, "Error parsing number of rx threads\n");
+        exit(1);
+      }
+      break;
+    case 'z':
+      xdp_mode = XDP_ZEROCOPY;
+      break;
+    default:
+      usage();
+    }
   }
+  if (n_interfaces == 0 || listen_addr.ip == 0) {
+    fprintf(stderr, "Missing required argument\n");
+    exit(1);
+  }
+  if (rx_threads != tx_threads) {
+    // XXX This is not required, but if they are different we need to take care
+    // to allocate the right number of sockets, or have XDP sockets that are
+    // each used only for one of TX/RX
+    fprintf(stderr, "TX/RX threads must match\n");
+    exit(1);
+  }
+  debug_printf("Starting Hercules using queue %d, %d rx threads, %d tx "
+               "threads, xdp mode 0x%x",
+               queue, rx_threads, tx_threads, xdp_mode);
+
+  usock = monitor_bind_daemon_socket();
+  if (usock == 0) {
+    fprintf(stderr, "Error binding daemon socket\n");
+    exit(1);
+  }
+
   struct hercules_server *server =
-      hercules_init_server(ifindices, num_ifaces, local_addr, queue, mtu);
-  if (argc == 2 && strcmp(argv[1], "TX") == 0) {
-    // Sender
-    server->n_pending = 1;
-    strncpy(server->pending[0], "hercules", 20);
-    strncpy(server->pending[1], "smallfile", 20);
-    server->destinations = &receiver;
-    server->num_dests = 1;
-	int np = 1;
-    server->num_paths = &np; // num paths per dest
-    server->max_paths = 1; // max paths per dest
-    server->rate_limit = 10e6;
-    server->enable_pcc = true;
+      hercules_init_server(if_idxs, n_interfaces, listen_addr, queue, xdp_mode, rx_threads, false);
 
-	struct hercules_path *path;
-	int n_paths;
-	monitor_get_paths(usock, 1, &n_paths, &path);
-
-	server->paths_per_dest = path;
-  }
-
-  hercules_main(server, XDP_COPY);
+  hercules_main(server);
 }
