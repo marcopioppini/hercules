@@ -97,6 +97,7 @@ func (ptd *PathsToDestination) choosePaths() bool {
 		return false
 	}
 
+	fmt.Println("all paths", ptd.allPaths)
 	availablePaths := ptd.pm.filterPathsByActiveInterfaces(ptd.allPaths)
 	if len(availablePaths) == 0 {
 		log.Error(fmt.Sprintf("no paths to destination %s", ptd.dst.hostAddr.IA.String()))

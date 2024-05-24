@@ -8,7 +8,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-bool monitor_get_reply_path(int sockfd, char *rx_sample_buf, int rx_sample_len,
+bool monitor_get_reply_path(int sockfd, char *rx_sample_buf, int rx_sample_len, int etherlen,
                             struct hercules_path *path) {
   struct sockaddr_un monitor;
   monitor.sun_family = AF_UNIX;
@@ -20,6 +20,7 @@ bool monitor_get_reply_path(int sockfd, char *rx_sample_buf, int rx_sample_len,
   assert(msg);
 
   msg->msgtype = SOCKMSG_TYPE_GET_REPLY_PATH;
+  msg->payload.reply_path.etherlen = etherlen;
   msg->payload.reply_path.sample_len = rx_sample_len;
   memcpy(msg->payload.reply_path.sample, rx_sample_buf, rx_sample_len);
   debug_printf("sending %ld bytes", msg_len);
@@ -79,7 +80,7 @@ bool monitor_get_paths(int sockfd, int job_id, int *n_paths,
   return true;
 }
 
-bool monitor_get_new_job(int sockfd, char *name) {
+bool monitor_get_new_job(int sockfd, char *name, u16 *job_id, struct hercules_app_addr *dest) {
   struct sockaddr_un monitor;
   monitor.sun_family = AF_UNIX;
   strcpy(monitor.sun_path, "/var/herculesmon.sock");
@@ -96,6 +97,7 @@ bool monitor_get_new_job(int sockfd, char *name) {
     return false;
   }
   strncpy(name, reply->filename, reply->filename_len);
+  *job_id = reply->job_id;
   return true;
 }
 

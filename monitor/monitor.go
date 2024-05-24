@@ -26,15 +26,12 @@ import (
 // #include "../monitor.h"
 import "C"
 
-// TODO should not be here
-const etherLen = 1200
-
 type layerWithOpts struct {
 	Layer gopacket.SerializableLayer
 	Opts  gopacket.SerializeOptions
 }
 
-func prepareUnderlayPacketHeader(srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, dstPort uint16) ([]byte, error) {
+func prepareUnderlayPacketHeader(srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, dstPort uint16, etherLen int) ([]byte, error) {
 	ethHeader := 14
 	ipHeader := 20
 	udpHeader := 8
@@ -106,7 +103,7 @@ func serializeLayersWOpts(w gopacket.SerializeBuffer, layersWOpts ...layerWithOp
 	return nil
 }
 
-func getReplyPathHeader(buf []byte) (*HerculesPathHeader, error) {
+func getReplyPathHeader(buf []byte, etherLen int) (*HerculesPathHeader, error) {
 	packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
 	if err := packet.ErrorLayer(); err != nil {
 		return nil, fmt.Errorf("error decoding some part of the packet: %v", err)
@@ -160,7 +157,7 @@ func getReplyPathHeader(buf []byte) (*HerculesPathHeader, error) {
 		return nil, errors.New("error decoding SCION/UDP")
 	}
 
-	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcIP, dstIP, uint16(udpDstPort))
+	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcIP, dstIP, uint16(udpDstPort), etherLen)
 	if err != nil {
 		return nil, err
 	}
@@ -320,21 +317,22 @@ func getNeighborMAC(n *netlink.Handle, linkIndex int, ip net.IP) (net.HardwareAd
 }
 
 func getNewHeader() HerculesPathHeader {
-	srcAddr := addr.MustParseAddr("17-ffaa:1:fe2,192.168.50.1")
+	srcAddr := addr.MustParseAddr("17-ffaa:1:113c,192.168.50.1")
 	srcIP := net.ParseIP(srcAddr.Host.String())
-	dstAddr := addr.MustParseAddr("17-ffaa:1:fe2,192.168.50.2")
+	dstAddr := addr.MustParseAddr("17-ffaa:1:113c,192.168.50.2")
 	dstIP := net.ParseIP(dstAddr.Host.String())
 	// querier := newPathQuerier()
 	// path, err := querier.Query(context.Background(), dest)
 	// fmt.Println(path, err)
 	emptyPath := path.Empty{}
 
+	etherLen := 1200
 	iface, err := net.InterfaceByName("ens5f0")
 	fmt.Println(iface, err)
 	dstMAC, srcMAC, err := getAddrs(iface, dstIP)
 	fmt.Println(dstMAC, srcMAC, err)
 	fmt.Println(dstIP, srcIP)
-	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcIP, dstIP, uint16(30041))
+	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcIP, dstIP, uint16(30041), etherLen)
 	fmt.Println(underlayHeader, err)
 
 	payload := snet.UDPPayload{
@@ -374,9 +372,25 @@ func getNewHeader() HerculesPathHeader {
 	return herculesPath
 }
 
+func preparePaths(etherLen int, localAddress snet.UDPAddr, interfaces []*net.Interface, destination snet.UDPAddr) {
+	fmt.Println("preparepaths", interfaces)
+	// TODO replace bps limit with the correct value
+	dest := []*Destination{{hostAddr: &destination, numPaths: 1}}
+	pm, err := initNewPathManager(interfaces, dest, &localAddress, uint64(etherLen))
+	fmt.Println("pm init", pm, err)
+	pm.choosePaths()
+	fmt.Println("finally", pm.dsts[0].allPaths, pm.dsts[0].paths)
+}
+
+type TransferState int
+const (
+	Queued TransferState = iota
+	Submitted
+	Done
+)
 type HerculesTransfer struct {
 	id     int
-	status int
+	status TransferState
 	file   string
 	dest   snet.UDPAddr
 }
@@ -406,7 +420,7 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 	transfersLock.Lock()
 	transfers[nextID] = &HerculesTransfer{
 		id:     nextID,
-		status: 0,
+		status: Queued,
 		file:   file,
 		dest:   *destParsed,
 	}
@@ -425,6 +439,19 @@ func main() {
 	usock, err := net.ListenUnixgram("unixgram", local)
 	fmt.Println(usock, err)
 
+	ifs, _ := net.Interfaces()
+	iffs := []*net.Interface{}
+	for i, _ := range ifs {
+		iffs = append(iffs, &ifs[i])
+	}
+	// src, _ := snet.ParseUDPAddr("17-ffaa:1:fe2,192.168.50.1:123")
+	// dst, _ := snet.ParseUDPAddr("17-ffaa:1:fe2,192.168.50.2:123")
+	// querier := newPathQuerier()
+	// path, err := querier.Query(context.Background(), dest)
+	// fmt.Println(path, err)
+	// preparePaths(1200, *src, iffs, *dst)
+
+
 	http.HandleFunc("/", httpreq)
 	go http.ListenAndServe(":8000", nil)
 
@@ -441,7 +468,10 @@ func main() {
 				fmt.Println("reply path")
 				sample_len := binary.LittleEndian.Uint16(buf[:2])
 				buf = buf[2:]
-				replyPath, err := getReplyPathHeader(buf[:sample_len])
+				etherlen := binary.LittleEndian.Uint16(buf[:2])
+				buf = buf[2:]
+				fmt.Println(etherlen)
+				replyPath, err := getReplyPathHeader(buf[:sample_len], int(etherlen))
 				fmt.Println(replyPath, err)
 				b := SerializePath(replyPath)
 				usock.WriteToUnix(b, a)
@@ -452,14 +482,14 @@ func main() {
 				for _, job := range transfers {
 					if job.status == 0 {
 						selectedJob = job
-						job.status = 1
+						job.status = Submitted
 						break
 					}
 				}
 				transfersLock.Unlock()
 				var b []byte
 				if selectedJob != nil {
-					fmt.Println("sending file to daemon", selectedJob.file)
+					fmt.Println("sending file to daemon:", selectedJob.file)
 					// TODO Conversion between go and C strings?
 					strlen := len(selectedJob.file)
 					b = append(b, 1)

@@ -74,6 +74,7 @@ struct hercules_header {
 struct rbudp_initial_pkt {
 	__u64 filesize;
 	__u32 chunklen;
+	__u32 etherlen;
 	__u64 timestamp;
 	__u8 path_index;
 	__u8 flags;

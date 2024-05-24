@@ -3,11 +3,12 @@
 #include "hercules.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include "utils.h"
 
 // Get a reply path from the monitor. The reversed path will be written to
 // *path. Returns false in case of error.
 bool monitor_get_reply_path(int sockfd, char *rx_sample_buf, int rx_sample_len,
-                            struct hercules_path *path);
+                            int etherlen, struct hercules_path *path);
 
 // Get SCION paths from the monitor. The caller is responsible for freeing
 // **paths.
@@ -16,7 +17,7 @@ bool monitor_get_paths(int sockfd, int job_id, int *n_paths,
 
 // Check if the monitor has a new job available
 // TODO
-bool monitor_get_new_job(int sockfd, char *name);
+bool monitor_get_new_job(int sockfd, char *name, u16 *job_id, struct hercules_app_addr *dest);
 
 // Inform the monitor about a transfer's (new) status
 // TODO
@@ -35,6 +36,7 @@ int monitor_bind_daemon_socket();
 #define SOCKMSG_TYPE_GET_REPLY_PATH (1)
 struct sockmsg_reply_path_Q {
   uint16_t sample_len;
+  uint16_t etherlen;
   uint8_t sample[];
 };
 struct sockmsg_reply_path_A {

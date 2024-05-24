@@ -127,6 +127,7 @@ func (pm *PathManager) interfaceForRoute(ip net.IP) (*net.Interface, error) {
 		return nil, fmt.Errorf("could not find route for destination %s: %s", ip, err)
 	}
 
+	fmt.Println(pm.interfaces)
 	for _, route := range routes {
 		if iface, ok := pm.interfaces[route.LinkIndex]; ok {
 			fmt.Printf("sending via #%d (%s) to %s\n", route.LinkIndex, pm.interfaces[route.LinkIndex].Name, ip)
