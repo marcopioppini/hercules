@@ -68,10 +68,9 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	}
 
 	// check if IP address matches
-	// FIXME uncomment
-	/* if(iph->daddr != addr->ip) { */
-	/* 	return XDP_PASS; // not addressed to us (IP address) */
-	/* } */
+	if(iph->daddr != addr->ip) {
+		return XDP_PASS; // not addressed to us (IP address)
+	}
 
 	// check if UDP port matches
 	const struct udphdr *udph = (const struct udphdr *)(iph + 1);
@@ -114,13 +113,12 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	}
 
 	const struct scionaddrhdr_ipv4 *scionaddrh = (const struct scionaddrhdr_ipv4 *)(scionh + 1);
-	// FIXME uncomment this
-	/* if(scionaddrh->dst_ia != addr->ia) { */
-	/* 	return XDP_PASS; // not addressed to us (IA) */
-	/* } */
-	/* if(scionaddrh->dst_ip != addr->ip) { */
-	/* 	return XDP_PASS; // not addressed to us (IP in SCION hdr) */
-	/* } */
+	if(scionaddrh->dst_ia != addr->ia) {
+		return XDP_PASS; // not addressed to us (IA)
+	}
+	if(scionaddrh->dst_ip != addr->ip) {
+		return XDP_PASS; // not addressed to us (IP in SCION hdr)
+	}
 
 	size_t offset = next_offset;
 

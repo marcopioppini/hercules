@@ -1379,11 +1379,19 @@ static bool tx_handle_cts(struct sender_state *tx_state, const char *cts, size_t
 /* } */
 
 static void
-tx_send_initial(struct hercules_server *server, const struct hercules_path *path, char *filename, size_t filesize, u32 chunklen, unsigned long timestamp, u32 path_index, bool set_return_path)
+tx_send_initial(struct hercules_server *server, const struct hercules_path *path, char *filename, size_t filesize, u32 chunklen, unsigned long timestamp, u32 path_index, bool set_return_path, bool new_transfer)
 {
 	debug_printf("Sending initial");
 	char buf[HERCULES_MAX_PKTSIZE];
 	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
+
+	u8 flags = 0;
+	if (set_return_path){
+		flags |= HANDSHAKE_FLAG_SET_RETURN_PATH;
+	}
+	if (new_transfer){
+		flags |= HANDSHAKE_FLAG_NEW_TRANSFER;
+	}
 
 	struct hercules_control_packet pld = {
 			.type = CONTROL_PACKET_TYPE_INITIAL,
@@ -1392,7 +1400,7 @@ tx_send_initial(struct hercules_server *server, const struct hercules_path *path
 					.chunklen = chunklen,
 					.timestamp = timestamp,
 					.path_index = path_index,
-					.flags = set_return_path ? HANDSHAKE_FLAG_SET_RETURN_PATH : 0,
+					.flags = flags,
 					.name_len = strlen(filename),
 			},
 	};
@@ -2183,8 +2191,8 @@ init_tx_state(struct hercules_session *session, size_t filesize, int chunklen, i
 		exit(1);
 	}
 
-	debug_printf("Sending a file consisting of %lld chunks (ANY KEY TO CONTINUE)", total_chunks);
-	getchar();
+	/* debug_printf("Sending a file consisting of %lld chunks (ANY KEY TO CONTINUE)", total_chunks); */
+	/* getchar(); */
 
 	struct sender_state *tx_state = calloc(1, sizeof(*tx_state));
 	tx_state->session = session;
@@ -2494,6 +2502,8 @@ static void rx_send_cts_ack(struct hercules_server *server, struct receiver_stat
 		return;
 	}
 
+	debug_printf("got reply path, idx %d", path.ifid);
+
 	char buf[HERCULES_MAX_PKTSIZE];
 	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
 
@@ -2712,9 +2722,10 @@ static void events_p(void *arg) {
 		memset(fname, 0, 1000);
         int count;
 		u16 jobid;
+		u16 mtu;
 		struct hercules_app_addr dest;
 		pthread_spin_lock(&usock_lock);
-		int ret = monitor_get_new_job(usock, fname, &jobid, &dest);
+		int ret = monitor_get_new_job(usock, fname, &jobid, &dest, &mtu);
 		pthread_spin_unlock(&usock_lock);
         if (ret) {
           debug_printf("new job: %s", fname);
@@ -2760,7 +2771,7 @@ static void events_p(void *arg) {
           unsigned long timestamp = get_nsecs();
           tx_send_initial(server, &tx_state->receiver[0].paths[0], fname,
                           tx_state->filesize, tx_state->chunklen, timestamp, 0,
-                          true);
+                          true, true);
           atomic_store(&server->session_tx->state, SESSION_STATE_WAIT_HS);
         } else {
           debug_printf("no new job.");
@@ -2769,6 +2780,9 @@ static void events_p(void *arg) {
     }
     // XXX
 
+	/* // Set timeout on the socket */
+	/* struct timeval to = {.tv_sec = 0, .tv_usec = 500}; */
+	/* setsockopt(server->control_sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to)); */
     ssize_t len = recvfrom(server->control_sockfd, buf, sizeof(buf), 0,
                            (struct sockaddr *)&addr,
                            &addr_size); // XXX set timeout
@@ -2835,7 +2849,7 @@ static void events_p(void *arg) {
                 session, parsed_pkt.name, parsed_pkt.filesize, parsed_pkt.chunklen, 1200, false);
             session->rx_state = rx_state;
             /* session->state = SESSION_STATE_READY; */
-            rx_handle_initial(server, rx_state, &parsed_pkt, buf, 3,
+            rx_handle_initial(server, rx_state, &parsed_pkt, buf, addr.sll_ifindex,
                               rbudp_pkt + rbudp_headerlen, len);
             rx_send_cts_ack(server, rx_state);
             server->session_rx->state = SESSION_STATE_RUNNING;
@@ -2882,7 +2896,7 @@ static void events_p(void *arg) {
   }
 }
 
-#define DEBUG_PRINT_PKTS
+/* #define DEBUG_PRINT_PKTS */
 #ifdef DEBUG_PRINT_PKTS
 void print_rbudp_pkt(const char *pkt, bool recv) {
   struct hercules_header *h = (struct hercules_header *)pkt;

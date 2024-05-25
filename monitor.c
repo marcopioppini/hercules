@@ -14,90 +14,83 @@ bool monitor_get_reply_path(int sockfd, char *rx_sample_buf, int rx_sample_len, 
   monitor.sun_family = AF_UNIX;
   strcpy(monitor.sun_path, "/var/herculesmon.sock");
 
-  struct hercules_sockmsg_Q *msg;
-  size_t msg_len = sizeof(*msg) + rx_sample_len;
-  msg = calloc(1, msg_len);
-  assert(msg);
+  struct hercules_sockmsg_Q msg;
+  msg.msgtype = SOCKMSG_TYPE_GET_REPLY_PATH;
+  msg.payload.reply_path.etherlen = etherlen;
+  msg.payload.reply_path.sample_len = rx_sample_len;
+  memcpy(msg.payload.reply_path.sample, rx_sample_buf, rx_sample_len);
+  sendto(sockfd, &msg, sizeof(msg), 0, &monitor, sizeof(monitor)); // TODO return val
 
-  msg->msgtype = SOCKMSG_TYPE_GET_REPLY_PATH;
-  msg->payload.reply_path.etherlen = etherlen;
-  msg->payload.reply_path.sample_len = rx_sample_len;
-  memcpy(msg->payload.reply_path.sample, rx_sample_buf, rx_sample_len);
-  debug_printf("sending %ld bytes", msg_len);
-  sendto(sockfd, msg, msg_len, 0, &monitor, sizeof(monitor)); // TODO return val
-  free(msg);
-
-  char buf[2000];
-  memset(&buf, 0, 2000);
-  int n = recv(sockfd, &buf, sizeof(buf), 0);
+  struct hercules_sockmsg_A reply;
+  int n = recv(sockfd, &reply, sizeof(reply), 0);
   debug_printf("Read %d bytes", n);
   if (n <= 0) {
     return false;
   }
-  struct hercules_sockmsg_A *reply = buf;
-  path->headerlen = reply->payload.reply_path.headerlen;
-  memcpy(&path->header.header, reply->payload.reply_path.header,
-         path->headerlen);
-  path->header.checksum = reply->payload.reply_path.chksum;
-
+  memcpy(&path->header, reply.payload.reply_path.path.header, reply.payload.reply_path.path.headerlen);
+  path->headerlen = reply.payload.reply_path.path.headerlen;
+  path->header.checksum = reply.payload.reply_path.path.chksum;
   path->enabled = true;
   path->replaced = false;
-  path->payloadlen = 1200 - path->headerlen;
+  path->payloadlen = 1200 - path->headerlen; // TODO set correctly
   path->framelen = 1200;
-  path->ifid = 3;
+  path->ifid = reply.payload.reply_path.path.ifid;
   return true;
 }
 
 bool monitor_get_paths(int sockfd, int job_id, int *n_paths,
                        struct hercules_path **paths) {
-  struct hercules_path *path = calloc(1, sizeof(*path));
-  assert(path);
-
   struct sockaddr_un monitor;
   monitor.sun_family = AF_UNIX;
   strcpy(monitor.sun_path, "/var/herculesmon.sock");
-  struct hercules_sockmsg_Q msg = {.msgtype = SOCKMSG_TYPE_GET_PATHS};
-  int len = sizeof(msg);
-  debug_printf("sending %d bytes", len);
-  sendto(sockfd, &msg, len, 0, &monitor, sizeof(monitor));
-  char recvbuf[2000];
-  memset(&recvbuf, 0, 2000);
-  int n = recv(sockfd, &recvbuf, sizeof(recvbuf), 0);
+
+  struct hercules_sockmsg_Q msg;
+  msg.msgtype = SOCKMSG_TYPE_GET_PATHS;
+  sendto(sockfd, &msg, sizeof(msg), 0, &monitor, sizeof(monitor));
+
+  struct hercules_sockmsg_A reply;
+  int n = recv(sockfd, &reply, sizeof(reply), 0);
   debug_printf("receive %d bytes", n);
-  struct sockmsg_reply_path_A *reply = recvbuf + 2;
-  path->headerlen = reply->headerlen;
-  memcpy(path->header.header, reply->header, reply->headerlen);
-  path->header.checksum = reply->chksum;
 
-  path->enabled = true;
-  path->replaced = false;
-  path->payloadlen = 1200 - path->headerlen;
-  path->framelen = 1200;
-  path->ifid = 3;
+  int received_paths = reply.payload.paths.n_paths;
+  struct hercules_path *p =
+      calloc(received_paths, sizeof(struct hercules_path));
 
-  *n_paths = 1;
-  *paths = path;
+  for (int i = 0; i < received_paths; i++) {
+    p[i].headerlen = reply.payload.paths.paths[i].headerlen;
+    memcpy(&p[i].header, reply.payload.paths.paths[i].header,
+           p[i].headerlen);
+    p[i].header.checksum = reply.payload.paths.paths[i].chksum;
+    p[i].enabled = true;
+    p[i].replaced = false;
+    p[i].payloadlen = 1200 - p[i].headerlen; // TODO set correctly
+    p[i].framelen = 1200;
+    p[i].ifid = reply.payload.paths.paths[i].ifid;
+  }
+
+  *n_paths = received_paths;
+  *paths = p;
   return true;
 }
 
-bool monitor_get_new_job(int sockfd, char *name, u16 *job_id, struct hercules_app_addr *dest) {
+bool monitor_get_new_job(int sockfd, char *name, u16 *job_id, struct hercules_app_addr *dest, u16 *mtu) {
   struct sockaddr_un monitor;
   monitor.sun_family = AF_UNIX;
   strcpy(monitor.sun_path, "/var/herculesmon.sock");
+
   struct hercules_sockmsg_Q msg = {.msgtype = SOCKMSG_TYPE_GET_NEW_JOB};
-  int len = sizeof(msg);
-  debug_printf("sending %d bytes", len);
-  sendto(sockfd, &msg, len, 0, &monitor, sizeof(monitor));
-  char recvbuf[2000];
-  memset(&recvbuf, 0, 2000);
-  int n = recv(sockfd, &recvbuf, sizeof(recvbuf), 0);
+  sendto(sockfd, &msg, sizeof(msg), 0, &monitor, sizeof(monitor));
+
+  struct hercules_sockmsg_A reply;
+  int n = recv(sockfd, &reply, sizeof(reply), 0);
   debug_printf("receive %d bytes", n);
-  struct sockmsg_new_job_A *reply = recvbuf;
-  if (!reply->has_job){
+  if (!reply.payload.newjob.has_job){
     return false;
   }
-  strncpy(name, reply->filename, reply->filename_len);
-  *job_id = reply->job_id;
+  // XXX name needs to be allocated large enough by caller
+  strncpy(name, reply.payload.newjob.filename, reply.payload.newjob.filename_len);
+  *job_id = reply.payload.newjob.job_id;
+  *mtu = reply.payload.newjob.mtu;
   return true;
 }
 

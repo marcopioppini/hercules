@@ -84,6 +84,7 @@ struct rbudp_initial_pkt {
 
 #define HANDSHAKE_FLAG_SET_RETURN_PATH 0x1u
 #define HANDSHAKE_FLAG_HS_CONFIRM (0x1u << 1)
+#define HANDSHAKE_FLAG_NEW_TRANSFER (0x1u << 2)
 
 // Structure of ACK RBUDP packets sent by the receiver.
 // Integers all transmitted in little endian (host endianness).

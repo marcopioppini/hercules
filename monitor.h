@@ -17,7 +17,7 @@ bool monitor_get_paths(int sockfd, int job_id, int *n_paths,
 
 // Check if the monitor has a new job available
 // TODO
-bool monitor_get_new_job(int sockfd, char *name, u16 *job_id, struct hercules_app_addr *dest);
+bool monitor_get_new_job(int sockfd, char *name, u16 *job_id, struct hercules_app_addr *dest, u16 *mtu);
 
 // Inform the monitor about a transfer's (new) status
 // TODO
@@ -25,8 +25,14 @@ bool monitor_update_job(int sockfd, int job_id);
 
 int monitor_bind_daemon_socket();
 
+// Maximum size of variable-length fields in socket messages
+#define SOCKMSG_MAX_PAYLOAD 2000
+// Maximum number of paths transferred
+#define SOCKMSG_MAX_PATHS 10
+
 // Messages used for communication between the Hercules daemon and monitor
 // via unix socket. Queries are sent by the daemon, Replies by the monitor.
+// Structs suffixed _Q are queries, ones suffixed _A are answers.
 #pragma pack(push)
 #pragma pack(1)
 
@@ -37,12 +43,17 @@ int monitor_bind_daemon_socket();
 struct sockmsg_reply_path_Q {
   uint16_t sample_len;
   uint16_t etherlen;
-  uint8_t sample[];
+  uint8_t sample[SOCKMSG_MAX_PAYLOAD];
 };
-struct sockmsg_reply_path_A {
+struct sockmsg_serialized_path {
   uint16_t chksum;
+  uint16_t ifid;
   uint32_t headerlen;
-  uint8_t header[];
+  uint8_t header[HERCULES_MAX_HEADERLEN];
+};
+
+struct sockmsg_reply_path_A {
+  struct sockmsg_serialized_path path;
 };
 
 // Ask the monitor for new transfer jobs.
@@ -52,8 +63,9 @@ struct sockmsg_new_job_Q {};
 struct sockmsg_new_job_A {
   uint8_t has_job; // The other fields are only valid if this is set to 1
   uint16_t job_id;
+  uint16_t mtu;
   uint16_t filename_len;
-  uint8_t filename[];
+  uint8_t filename[SOCKMSG_MAX_PAYLOAD];
 };
 
 // Get paths to use for a given job ID
@@ -63,8 +75,7 @@ struct sockmsg_paths_Q {
 };
 struct sockmsg_paths_A {
   uint16_t n_paths;
-  uint8_t paths[]; // This should be a concatenation of n_paths many paths, each
-                   // laid out as struct sockmsg_reply_path_A above.
+  struct sockmsg_serialized_path paths[SOCKMSG_MAX_PATHS];
 };
 
 // Inform the monitor about a job's status
@@ -85,6 +96,8 @@ struct hercules_sockmsg_Q {
     struct sockmsg_update_job_Q job_update;
   } payload;
 };
+// Used by go code
+#define SOCKMSG_SIZE sizeof(struct hercules_sockmsg_Q)
 
 struct hercules_sockmsg_A {
   union {

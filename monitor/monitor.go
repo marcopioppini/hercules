@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -18,7 +20,6 @@ import (
 	// "github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/snet"
-	"github.com/scionproto/scion/pkg/snet/path"
 	"github.com/scionproto/scion/private/topology"
 	"github.com/vishvananda/netlink"
 )
@@ -103,63 +104,61 @@ func serializeLayersWOpts(w gopacket.SerializeBuffer, layersWOpts ...layerWithOp
 	return nil
 }
 
-func getReplyPathHeader(buf []byte, etherLen int) (*HerculesPathHeader, error) {
+func getReplyPathHeader(buf []byte, etherLen int) (*HerculesPathHeader, net.IP, error) {
 	packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
 	if err := packet.ErrorLayer(); err != nil {
-		return nil, fmt.Errorf("error decoding some part of the packet: %v", err)
+		return nil, nil, fmt.Errorf("error decoding some part of the packet: %v", err)
 	}
 	eth := packet.Layer(layers.LayerTypeEthernet)
 	if eth == nil {
-		return nil, errors.New("error decoding ETH layer")
+		return nil, nil, errors.New("error decoding ETH layer")
 	}
 	dstMAC, srcMAC := eth.(*layers.Ethernet).SrcMAC, eth.(*layers.Ethernet).DstMAC
 
 	ip4 := packet.Layer(layers.LayerTypeIPv4)
 	if ip4 == nil {
-		return nil, errors.New("error decoding IPv4 layer")
+		return nil, nil, errors.New("error decoding IPv4 layer")
 	}
 	dstIP, srcIP := ip4.(*layers.IPv4).SrcIP, ip4.(*layers.IPv4).DstIP
 
 	udp := packet.Layer(layers.LayerTypeUDP)
 	if udp == nil {
-		return nil, errors.New("error decoding IPv4/UDP layer")
+		return nil, nil, errors.New("error decoding IPv4/UDP layer")
 	}
 	udpPayload := udp.(*layers.UDP).Payload
 	udpDstPort := udp.(*layers.UDP).SrcPort
 
 	if len(udpPayload) < 8 { // Guard against bug in ParseScnPkt
-		return nil, errors.New("error decoding SCION packet: payload too small")
+		return nil, nil, errors.New("error decoding SCION packet: payload too small")
 	}
 
 	sourcePkt := snet.Packet{
 		Bytes: udpPayload,
 	}
 	if err := sourcePkt.Decode(); err != nil {
-		return nil, fmt.Errorf("error decoding SCION packet: %v", err)
+		return nil, nil, fmt.Errorf("error decoding SCION packet: %v", err)
 	}
 
 	rpath, ok := sourcePkt.Path.(snet.RawPath)
 	if !ok {
-		return nil, fmt.Errorf("error decoding SCION packet: unexpected dataplane path type")
+		return nil, nil, fmt.Errorf("error decoding SCION packet: unexpected dataplane path type")
 	}
 	if len(rpath.Raw) != 0 {
 		replyPath, err := snet.DefaultReplyPather{}.ReplyPath(rpath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to reverse SCION path: %v", err)
+			return nil, nil, fmt.Errorf("failed to reverse SCION path: %v", err)
 		}
 		sourcePkt.Path = replyPath
 	}
 
-	sourcePkt.Path = path.Empty{}
-
 	udpPkt, ok := sourcePkt.Payload.(snet.UDPPayload)
 	if !ok {
-		return nil, errors.New("error decoding SCION/UDP")
+		return nil, nil, errors.New("error decoding SCION/UDP")
 	}
 
 	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcIP, dstIP, uint16(udpDstPort), etherLen)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	payload := snet.UDPPayload{
@@ -178,7 +177,7 @@ func getReplyPathHeader(buf []byte, etherLen int) (*HerculesPathHeader, error) {
 	}
 
 	if err = destPkt.Serialize(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	scionHeaderLen := len(destPkt.Bytes)
 	payloadLen := etherLen - len(underlayHeader) - scionHeaderLen
@@ -186,7 +185,7 @@ func getReplyPathHeader(buf []byte, etherLen int) (*HerculesPathHeader, error) {
 	destPkt.Payload = payload
 
 	if err = destPkt.Serialize(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	scionHeader := destPkt.Bytes[:scionHeaderLen]
 	scionChecksum := binary.BigEndian.Uint16(scionHeader[scionHeaderLen-2:])
@@ -195,19 +194,22 @@ func getReplyPathHeader(buf []byte, etherLen int) (*HerculesPathHeader, error) {
 		Header:          headerBuf,
 		PartialChecksum: scionChecksum,
 	}
-	return &herculesPath, nil
+	return &herculesPath, dstIP, nil
 }
 
-func SerializePath(from *HerculesPathHeader) []byte {
+func SerializePath(from *HerculesPathHeader, ifid int) []byte {
 	fmt.Println("serialize")
 	out := make([]byte, 0, 1500)
 	fmt.Println(out)
 	out = binary.LittleEndian.AppendUint16(out, from.PartialChecksum)
+	out = binary.LittleEndian.AppendUint16(out, uint16(ifid))
 	fmt.Println(out)
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(from.Header)))
 	fmt.Println(out)
 	out = append(out, from.Header...)
-	fmt.Println(out)
+	out = append(out, bytes.Repeat([]byte{0x00}, C.HERCULES_MAX_HEADERLEN-len(from.Header))...)
+	fmt.Println("Serialized header", out, len(out))
+	fmt.Printf("hex header % x\n", out)
 	return out
 }
 
@@ -316,28 +318,18 @@ func getNeighborMAC(n *netlink.Handle, linkIndex int, ip net.IP) (net.HardwareAd
 	return nil, errors.New("missing ARP entry")
 }
 
-func getNewHeader() HerculesPathHeader {
-	srcAddr := addr.MustParseAddr("17-ffaa:1:113c,192.168.50.1")
-	srcIP := net.ParseIP(srcAddr.Host.String())
-	dstAddr := addr.MustParseAddr("17-ffaa:1:113c,192.168.50.2")
-	dstIP := net.ParseIP(dstAddr.Host.String())
-	// querier := newPathQuerier()
-	// path, err := querier.Query(context.Background(), dest)
-	// fmt.Println(path, err)
-	emptyPath := path.Empty{}
-
-	etherLen := 1200
-	iface, err := net.InterfaceByName("ens5f0")
-	fmt.Println(iface, err)
-	dstMAC, srcMAC, err := getAddrs(iface, dstIP)
+// TODO no reason to pass in both net.udpaddr and addr.Addr, but the latter does not include the port
+func prepareHeader(path PathMeta, etherLen int, srcUDP, dstUDP net.UDPAddr, srcAddr, dstAddr addr.Addr) HerculesPathHeader {
+	iface := path.iface
+	dstMAC, srcMAC, err := getAddrs(iface, path.path.UnderlayNextHop().IP)
 	fmt.Println(dstMAC, srcMAC, err)
-	fmt.Println(dstIP, srcIP)
-	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcIP, dstIP, uint16(30041), etherLen)
+
+	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcUDP.IP, path.path.UnderlayNextHop().IP, uint16(path.path.UnderlayNextHop().Port), etherLen)
 	fmt.Println(underlayHeader, err)
 
 	payload := snet.UDPPayload{
-		SrcPort: 123,
-		DstPort: 123,
+		SrcPort: srcUDP.AddrPort().Port(),
+		DstPort: dstUDP.AddrPort().Port(),
 		Payload: nil,
 	}
 
@@ -345,7 +337,7 @@ func getNewHeader() HerculesPathHeader {
 		PacketInfo: snet.PacketInfo{
 			Destination: dstAddr,
 			Source:      srcAddr,
-			Path:        emptyPath,
+			Path:        path.path.Dataplane(),
 			Payload:     payload,
 		},
 	}
@@ -372,27 +364,51 @@ func getNewHeader() HerculesPathHeader {
 	return herculesPath
 }
 
-func preparePaths(etherLen int, localAddress snet.UDPAddr, interfaces []*net.Interface, destination snet.UDPAddr) {
-	fmt.Println("preparepaths", interfaces)
+func pickPathsToDestination(etherLen int, numPaths int, localAddress snet.UDPAddr, interfaces []*net.Interface, destination snet.UDPAddr) []PathMeta {
+	dest := []*Destination{{hostAddr: &destination, numPaths: numPaths, pathSpec: &[]PathSpec{}}}
 	// TODO replace bps limit with the correct value
-	dest := []*Destination{{hostAddr: &destination, numPaths: 1}}
-	pm, err := initNewPathManager(interfaces, dest, &localAddress, uint64(etherLen))
-	fmt.Println("pm init", pm, err)
+	pm, _ := initNewPathManager(interfaces, dest, &localAddress, uint64(etherLen))
 	pm.choosePaths()
-	fmt.Println("finally", pm.dsts[0].allPaths, pm.dsts[0].paths)
+	numSelectedPaths := len(pm.dsts[0].paths)
+	fmt.Println("selected paths", numSelectedPaths)
+	return pm.dsts[0].paths
+}
+
+func headersToDestination(src, dst snet.UDPAddr, ifs []*net.Interface, etherLen int) (int, []byte) {
+	fmt.Println("making headers", src, dst)
+	srcA := addr.Addr{
+		IA:   src.IA,
+		Host: addr.MustParseHost(src.Host.IP.String()),
+	}
+	dstA := addr.Addr{
+		IA:   dst.IA,
+		Host: addr.MustParseHost(dst.Host.IP.String()),
+	}
+	// TODO numpaths should come from somewhere
+	paths := pickPathsToDestination(etherLen, 1, src, ifs, dst)
+	numSelectedPaths := len(paths)
+	headers_ser := []byte{}
+	for _, p := range paths {
+		preparedHeader := prepareHeader(p, etherLen, *src.Host, *dst.Host, srcA, dstA)
+		headers_ser = append(headers_ser, SerializePath(&preparedHeader, p.iface.Index)...)
+	}
+	return numSelectedPaths, headers_ser
 }
 
 type TransferState int
+
 const (
 	Queued TransferState = iota
 	Submitted
 	Done
 )
+
 type HerculesTransfer struct {
 	id     int
 	status TransferState
 	file   string
 	dest   snet.UDPAddr
+	mtu    int
 }
 
 var transfersLock sync.Mutex
@@ -423,6 +439,7 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 		status: Queued,
 		file:   file,
 		dest:   *destParsed,
+		mtu: 1200,
 	}
 	nextID += 1
 	transfersLock.Unlock()
@@ -430,7 +447,23 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "OK")
 }
 
+func pathsForTransfer(id int) []C.struct_hercules_path {
+	paths := []C.struct_hercules_path{}
+	return paths
+}
+
 func main() {
+	var localAddr string
+	flag.StringVar(&localAddr, "l", "", "local address")
+	flag.Parse()
+
+	src, err := snet.ParseUDPAddr(localAddr)
+	if err != nil || src.Host.Port == 0 {
+		flag.Usage()
+		return
+	}
+
+	// TODO make socket paths congfigurable
 	daemon, err := net.ResolveUnixAddr("unixgram", "/var/hercules.sock")
 	fmt.Println(daemon, err)
 	local, err := net.ResolveUnixAddr("unixgram", "/var/herculesmon.sock")
@@ -444,36 +477,34 @@ func main() {
 	for i, _ := range ifs {
 		iffs = append(iffs, &ifs[i])
 	}
-	// src, _ := snet.ParseUDPAddr("17-ffaa:1:fe2,192.168.50.1:123")
-	// dst, _ := snet.ParseUDPAddr("17-ffaa:1:fe2,192.168.50.2:123")
-	// querier := newPathQuerier()
-	// path, err := querier.Query(context.Background(), dest)
-	// fmt.Println(path, err)
-	// preparePaths(1200, *src, iffs, *dst)
 
+	pm, err := initNewPathManager(iffs, nil, src, 0);
+	fmt.Println(err)
 
 	http.HandleFunc("/", httpreq)
 	go http.ListenAndServe(":8000", nil)
 
 	for {
-		buf := make([]byte, 2000)
-		fmt.Println("read...")
+		buf := make([]byte, C.SOCKMSG_SIZE)
+		fmt.Println("read...", C.SOCKMSG_SIZE)
 		n, a, err := usock.ReadFromUnix(buf)
 		fmt.Println(n, a, err, buf)
 		if n > 0 {
-			id := binary.LittleEndian.Uint16(buf[:2])
+			msgtype := binary.LittleEndian.Uint16(buf[:2])
 			buf = buf[2:]
-			switch id {
+			switch msgtype {
 			case C.SOCKMSG_TYPE_GET_REPLY_PATH:
 				fmt.Println("reply path")
 				sample_len := binary.LittleEndian.Uint16(buf[:2])
 				buf = buf[2:]
 				etherlen := binary.LittleEndian.Uint16(buf[:2])
 				buf = buf[2:]
-				fmt.Println(etherlen)
-				replyPath, err := getReplyPathHeader(buf[:sample_len], int(etherlen))
+				fmt.Println("smaple len", sample_len)
+				replyPath, nextHop, err := getReplyPathHeader(buf[:sample_len], int(etherlen))
+				iface, _ := pm.interfaceForRoute(nextHop)
+				fmt.Println("reply iface", iface)
 				fmt.Println(replyPath, err)
-				b := SerializePath(replyPath)
+				b := SerializePath(replyPath, iface.Index)
 				usock.WriteToUnix(b, a)
 
 			case C.SOCKMSG_TYPE_GET_NEW_JOB:
@@ -489,11 +520,12 @@ func main() {
 				transfersLock.Unlock()
 				var b []byte
 				if selectedJob != nil {
-					fmt.Println("sending file to daemon:", selectedJob.file)
+					fmt.Println("sending file to daemon:", selectedJob.file, selectedJob.id)
 					// TODO Conversion between go and C strings?
 					strlen := len(selectedJob.file)
 					b = append(b, 1)
 					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.id))
+					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.mtu))
 					b = binary.LittleEndian.AppendUint16(b, uint16(strlen))
 					b = append(b, []byte(selectedJob.file)...)
 					fmt.Println(b)
@@ -504,10 +536,16 @@ func main() {
 				usock.WriteToUnix(b, a)
 
 			case C.SOCKMSG_TYPE_GET_PATHS:
-				fmt.Println("fetch path")
-				header := getNewHeader()
-				b := binary.LittleEndian.AppendUint16(nil, uint16(1))
-				b = append(b, SerializePath(&header)...)
+				// job_id := binary.LittleEndian.Uint16(buf[:2])
+				// buf = buf[2:]
+				job_id := 1
+				fmt.Println("fetch path, job", job_id)
+				transfersLock.Lock()
+				job, _ := transfers[int(job_id)]
+				n_headers, headers := headersToDestination(*src, job.dest, iffs, 1200)
+				transfersLock.Unlock()
+				b := binary.LittleEndian.AppendUint16(nil, uint16(n_headers))
+				b = append(b, headers...)
 				usock.WriteToUnix(b, a)
 
 			case C.SOCKMSG_TYPE_UPDATE_JOB:
