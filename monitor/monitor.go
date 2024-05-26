@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -374,7 +375,7 @@ func pickPathsToDestination(etherLen int, numPaths int, localAddress snet.UDPAdd
 	return pm.dsts[0].paths
 }
 
-func headersToDestination(src, dst snet.UDPAddr, ifs []*net.Interface, etherLen int) (int, []byte) {
+func headersToDestination(src, dst snet.UDPAddr, ifs []*net.Interface, etherLen int, nPaths int) (int, []byte) {
 	fmt.Println("making headers", src, dst)
 	srcA := addr.Addr{
 		IA:   src.IA,
@@ -385,7 +386,7 @@ func headersToDestination(src, dst snet.UDPAddr, ifs []*net.Interface, etherLen 
 		Host: addr.MustParseHost(dst.Host.IP.String()),
 	}
 	// TODO numpaths should come from somewhere
-	paths := pickPathsToDestination(etherLen, 1, src, ifs, dst)
+	paths := pickPathsToDestination(etherLen, nPaths, src, ifs, dst)
 	numSelectedPaths := len(paths)
 	headers_ser := []byte{}
 	for _, p := range paths {
@@ -409,6 +410,7 @@ type HerculesTransfer struct {
 	file   string
 	dest   snet.UDPAddr
 	mtu    int
+	nPaths int
 }
 
 var transfersLock sync.Mutex
@@ -432,6 +434,22 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "parse err")
 		return
 	}
+	mtu := 1200
+	if r.URL.Query().Has("mtu") {
+		mtu, err = strconv.Atoi(r.URL.Query().Get("mtu"))
+		if err != nil {
+			io.WriteString(w, "parse err")
+			return
+		}
+	}
+	nPaths := 1
+	if r.URL.Query().Has("np") {
+		mtu, err = strconv.Atoi(r.URL.Query().Get("np"))
+		if err != nil {
+			io.WriteString(w, "parse err")
+			return
+		}
+	}
 	fmt.Println(destParsed)
 	transfersLock.Lock()
 	transfers[nextID] = &HerculesTransfer{
@@ -439,7 +457,8 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 		status: Queued,
 		file:   file,
 		dest:   *destParsed,
-		mtu: 1200,
+		mtu:    mtu,
+		nPaths: nPaths,
 	}
 	nextID += 1
 	transfersLock.Unlock()
@@ -478,7 +497,7 @@ func main() {
 		iffs = append(iffs, &ifs[i])
 	}
 
-	pm, err := initNewPathManager(iffs, nil, src, 0);
+	pm, err := initNewPathManager(iffs, nil, src, 0)
 	fmt.Println(err)
 
 	http.HandleFunc("/", httpreq)
@@ -542,7 +561,7 @@ func main() {
 				fmt.Println("fetch path, job", job_id)
 				transfersLock.Lock()
 				job, _ := transfers[int(job_id)]
-				n_headers, headers := headersToDestination(*src, job.dest, iffs, 1200)
+				n_headers, headers := headersToDestination(*src, job.dest, iffs, job.mtu, job.nPaths)
 				transfersLock.Unlock()
 				b := binary.LittleEndian.AppendUint16(nil, uint16(n_headers))
 				b = append(b, headers...)
