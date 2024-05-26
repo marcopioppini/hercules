@@ -187,6 +187,7 @@ struct receiver_state {
 	char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE];
 	int rx_sample_len;
 	int rx_sample_ifid;
+	struct hercules_path reply_path;
 
 	// Start/end time of the current transfer
 	u64 start_time;
@@ -1499,7 +1500,6 @@ static void rx_receive_batch(struct receiver_state *rx_state, struct xsk_socket_
 	if(!rcvd){
 		return;
 	}
-		debug_printf("received %ld", rcvd);
 
 	// optimistically update receive timestamp
 	u64 now = get_nsecs();
@@ -1737,12 +1737,11 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 		struct sender_state_per_receiver *rcvr = &tx_state->receiver[unit->rcvr[i]];
 		struct hercules_path *path = &rcvr->paths[unit->paths[i]];
 		if(path->ifid == ifid) {
-			debug_printf("%d, %d", path->ifid, ifid);
 			num_chunks_in_unit++;
 		}
 	}
 	// We may have claimed more frames than we need, if the unit is not full
-	debug_printf("handling %d chunks in unit", num_chunks_in_unit);
+	/* debug_printf("handling %d chunks in unit", num_chunks_in_unit); */
 
 	u32 idx;
 	if(xsk_ring_prod__reserve(&xsk->tx, num_chunks_in_unit, &idx) != num_chunks_in_unit) {
@@ -1784,13 +1783,13 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 		stitch_checksum(path, path->header.checksum, pkt);
 	}
 
-	debug_printf("submitting %d chunks in unit", num_chunks_in_unit);
+	/* debug_printf("submitting %d chunks in unit", num_chunks_in_unit); */
 	xsk_ring_prod__submit(&xsk->tx, num_chunks_in_unit);
 	if (num_chunks_in_unit != SEND_QUEUE_ENTRIES_PER_UNIT){
-		debug_printf("Submitting only %d frames", num_chunks_in_unit);
+		/* debug_printf("Submitting only %d frames", num_chunks_in_unit); */
 	}
 	__sync_synchronize();
-	debug_printf("submit returns");
+	/* debug_printf("submit returns"); */
 }
 
 static inline void tx_handle_send_queue_unit(struct hercules_server *server, struct sender_state *tx_state, struct xsk_socket_info *xsks[],
@@ -1850,7 +1849,7 @@ static inline void allocate_tx_frames(struct hercules_server *server,
 				break;
 			}
 		}
-		debug_printf("claiming %d frames", num_frames);
+		/* debug_printf("claiming %d frames", num_frames); */
 		claim_tx_frames(server, &server->ifaces[i], frame_addrs[i], num_frames);
 	}
 }
@@ -1883,18 +1882,18 @@ static void tx_send_p(void *arg) {
 		}
 		num_chunks_in_unit++;
 	}
-	debug_printf("unit has %d chunks", num_chunks_in_unit);
+	/* debug_printf("unit has %d chunks", num_chunks_in_unit); */
     u64 frame_addrs[server->num_ifaces][SEND_QUEUE_ENTRIES_PER_UNIT];
     memset(frame_addrs, 0xFF, sizeof(frame_addrs));
 	for (u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++){
 		if (i >= num_chunks_in_unit){
-			debug_printf("not using unit slot %d", i);
+			/* debug_printf("not using unit slot %d", i); */
 			frame_addrs[0][i] = 0;
 		}
 	}
-	debug_printf("allocating frames");
+	/* debug_printf("allocating frames"); */
     allocate_tx_frames(server, frame_addrs);
-	debug_printf("done allocating frames");
+	/* debug_printf("done allocating frames"); */
 	// At this point we claimed 7 frames (as many as can fit in a sendq unit)
     tx_handle_send_queue_unit(server, session_tx->tx_state, args->xsks,
                               frame_addrs, &unit);
@@ -2011,6 +2010,7 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 		/* debug_printf("prepared %d/%d chunks", num_chunks_prepared, num_chunks); */
 		chunk_idx = bitset__scan_neg(&rcvr->acked_chunks, chunk_idx);
 		if(chunk_idx == tx_state->total_chunks) {
+			debug_printf("prev %d", rcvr->prev_chunk_idx);
 			if(rcvr->prev_chunk_idx == 0) { // this receiver has finished
 				debug_printf("receiver has finished");
 				rcvr->finished = true;
@@ -2191,8 +2191,8 @@ init_tx_state(struct hercules_session *session, size_t filesize, int chunklen, i
 		exit(1);
 	}
 
-	/* debug_printf("Sending a file consisting of %lld chunks (ANY KEY TO CONTINUE)", total_chunks); */
-	/* getchar(); */
+	debug_printf("Sending a file consisting of %lld chunks (ANY KEY TO CONTINUE)", total_chunks);
+	getchar();
 
 	struct sender_state *tx_state = calloc(1, sizeof(*tx_state));
 	tx_state->session = session;
@@ -2303,13 +2303,12 @@ static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initia
 	return true;
 }
 
-
-static bool rx_get_reply_path(struct receiver_state *rx_state, struct hercules_path *path)
-{
+static bool rx_update_reply_path(struct receiver_state *rx_state){
 	// Get reply path for sending ACKs:
 	//
 	// XXX: race reading from shared mem.
 	// Try to make a quick copy to at least limit the carnage.
+	debug_printf("Updating reply path");
 	if(!rx_state) {
 		debug_printf("ERROR: invalid rx_state");
 		return false;
@@ -2321,12 +2320,22 @@ static bool rx_get_reply_path(struct receiver_state *rx_state, struct hercules_p
 	memcpy(rx_sample_buf, rx_state->rx_sample_buf, rx_sample_len);
 
 	pthread_spin_lock(&usock_lock);
-	int ret = monitor_get_reply_path(usock, rx_sample_buf, rx_sample_len, rx_state->etherlen, path);
+	// TODO writing to reply path needs sync?
+	int ret = monitor_get_reply_path(usock, rx_sample_buf, rx_sample_len, rx_state->etherlen, &rx_state->reply_path);
 	pthread_spin_unlock(&usock_lock);
 	if(!ret) {
 		return false;
 	}
-	path->ifid = rx_state->rx_sample_ifid;
+	// XXX Do we always want to reply from the interface the packet was received on?
+	// TODO The monitor also returns an interface id (from route lookup)
+	rx_state->reply_path.ifid = rx_state->rx_sample_ifid;
+	return true;
+}
+
+
+static bool rx_get_reply_path(struct receiver_state *rx_state, struct hercules_path *path)
+{
+	memcpy(path, &rx_state->reply_path, sizeof(*path));
 	return true;
 }
 
@@ -2362,6 +2371,7 @@ static void rx_handle_initial(struct hercules_server *server, struct receiver_st
 	if(initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
 		debug_printf("setting rx sample");
 		set_rx_sample(rx_state, ifid, buf, headerlen + payloadlen);
+		rx_update_reply_path(rx_state);
 	}
 
 	rx_send_rtt_ack(server, rx_state, initial); // echo back initial pkt to ACK filesize
@@ -2896,7 +2906,7 @@ static void events_p(void *arg) {
   }
 }
 
-/* #define DEBUG_PRINT_PKTS */
+#define DEBUG_PRINT_PKTS
 #ifdef DEBUG_PRINT_PKTS
 void print_rbudp_pkt(const char *pkt, bool recv) {
   struct hercules_header *h = (struct hercules_header *)pkt;

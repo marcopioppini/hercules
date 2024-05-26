@@ -376,7 +376,7 @@ func pickPathsToDestination(etherLen int, numPaths int, localAddress snet.UDPAdd
 }
 
 func headersToDestination(src, dst snet.UDPAddr, ifs []*net.Interface, etherLen int, nPaths int) (int, []byte) {
-	fmt.Println("making headers", src, dst)
+	fmt.Println("making headers", src, dst, nPaths)
 	srcA := addr.Addr{
 		IA:   src.IA,
 		Host: addr.MustParseHost(src.Host.IP.String()),
@@ -444,7 +444,7 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 	}
 	nPaths := 1
 	if r.URL.Query().Has("np") {
-		mtu, err = strconv.Atoi(r.URL.Query().Get("np"))
+		nPaths, err = strconv.Atoi(r.URL.Query().Get("np"))
 		if err != nil {
 			io.WriteString(w, "parse err")
 			return
@@ -555,9 +555,8 @@ func main() {
 				usock.WriteToUnix(b, a)
 
 			case C.SOCKMSG_TYPE_GET_PATHS:
-				// job_id := binary.LittleEndian.Uint16(buf[:2])
-				// buf = buf[2:]
-				job_id := 1
+				job_id := binary.LittleEndian.Uint16(buf[:2])
+				buf = buf[2:]
 				fmt.Println("fetch path, job", job_id)
 				transfersLock.Lock()
 				job, _ := transfers[int(job_id)]

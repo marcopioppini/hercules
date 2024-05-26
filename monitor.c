@@ -46,6 +46,7 @@ bool monitor_get_paths(int sockfd, int job_id, int *n_paths,
 
   struct hercules_sockmsg_Q msg;
   msg.msgtype = SOCKMSG_TYPE_GET_PATHS;
+  msg.payload.paths.job_id = job_id;
   sendto(sockfd, &msg, sizeof(msg), 0, &monitor, sizeof(monitor));
 
   struct hercules_sockmsg_A reply;
@@ -90,6 +91,7 @@ bool monitor_get_new_job(int sockfd, char *name, u16 *job_id, struct hercules_ap
   // XXX name needs to be allocated large enough by caller
   strncpy(name, reply.payload.newjob.filename, reply.payload.newjob.filename_len);
   *job_id = reply.payload.newjob.job_id;
+  debug_printf("received job id %d", reply.payload.newjob.job_id);
   *mtu = reply.payload.newjob.mtu;
   return true;
 }
