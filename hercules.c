@@ -1663,29 +1663,29 @@ static void update_hercules_tx_paths(struct sender_state *tx_state)
 	free_path_lock();
 }
 
-void send_path_handshakes(struct sender_state *tx_state)
-{
-	return;
-	/* u64 now = get_nsecs(); */
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		struct sender_state_per_receiver *rcvr = &tx_state->receiver[r];
-		for(u32 p = 0; p < rcvr->num_paths; p++) {
-			struct hercules_path *path = &rcvr->paths[p];
-			if(path->enabled) {
-				/* u64 handshake_at = atomic_load(&path->next_handshake_at); */
-				/* if(handshake_at < now) { */
-				/* 	if(atomic_compare_exchange_strong(&path->next_handshake_at, &handshake_at, */
-				/* 									  now + PATH_HANDSHAKE_TIMEOUT_NS)) { */
-				/* 		debug_printf("sending hs"); */
-				/* 		tx_send_initial(tx_state->session, path, tx_state->filesize, tx_state->chunklen, get_nsecs(), p, */
-				/* 						p == rcvr->return_path_idx); */
-				/* 	} */
-				/* } */
-			}
-		}
-	}
-}
+void send_path_handshakes(struct hercules_server *server, struct sender_state *tx_state) {
+  u64 now = get_nsecs();
+  struct sender_state_per_receiver *rcvr = &tx_state->receiver[0];
 
+  for (u32 p = 0; p < rcvr->num_paths; p++) {
+    struct hercules_path *path = &rcvr->paths[p];
+	debug_printf("Checking path %d/%d", p, rcvr->num_paths);
+    if (path->enabled) {
+      u64 handshake_at = atomic_load(&path->next_handshake_at);
+      if (handshake_at < now) {
+        if (atomic_compare_exchange_strong(&path->next_handshake_at,
+                                           &handshake_at,
+                                           now + PATH_HANDSHAKE_TIMEOUT_NS)) {
+          debug_printf("sending hs on path %d", p);
+		  // FIXME file name below?
+          tx_send_initial(server, path, "abcd", tx_state->filesize,
+                          tx_state->chunklen, get_nsecs(), p,
+                          false, false);
+        }
+      }
+    }
+  }
+}
 
 static void claim_tx_frames(struct hercules_server *server, struct hercules_interface *iface, u64 *addrs, size_t num_frames)
 {
@@ -1922,6 +1922,25 @@ u32 compute_max_chunks_per_rcvr(struct sender_state *tx_state, u32 *max_chunks_p
 	}
 	return total_chunks;
 }
+// Collect path rate limits
+u32 compute_max_chunks_current_path(struct sender_state *tx_state) {
+  u32 allowed_chunks = 0;
+  u64 now = get_nsecs();
+
+  if (!tx_state->receiver[0].paths[tx_state->receiver[0].path_index].enabled) {
+    return 0; // if a receiver does not have any enabled paths, we can actually
+              // end up here ... :(
+  }
+
+  if (tx_state->receiver[0].cc_states != NULL) { // use PCC
+    struct ccontrol_state *cc_state =
+        &tx_state->receiver[0].cc_states[tx_state->receiver[0].path_index];
+    allowed_chunks = umin32(BATCH_SIZE, ccontrol_can_send_npkts(cc_state, now));
+  } else { // no path-based limit
+    allowed_chunks = BATCH_SIZE;
+  }
+  return allowed_chunks;
+}
 
 // exclude receivers that have completed the current iteration
 u32 exclude_finished_receivers(struct sender_state *tx_state, u32 *max_chunks_per_rcvr, u32 total_chunks)
@@ -2095,7 +2114,7 @@ static void tx_only(struct hercules_server *server, struct sender_state *tx_stat
 
 	while(tx_state->session->state == SESSION_STATE_RUNNING && finished_count < tx_state->num_receivers) {
 		pop_completion_rings(server);
-		send_path_handshakes(tx_state);
+		/* send_path_handshakes(tx_state); */
 		u64 next_ack_due = 0;
 		u32 num_chunks_per_rcvr[tx_state->num_receivers];
 		memset(num_chunks_per_rcvr, 0, sizeof(num_chunks_per_rcvr));
@@ -2762,6 +2781,7 @@ static void events_p(void *arg) {
 		  session->state = SESSION_STATE_PENDING;
 		  session->destination = server->config.local_addr;
 		  session->destination.ip = 0x132a8c0UL;
+		  // FIXME remove ip above
 
 		  int n_paths;
 		  struct hercules_path *paths;
@@ -3144,32 +3164,93 @@ static void *tx_p(void *arg) {
   struct hercules_server *server = arg;
   while (1) {
     /* pthread_spin_lock(&server->biglock); */
-      pop_completion_rings(server);
+    pop_completion_rings(server);
+    u32 chunks[BATCH_SIZE];
+    u8 chunk_rcvr[BATCH_SIZE];
     struct hercules_session *session_tx = atomic_load(&server->session_tx);
-    if (session_tx != NULL && atomic_load(&session_tx->state) == SESSION_STATE_RUNNING) {
+    if (session_tx != NULL &&
+        atomic_load(&session_tx->state) == SESSION_STATE_RUNNING) {
       struct sender_state *tx_state = session_tx->tx_state;
-      /* tx_only(server, tx_state); */
-      u32 chunks[BATCH_SIZE];
-      u8 chunk_rcvr[BATCH_SIZE];
-      u32 max_chunks_per_rcvr[1] = {BATCH_SIZE};
+      debug_printf("Start transmit round");
+      tx_state->prev_rate_check = get_nsecs();
 
+      pop_completion_rings(server);
+      send_path_handshakes(server, tx_state);
       u64 next_ack_due = 0;
-      u32 total_chunks = BATCH_SIZE;
+
+      // in each iteration, we send packets on a single path to each receiver
+      // collect the rate limits for each active path
+      u32 allowed_chunks = compute_max_chunks_current_path(tx_state);
+
+      if (allowed_chunks ==
+          0) { // we hit the rate limits on every path; switch paths
+        iterate_paths(tx_state);
+        continue;
+      }
+
+      // TODO re-enable?
+      // sending rates might add up to more than BATCH_SIZE, shrink
+      // proportionally, if needed
+      /* shrink_sending_rates(tx_state, max_chunks_per_rcvr, total_chunks); */
+
       const u64 now = get_nsecs();
       u32 num_chunks = 0;
       struct sender_state_per_receiver *rcvr = &tx_state->receiver[0];
-      u64 ack_due = 0;
-      u32 cur_num_chunks = prepare_rcvr_chunks(
-          tx_state, 0, &chunks[num_chunks], &chunk_rcvr[num_chunks], now,
-          &ack_due, max_chunks_per_rcvr[0]);
-	  /* debug_printf("prepared %d chunks", cur_num_chunks); */
-	  num_chunks += cur_num_chunks;
-	  if (num_chunks > 0){
-		  u8 rcvr_path[1] = {0};
-		  produce_batch(server, session_tx, tx_state, rcvr_path, chunks, chunk_rcvr, num_chunks);
-			tx_state->tx_npkts_queued += num_chunks;
-	  }
-	  /* sleep_nsecs(1e9); // XXX FIXME */
+      if (!rcvr->finished) {
+        u64 ack_due = 0;
+        // for each receiver, we prepare up to max_chunks_per_rcvr[r] chunks to
+        // send
+        u32 cur_num_chunks = prepare_rcvr_chunks(
+            tx_state, 0, &chunks[num_chunks], &chunk_rcvr[num_chunks], now,
+            &ack_due, allowed_chunks);
+        num_chunks += cur_num_chunks;
+        if (rcvr->finished) {
+          if (rcvr->cc_states) {
+            terminate_cc(rcvr);
+            kick_cc(tx_state);
+          }
+        } else {
+          // only wait for the nearest ack
+          if (next_ack_due) {
+            if (next_ack_due > ack_due) {
+              next_ack_due = ack_due;
+            }
+          } else {
+            next_ack_due = ack_due;
+          }
+        }
+      }
+
+      if (num_chunks > 0) {
+        u8 rcvr_path[tx_state->num_receivers];
+        prepare_rcvr_paths(tx_state, rcvr_path);
+        produce_batch(server, session_tx, tx_state, rcvr_path, chunks, chunk_rcvr,
+                      num_chunks);
+        tx_state->tx_npkts_queued += num_chunks;
+        rate_limit_tx(tx_state);
+
+        // update book-keeping
+        struct sender_state_per_receiver *receiver = &tx_state->receiver[0];
+        u32 path_idx = tx_state->receiver[0].path_index;
+        if (receiver->cc_states != NULL) {
+          struct ccontrol_state *cc_state = &receiver->cc_states[path_idx];
+		  // FIXME allowed_chunks below is not correct (3x)
+          atomic_fetch_add(&cc_state->mi_tx_npkts, allowed_chunks);
+          atomic_fetch_add(&cc_state->total_tx_npkts, allowed_chunks);
+          if (pcc_has_active_mi(cc_state, now)) {
+            atomic_fetch_add(&cc_state->mi_tx_npkts_monitored,
+                             allowed_chunks);
+          }
+        }
+      }
+
+      iterate_paths(tx_state);
+
+      if (now < next_ack_due) {
+        // XXX if the session vanishes in the meantime, we might wait
+        // unnecessarily
+        sleep_until(next_ack_due);
+      }
     }
   }
 
