@@ -28,8 +28,7 @@ struct send_queue_unit {
 	u32 chunk_idx[SEND_QUEUE_ENTRIES_PER_UNIT];
 	u8 rcvr[SEND_QUEUE_ENTRIES_PER_UNIT];
 	u8 paths[SEND_QUEUE_ENTRIES_PER_UNIT];
-	u32 ts;
-	char a[CACHELINE_SIZE - 6 - SEND_QUEUE_ENTRIES_PER_UNIT * SEND_QUEUE_ENTRY_SIZE]; // force padding to 64 bytes
+	char a[CACHELINE_SIZE - SEND_QUEUE_ENTRIES_PER_UNIT * SEND_QUEUE_ENTRY_SIZE]; // force padding to 64 bytes
 };
 _Static_assert(sizeof(struct send_queue_unit) == 64, "struct send_queue_unit should be cache line sized");
 

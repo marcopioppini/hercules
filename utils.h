@@ -27,15 +27,8 @@ typedef __u8 u8;
 
 #ifndef NDEBUG
 #define debug_printf(fmt, ...) printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
-#define debug_quit(fmt, ...)                                                   \
-  do {                                                                         \
-    printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__,       \
-           ##__VA_ARGS__);                                                     \
-    exit_with_error(NULL, 1);                                                  \
-  } while (0);
 #else
 #define debug_printf(...) ;
-#define debug_quit(...) ;
 #endif
 
 #ifndef likely

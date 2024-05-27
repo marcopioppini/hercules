@@ -115,20 +115,13 @@ struct receiver_state;
 struct hercules_stats hercules_rx(struct hercules_session *session, const char *filename, int xdp_mode,
                                   bool configure_queues, int accept_timeout, int num_threads, bool is_pcc_benchmark);
 
-
-struct rx_print_args{
-	struct hercules_session *session;
-	struct xsk_socket_info *xsk;
-	struct send_queue *rxq;
-};
-
 struct hercules_server *
 hercules_init_server(int *ifindices, int num_ifaces,
                      const struct hercules_app_addr local_addr, int queue,
                      int xdp_mode, int n_threads, bool configure_queues);
 void hercules_main(struct hercules_server *server);
 void hercules_main_sender(struct hercules_server *server, int xdp_mode, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc);
-void print_rbudp_pkt(const char *pkt, bool recv);
+void debug_print_rbudp_pkt(const char *pkt, bool recv);
 struct hercules_session *make_session(struct hercules_server *server);
 
 #endif // __HERCULES_H__
