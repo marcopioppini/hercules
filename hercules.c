@@ -126,21 +126,28 @@ struct hercules_config {
 	struct hercules_app_addr local_addr;
 };
 
+// Some states are used only by the TX/RX side and are marked accordingly
 enum session_state {
-  SESSION_STATE_NONE,     //< no session
-  SESSION_STATE_PENDING,  //< Need to send HS and repeat until TO
-  SESSION_STATE_CREATED,  //<
-  SESSION_STATE_READY,    //< Receiver setup ready, need to send HS and CTS
-  SESSION_STATE_WAIT_HS,  //< Waiting for HS
-  SESSION_STATE_WAIT_CTS, //< Waiting for CTS
+  SESSION_STATE_NONE,
+  SESSION_STATE_PENDING, //< (TX) Need to send HS and repeat until TO, waiting
+                         // for a reflected HS packet
+  SESSION_STATE_NEW, //< (RX) Received a HS packet, need to send HS reply and
+                     // CTS
+  SESSION_STATE_WAIT_CTS, //< (TX) Waiting for CTS
   SESSION_STATE_RUNNING,  //< Transfer in progress
   SESSION_STATE_DONE,     //< Transfer done (or cancelled with error)
+};
+
+enum session_error {
+  SESSION_ERROR_OK,      //< No error, transfer completed successfully
+  SESSION_ERROR_TIMEOUT, //< Session timed out
 };
 
 struct hercules_session {
   struct receiver_state *rx_state;
   struct sender_state *tx_state;
   enum session_state state;
+  enum session_error error;
   struct send_queue *send_queue;
 
 	struct hercules_app_addr destination;
@@ -349,6 +356,11 @@ static inline struct hercules_interface *get_interface_by_id(struct hercules_ser
 		}
 	}
 	return NULL;
+}
+
+static inline void quit_session(struct hercules_session *s, enum session_error err){
+    s->error = err;
+    s->state = SESSION_STATE_DONE;
 }
 
 // XXX: from lib/scion/udp.c
@@ -2802,7 +2814,6 @@ static void events_p(void *arg) {
           tx_send_initial(server, &tx_state->receiver[0].paths[0], fname,
                           tx_state->filesize, tx_state->chunklen, timestamp, 0,
                           true, true);
-          atomic_store(&server->session_tx->state, SESSION_STATE_WAIT_HS);
         } else {
           debug_printf("no new job.");
         }
@@ -2861,7 +2872,7 @@ static void events_p(void *arg) {
           // we sent out earlier
           debug_printf("HS confirm packet");
           if (server->session_tx != NULL &&
-              server->session_tx->state == SESSION_STATE_WAIT_HS) {
+              server->session_tx->state == SESSION_STATE_PENDING) {
             server->session_tx->state = SESSION_STATE_WAIT_CTS;
           }
           break; // Make sure we don't process this further
@@ -2873,7 +2884,7 @@ static void events_p(void *arg) {
           if (parsed_pkt.flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
             struct hercules_session *session = make_session(server);
             server->session_rx = session;
-            session->state = SESSION_STATE_CREATED;
+            session->state = SESSION_STATE_NEW;
 			// TODO fill in etherlen
             struct receiver_state *rx_state = make_rx_state(
                 session, parsed_pkt.name, parsed_pkt.filesize, parsed_pkt.chunklen, 1200, false);
