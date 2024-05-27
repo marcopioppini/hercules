@@ -149,6 +149,8 @@ struct hercules_session {
   enum session_state state;
   enum session_error error;
   struct send_queue *send_queue;
+    u64 last_pkt_sent;
+    u64 last_pkt_rcvd;
 
 	struct hercules_app_addr destination;
 	int num_paths;
@@ -238,6 +240,7 @@ struct sender_state {
 
 	/** Filesize in bytes */
 	size_t filesize;
+    char filename[100];
 	/** Size of file data (in byte) per packet */
 	u32 chunklen;
 	/** Number of packets that will make up the entire file. Equal to `ceil(filesize/chunklen)` */
@@ -2809,11 +2812,8 @@ static void events_p(void *arg) {
               server->session_tx, filesize, chunklen, server->rate_limit, mem,
               &session->destination, session->paths_to_dest, 1,
               session->num_paths, server->max_paths);
+          strncpy(tx_state, fname, 99);
           server->session_tx->tx_state = tx_state;
-          unsigned long timestamp = get_nsecs();
-          tx_send_initial(server, &tx_state->receiver[0].paths[0], fname,
-                          tx_state->filesize, tx_state->chunklen, timestamp, 0,
-                          true, true);
         } else {
           debug_printf("no new job.");
         }
@@ -2821,7 +2821,34 @@ static void events_p(void *arg) {
     }
     // XXX
 
-	/* // Set timeout on the socket */
+    struct hercules_session *session_tx = atomic_load(&server->session_tx);
+    // TODO FIXME enable once receive timestamps are stored upon pkt reception
+    /* if (session_tx && session_tx->state == SESSION_STATE_DONE){ */
+    /*     if (get_nsecs() > session_tx->last_pkt_rcvd + 20e9){ */
+    /*         atomic_store(&server->session_tx, NULL); // FIXME leak */
+    /*         fprintf(stderr, "Cleaning up session..."); */
+    /*     } */
+    /* } */
+    /* // Time out if no packets received for 10 sec. */
+    /* if (session_tx && session_tx->state != SESSION_STATE_DONE){ */
+    /*     if (get_nsecs() > session_tx->last_pkt_rcvd + 10e9){ */
+    /*         quit_session(session_tx, SESSION_ERROR_TIMEOUT); */
+    /*         debug_printf("Session timed out!"); */
+    /*     } */
+    /* } */
+    // (Re)send HS if needed
+    if (session_tx && session_tx->state == SESSION_STATE_PENDING) {
+      unsigned long timestamp = get_nsecs();
+      if (timestamp > session_tx->last_pkt_sent + 1e9) { // Re-send HS every 1 sec.
+          struct sender_state *tx_state = session_tx->tx_state;
+        tx_send_initial(server, &tx_state->receiver[0].paths[0], tx_state->filename,
+                        tx_state->filesize, tx_state->chunklen, timestamp, 0,
+                        true, true);
+        session_tx->last_pkt_sent = timestamp;
+      }
+    }
+
+        /* // Set timeout on the socket */
 	/* struct timeval to = {.tv_sec = 0, .tv_usec = 500}; */
 	/* setsockopt(server->control_sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to)); */
     ssize_t len = recvfrom(server->control_sockfd, buf, sizeof(buf), 0,
@@ -2911,8 +2938,7 @@ static void events_p(void *arg) {
                            &server->session_tx->tx_state->receiver[0]);
           if (tx_acked_all(server->session_tx->tx_state)) {
             debug_printf("TX done, received all acks");
-            /* server->session_tx = NULL; // FIXME leak */
-			atomic_store(&server->session_tx, NULL);
+            quit_session(server->session_tx, SESSION_ERROR_OK);
           }
         }
         break;
@@ -2997,6 +3023,11 @@ struct hercules_session *make_session(struct hercules_server *server) {
     exit_with_error(NULL, err);
   }
   init_send_queue(s->send_queue, BATCH_SIZE);
+  s->last_pkt_sent = 0;
+  s->last_pkt_rcvd =
+      get_nsecs(); // Set this to "now" to allow timing out HS at sender (when
+                   // no packet was received yet), once packets are received it
+                   // will be updated accordingly
 
   return s;
 }
