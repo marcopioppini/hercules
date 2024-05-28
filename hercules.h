@@ -90,7 +90,10 @@ struct receiver_state {
 	u64 start_time;
 	u64 end_time;
 	u64 cts_sent_at;
-	u64 last_pkt_rcvd;	// Timeout detection
+	u64 last_pkt_rcvd;		// Timeout detection
+	u64 last_new_pkt_rcvd;	// If we don't receive any new chunks for a while
+							// something is presumably wrong and we abort the
+							// transfer
 
 	u8 num_tracked_paths;
 	bool is_pcc_benchmark;
@@ -172,7 +175,8 @@ enum session_state {
 enum session_error {
 	SESSION_ERROR_OK,		//< No error, transfer completed successfully
 	SESSION_ERROR_TIMEOUT,	//< Session timed out
-	SESSION_ERROR_PCC,
+	SESSION_ERROR_PCC,		//< Something wrong with PCC
+	SESSION_ERROR_SEQNO_OVERFLOW,
 };
 
 // A session is a transfer between one sender and one receiver
@@ -188,9 +192,9 @@ struct hercules_session {
 	struct hercules_app_addr destination;
 	int num_paths;
 	struct hercules_path *paths_to_dest;
-	// State for stat dump
-	/* size_t rx_npkts; */
-	/* size_t tx_npkts; */
+
+	size_t rx_npkts;
+	size_t tx_npkts;
 };
 
 // SERVER

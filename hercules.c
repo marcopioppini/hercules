@@ -69,15 +69,13 @@
 
 #define ACK_RATE_TIME_MS 100 // send ACKS after at most X milliseconds
 
-static const int rbudp_headerlen = sizeof(u32) + sizeof(u8) + sizeof(sequence_number);
-static const u64 tx_handshake_retry_after = 1e9;
-static const u64 tx_handshake_timeout = 5e9;
+static const int rbudp_headerlen = sizeof(struct hercules_header);
+static const u64 session_timeout = 10e9; // 10 sec
 #define PCC_NO_PATH UINT8_MAX // tell the receiver not to count the packet on any path
 
 // TODO move and see if we can't use this from only 1 thread so no locks
 int usock;
 pthread_spinlock_t usock_lock;
-
 
 // Fill packet with n bytes from data and pad with zeros to payloadlen.
 static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx,
@@ -93,7 +91,7 @@ static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initia
 
 static struct hercules_session *make_session(struct hercules_server *server);
 
-/// COMMON
+/// OK COMMON
 
 /**
  * @param scionaddrhdr
@@ -135,9 +133,10 @@ static inline struct hercules_interface *get_interface_by_id(struct hercules_ser
 }
 
 // Mark the session as done and store why it was stopped.
-static inline void quit_session(struct hercules_session *s, enum session_error err){
-    s->error = err;
-    s->state = SESSION_STATE_DONE;
+static inline void quit_session(struct hercules_session *s,
+								enum session_error err) {
+	s->error = err;
+	s->state = SESSION_STATE_DONE;
 }
 
 static u32 ack__max_num_entries(u32 len)
@@ -151,10 +150,10 @@ static u32 ack__len(const struct rbudp_ack_pkt *ack)
 	return sizeof(ack->num_acks) + sizeof(ack->ack_nr) + sizeof(ack->max_seq) + sizeof(ack->timestamp) + ack->num_acks * sizeof(ack->acks[0]);
 }
 
-// Send the packet pointed to by *buf via the server's control socket.
+// Send the *raw* packet pointed to by buf via the server's control socket.
 // Used for transmitting control packets.
-static void send_eth_frame(struct hercules_server *server, const struct hercules_path *path, void *buf)
-{
+static void send_eth_frame(struct hercules_server *server,
+						   const struct hercules_path *path, void *buf) {
 	struct sockaddr_ll addr;
 	// Index of the network device
 	addr.sll_ifindex = path->ifid;
@@ -163,8 +162,9 @@ static void send_eth_frame(struct hercules_server *server, const struct hercules
 	// Destination MAC; extracted from ethernet header
 	memcpy(addr.sll_addr, buf, ETH_ALEN);
 
-	ssize_t ret = sendto(server->control_sockfd, buf, path->framelen, 0, (struct sockaddr *) &addr, sizeof(struct sockaddr_ll));
-	if(ret == -1) {
+	ssize_t ret = sendto(server->control_sockfd, buf, path->framelen, 0,
+						 (struct sockaddr *)&addr, sizeof(struct sockaddr_ll));
+	if (ret == -1) {
 		exit_with_error(server, errno);
 	}
 }
@@ -219,16 +219,19 @@ void debug_print_rbudp_pkt(const char * pkt, bool recv){
 }
 #endif
 
-// Initialise a new session
+// Initialise a new session. Returns null in case of error.
 static struct hercules_session *make_session(struct hercules_server *server) {
 	struct hercules_session *s;
 	s = calloc(1, sizeof(*s));
-	assert(s);
+	if (s == NULL) {
+		return NULL;
+	}
 	s->state = SESSION_STATE_NONE;
 	int err = posix_memalign((void **)&s->send_queue, CACHELINE_SIZE,
 							 sizeof(*s->send_queue));
 	if (err != 0) {
-		exit_with_error(NULL, err);
+		free(s);
+		return NULL;
 	}
 	init_send_queue(s->send_queue, BATCH_SIZE);
 	s->last_pkt_sent = 0;
@@ -236,55 +239,57 @@ static struct hercules_session *make_session(struct hercules_server *server) {
 		get_nsecs();  // Set this to "now" to allow timing out HS at sender
 					  // (when no packet was received yet), once packets are
 					  // received it will be updated accordingly
-
 	return s;
 }
 
-// Initialise the Hercules server
-struct hercules_server *
-hercules_init_server(int *ifindices, int num_ifaces,
-                     const struct hercules_app_addr local_addr, int queue,
-                     int xdp_mode, int n_threads, bool configure_queues) {
-  struct hercules_server *server;
-  server = calloc(1, sizeof(*server) + num_ifaces * sizeof(*server->ifaces));
-  if (server == NULL) {
-    exit_with_error(NULL, ENOMEM);
-  }
-  debug_printf("local address %llx %x %x", local_addr.ia, local_addr.ip,
-               local_addr.port);
-  server->ifindices = ifindices;
-  server->num_ifaces = num_ifaces;
-  server->config.queue = queue;
-  server->n_threads = n_threads;
-  server->session_rx = NULL;
-  server->session_tx = NULL;
-  server->session_tx_counter = 0;
-  server->worker_args = calloc(server->n_threads, sizeof(struct rx_p_args *));
-  server->config.local_addr = local_addr;
-  server->config.configure_queues = configure_queues;
-  server->enable_pcc = false;
+// Initialise the Hercules server. If this runs into trouble we just exit as
+// there's no point in continuing.
+struct hercules_server *hercules_init_server(
+	int *ifindices, int num_ifaces, const struct hercules_app_addr local_addr,
+	int queue, int xdp_mode, int n_threads, bool configure_queues) {
+	struct hercules_server *server;
+	server = calloc(1, sizeof(*server) + num_ifaces * sizeof(*server->ifaces));
+	if (server == NULL) {
+		exit_with_error(NULL, ENOMEM);
+	}
+	server->ifindices = ifindices;
+	server->num_ifaces = num_ifaces;
+	server->config.queue = queue;
+	server->n_threads = n_threads;
+	server->session_rx = NULL;
+	server->session_tx = NULL;
+	server->session_tx_counter = 0;
+	server->worker_args = calloc(server->n_threads, sizeof(struct rx_p_args *));
+	if (server->worker_args == NULL){
+		exit_with_error(NULL, ENOMEM);
+	}
+	server->config.local_addr = local_addr;
+	server->config.configure_queues = configure_queues;
+	server->enable_pcc =
+		false;	// TODO this should be per-path or at least per-transfer
 
-  for (int i = 0; i < num_ifaces; i++) {
-    server->ifaces[i] = (struct hercules_interface){
-        .queue = queue,
-        .ifid = ifindices[i],
-        .ethtool_rule = -1,
-    };
-    if_indextoname(ifindices[i], server->ifaces[i].ifname);
-    debug_printf("using queue %d on interface %s", server->ifaces[i].queue,
-                 server->ifaces[i].ifname);
-  }
+	for (int i = 0; i < num_ifaces; i++) {
+		server->ifaces[i] = (struct hercules_interface){
+			.queue = queue,
+			.ifid = ifindices[i],
+			.ethtool_rule = -1,
+		};
+		if_indextoname(ifindices[i], server->ifaces[i].ifname);
+		debug_printf("using queue %d on interface %s", server->ifaces[i].queue,
+					 server->ifaces[i].ifname);
+	}
 
-  pthread_spin_init(&usock_lock, PTHREAD_PROCESS_PRIVATE);
+	pthread_spin_init(&usock_lock, PTHREAD_PROCESS_PRIVATE);
 
-  server->control_sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
-  if (server->control_sockfd == -1) {
-    exit_with_error(server, 0);
-  }
-  debug_printf("init complete");
-  return server;
+	server->control_sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+	if (server->control_sockfd == -1) {
+		exit_with_error(server, 0);
+	}
+	debug_printf("init complete");
+	return server;
 }
-/// PACKET PARSING
+
+/// OK PACKET PARSING
 // XXX: from lib/scion/udp.c
 /*
  * Calculate UDP checksum
@@ -527,6 +532,7 @@ static void stitch_checksum(const struct hercules_path *path, u16 precomputed_ch
 
 	mempcpy(payload - 2, &pkt_checksum, sizeof(pkt_checksum));
 }
+
 // Fill packet with n bytes from data and pad with zeros to payloadlen.
 static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx,
 						   sequence_number seqnr, const char *data, size_t n,
@@ -541,6 +547,8 @@ static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx,
 	}
 	debug_print_rbudp_pkt(rbudp_pkt, false);
 }
+
+// Parse an initial (HS) packet and copy its contents to *parsed_pkt
 static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initial_pkt *parsed_pkt)
 {
 	struct hercules_control_packet control_pkt;
@@ -556,7 +564,8 @@ static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initia
 	memcpy(parsed_pkt, &control_pkt.payload.initial, sizeof(*parsed_pkt) + control_pkt.payload.initial.name_len);
 	return true;
 }
-/// RECEIVER
+
+/// OK RECEIVER
 
 static bool rx_received_all(const struct receiver_state *rx_state)
 {
@@ -607,7 +616,8 @@ static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *p
 			} else {
 				fprintf(stderr, "sequence number overflow %d / %d\n", seqnr,
 				        rx_state->path_state[path_idx].seq_rcvd.num);
-				exit(EXIT_FAILURE);
+				quit_session(rx_state->session, SESSION_ERROR_SEQNO_OVERFLOW);
+				return false;
 			}
 		}
 		bitset__set_mt_safe(&rx_state->path_state[path_idx].seq_rcvd, seqnr);
@@ -676,15 +686,13 @@ fill_nack_pkt(sequence_number first, struct rbudp_ack_pkt *ack, size_t max_num_a
 	ack->num_acks = e;
 	return curr;
 }
+
 static bool has_more_nacks(sequence_number curr, struct bitset *seqs)
 {
 	u32 begin = bitset__scan_neg(seqs, curr);
 	u32 end = bitset__scan(seqs, begin + 1);
 	return end < seqs->num;
 }
-
-static void rx_handle_initial(struct hercules_server *server, struct receiver_state *rx_state, struct rbudp_initial_pkt *initial, const char *buf,
-							  int ifid, const char *payload, int payloadlen);
 
 static void
 submit_rx_frames(struct hercules_session *session, struct xsk_umem_info *umem, const u64 *addrs, size_t num_frames)
@@ -707,53 +715,51 @@ submit_rx_frames(struct hercules_session *session, struct xsk_umem_info *umem, c
 	pthread_spin_unlock(&umem->lock);
 }
 
-static void rx_receive_batch(struct receiver_state *rx_state, struct xsk_socket_info *xsk)
-{
-	/* debug_printf("receive batch"); */
+// Read a batch of data packets from the XSK
+static void rx_receive_batch(struct receiver_state *rx_state,
+							 struct xsk_socket_info *xsk) {
 	u32 idx_rx = 0;
 	int ignored = 0;
 
 	size_t rcvd = xsk_ring_cons__peek(&xsk->rx, BATCH_SIZE, &idx_rx);
-	if(!rcvd){
+	if (!rcvd) {
 		return;
 	}
 
 	// optimistically update receive timestamp
 	u64 now = get_nsecs();
 	u64 old_last_pkt_rcvd = atomic_load(&rx_state->last_pkt_rcvd);
-	if(old_last_pkt_rcvd < now) {
-		atomic_compare_exchange_strong(&rx_state->last_pkt_rcvd, &old_last_pkt_rcvd, now);
+	if (old_last_pkt_rcvd < now) {
+		atomic_compare_exchange_strong(&rx_state->last_pkt_rcvd,
+									   &old_last_pkt_rcvd, now);
 	}
 
 	u64 frame_addrs[BATCH_SIZE];
-	for(size_t i = 0; i < rcvd; i++) {
+	for (size_t i = 0; i < rcvd; i++) {
 		u64 addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->addr;
 		frame_addrs[i] = addr;
 		u32 len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->len;
 		const char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 		const char *rbudp_pkt = parse_pkt_fast_path(pkt, len, true, UINT32_MAX);
-		if(rbudp_pkt) {
+		if (rbudp_pkt) {
 			debug_print_rbudp_pkt(rbudp_pkt, true);
-			if(!handle_rbudp_data_pkt(rx_state, rbudp_pkt, len - (rbudp_pkt - pkt))) {
-				struct rbudp_initial_pkt initial;
-				if(rbudp_parse_initial(rbudp_pkt + rbudp_headerlen, len, &initial)) {
-					/* rx_handle_initial(rx_state, &initial, pkt, xsk->umem->iface->ifid, rbudp_pkt, (int) len - (int) (rbudp_pkt - pkt)); */
-				} else {
-					ignored++;
-				}
+			if (!handle_rbudp_data_pkt(rx_state, rbudp_pkt,
+									   len - (rbudp_pkt - pkt))) {
+				debug_printf("Non-data packet on XDP socket? Ignoring.");
+				ignored++;
 			}
 		} else {
-			debug_printf("ignoring packet failed parse");
+			debug_printf("Unparseable packet on XDP socket, ignoring");
 			ignored++;
 		}
 	}
 	xsk_ring_cons__release(&xsk->rx, rcvd);
-	/* atomic_fetch_add(&rx_state->session->rx_npkts, (rcvd - ignored)); */
+	atomic_fetch_add(&rx_state->session->rx_npkts, (rcvd - ignored));
 	submit_rx_frames(rx_state->session, xsk->umem, frame_addrs, rcvd);
 }
-// TODO should return error instead of quitting
-static char *rx_mmap(struct hercules_server *server, const char *pathname, size_t filesize)
-{
+
+// Prepare a file and memory mapping to receive a file
+static char *rx_mmap(const char *pathname, size_t filesize) {
 	debug_printf("mmap file: %s", pathname);
 	int ret;
 	/*ret = unlink(pathname);
@@ -761,29 +767,38 @@ static char *rx_mmap(struct hercules_server *server, const char *pathname, size_
 		exit_with_error(server, errno);
 	}*/
 	int f = open(pathname, O_RDWR | O_CREAT | O_EXCL, 0664);
-	if(f == -1 && errno == EEXIST) {
+	if (f == -1 && errno == EEXIST) {
 		f = open(pathname, O_RDWR | O_EXCL);
 	}
-	if(f == -1) {
-		exit_with_error(server, errno);
+	if (f == -1) {
+		return NULL;
 	}
-	ret = fallocate(f, 0, 0, filesize); // Will fail on old filesystems (ext3)
-	if(ret) {
-		exit_with_error(server, errno);
+	ret = fallocate(f, 0, 0, filesize);	 // Will fail on old filesystems (ext3)
+	if (ret) {
+		close(f);
+		return NULL;
 	}
 	char *mem = mmap(NULL, filesize, PROT_WRITE, MAP_SHARED, f, 0);
-	if(mem == MAP_FAILED) {
-		exit_with_error(server, errno);
+	if (mem == MAP_FAILED) {
+		close(f);
+		return NULL;
 	}
+	// TODO Shouldn't we keep the file open until the transfer is finished to
+	// prevent it being messed with?
 	close(f);
 	return mem;
 }
 
-static struct receiver_state *make_rx_state(struct hercules_session *session, char *filename, size_t filesize, int chunklen, int etherlen,
-                                            bool is_pcc_benchmark)
-{
+// Create new receiver state. Returns null in case of error.
+static struct receiver_state *make_rx_state(struct hercules_session *session,
+											char *filename, size_t filesize,
+											int chunklen, int etherlen,
+											bool is_pcc_benchmark) {
 	struct receiver_state *rx_state;
 	rx_state = calloc(1, sizeof(*rx_state));
+	if (rx_state == NULL){
+		return NULL;
+	}
 	rx_state->session = session;
 	rx_state->filesize = filesize;
 	rx_state->chunklen = chunklen;
@@ -793,48 +808,56 @@ static struct receiver_state *make_rx_state(struct hercules_session *session, ch
 	rx_state->end_time = 0;
 	rx_state->handshake_rtt = 0;
 	rx_state->is_pcc_benchmark = is_pcc_benchmark;
-	rx_state->mem = rx_mmap(NULL, filename, filesize);
+	rx_state->mem = rx_mmap(filename, filesize);
+	if (rx_state->mem == NULL) {
+		free(rx_state);
+		return NULL;
+	}
 	rx_state->etherlen = etherlen;
 	return rx_state;
 }
-static bool rx_update_reply_path(struct receiver_state *rx_state){
-	// Get reply path for sending ACKs:
-	//
-	// XXX: race reading from shared mem.
-	// Try to make a quick copy to at least limit the carnage.
+
+// Update the reply path using the header from a received packet.
+// The packet is sent to the monior, which will return a new header with the
+// path reversed.
+static bool rx_update_reply_path(
+	struct receiver_state *rx_state, int ifid, int rx_sample_len,
+	const char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE]) {
 	debug_printf("Updating reply path");
-	if(!rx_state) {
+	if (!rx_state) {
 		debug_printf("ERROR: invalid rx_state");
 		return false;
 	}
-	int rx_sample_len = rx_state->rx_sample_len;
 	assert(rx_sample_len > 0);
 	assert(rx_sample_len <= XSK_UMEM__DEFAULT_FRAME_SIZE);
-	char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE];
-	memcpy(rx_sample_buf, rx_state->rx_sample_buf, rx_sample_len);
 
 	pthread_spin_lock(&usock_lock);
 	// TODO writing to reply path needs sync?
-	int ret = monitor_get_reply_path(usock, rx_sample_buf, rx_sample_len, rx_state->etherlen, &rx_state->reply_path);
+	int ret = monitor_get_reply_path(usock, rx_sample_buf, rx_sample_len,
+									 rx_state->etherlen, &rx_state->reply_path);
 	pthread_spin_unlock(&usock_lock);
-	if(!ret) {
+	if (!ret) {
 		return false;
 	}
-	// XXX Do we always want to reply from the interface the packet was received on?
+	// XXX Do we always want to reply from the interface the packet was received
+	// on?
 	// TODO The monitor also returns an interface id (from route lookup)
-	rx_state->reply_path.ifid = rx_state->rx_sample_ifid;
+	rx_state->reply_path.ifid = ifid;
 	return true;
 }
 
-
-static bool rx_get_reply_path(struct receiver_state *rx_state, struct hercules_path *path)
-{
+// Return a copy of the currently stored reply path.
+static bool rx_get_reply_path(struct receiver_state *rx_state,
+							  struct hercules_path *path) {
 	memcpy(path, &rx_state->reply_path, sizeof(*path));
 	return true;
 }
 
-static void rx_send_rtt_ack(struct hercules_server *server, struct receiver_state *rx_state, struct rbudp_initial_pkt *pld)
-{
+// Reflect the received initial packet back to the sender. The sent packet is
+// identical to the one received, but has the HS_CONFIRM flag set.
+static void rx_send_rtt_ack(struct hercules_server *server,
+							struct receiver_state *rx_state,
+							struct rbudp_initial_pkt *pld) {
 	struct hercules_path path;
 	if(!rx_get_reply_path(rx_state, &path)) {
 		debug_printf("no return path");
@@ -848,6 +871,7 @@ static void rx_send_rtt_ack(struct hercules_server *server, struct receiver_stat
 			.type = CONTROL_PACKET_TYPE_INITIAL,
 			.payload.initial = *pld,
 	};
+	/* strncpy(control_pkt.payload.initial.name, pld->name, pld->name_len); */
 	control_pkt.payload.initial.flags |= HANDSHAKE_FLAG_HS_CONFIRM;
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *)&control_pkt,
@@ -855,33 +879,38 @@ static void rx_send_rtt_ack(struct hercules_server *server, struct receiver_stat
 	stitch_checksum(&path, path.header.checksum, buf);
 
 	send_eth_frame(server, &path, buf);
-	/* atomic_fetch_add(&rx_state->session->tx_npkts, 1); */
+	atomic_fetch_add(&rx_state->session->tx_npkts, 1);
 }
 
-static void rx_handle_initial(struct hercules_server *server, struct receiver_state *rx_state, struct rbudp_initial_pkt *initial, const char *buf,
-                              int ifid, const char *payload, int payloadlen)
-{
+// Handle a received HS packet by reflecting it back to its sender and update
+// the session's reply path if the corresponding flag was set
+static void rx_handle_initial(struct hercules_server *server,
+							  struct receiver_state *rx_state,
+							  struct rbudp_initial_pkt *initial,
+							  const char *buf, int ifid, const char *payload,
+							  int payloadlen) {
 	debug_printf("handling initial");
 	const int headerlen = (int)(payload - buf);
-	if(initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
-		debug_printf("setting rx sample");
-		set_rx_sample(rx_state, ifid, buf, headerlen + payloadlen);
-		rx_update_reply_path(rx_state);
+	if (initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
+		rx_update_reply_path(rx_state, ifid, headerlen + payloadlen, buf);
 	}
-
-	rx_send_rtt_ack(server, rx_state, initial); // echo back initial pkt to ACK filesize
-	rx_state->cts_sent_at = get_nsecs(); // FIXME why is this here?
+	rx_send_rtt_ack(server, rx_state,
+					initial);  // echo back initial pkt to ACK filesize
+	rx_state->cts_sent_at = get_nsecs();  // FIXME why is this here?
 }
-static void rx_send_cts_ack(struct hercules_server *server, struct receiver_state *rx_state)
-{
+
+// Send an empty ACK, indicating to the sender that it may start sending data
+// packets.
+// XXX This is not strictly necessary, I think. Once the ACK sender thread sees
+// the session it will start sending ACKs, which will also be empty.
+static void rx_send_cts_ack(struct hercules_server *server,
+							struct receiver_state *rx_state) {
 	debug_printf("Send CTS ACK");
 	struct hercules_path path;
 	if(!rx_get_reply_path(rx_state, &path)) {
 		debug_printf("no reply path");
 		return;
 	}
-
-	debug_printf("got reply path, idx %d", path.ifid);
 
 	char buf[HERCULES_MAX_PKTSIZE];
 	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
@@ -894,27 +923,32 @@ static void rx_send_cts_ack(struct hercules_server *server, struct receiver_stat
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *)&control_pkt,
 	               sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
 	stitch_checksum(&path, path.header.checksum, buf);
-
 	send_eth_frame(server, &path, buf);
-	/* atomic_fetch_add(&rx_state->session->tx_npkts, 1); */
+	atomic_fetch_add(&rx_state->session->tx_npkts, 1);
 }
 
-static void rx_send_ack_pkt(struct hercules_server *server, struct hercules_control_packet *control_pkt,
-                            struct hercules_path *path) {
+// TODO some other functions repeat this code
+// Send the given control packet via the server's control socket.
+static void send_control_pkt(struct hercules_server *server,
+							 struct hercules_session *session,
+							 struct hercules_control_packet *control_pkt,
+							 struct hercules_path *path) {
 	char buf[HERCULES_MAX_PKTSIZE];
 	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
 
-	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *)control_pkt,
-	               sizeof(control_pkt->type) + ack__len(&control_pkt->payload.ack), path->payloadlen);
+	fill_rbudp_pkt(
+		rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *)control_pkt,
+		sizeof(control_pkt->type) + ack__len(&control_pkt->payload.ack),
+		path->payloadlen);
 	stitch_checksum(path, path->header.checksum, buf);
 
 	send_eth_frame(server, path, buf);
-	/* atomic_fetch_add(&rx_state->session->tx_npkts, 1); */
+	atomic_fetch_add(&session->tx_npkts, 1);
 }
 
+// Send as many ACK packets as necessary to convey all received packet ranges
 static void rx_send_acks(struct hercules_server *server, struct receiver_state *rx_state)
 {
-	/* debug_printf("rx_send_acks"); */
 	struct hercules_path path;
 	if(!rx_get_reply_path(rx_state, &path)) {
 		debug_printf("no reply path");
@@ -930,43 +964,14 @@ static void rx_send_acks(struct hercules_server *server, struct receiver_state *
 
 	// send an empty ACK to keep connection alive until first packet arrives
 	u32 curr = fill_ack_pkt(rx_state, 0, &control_pkt.payload.ack, max_entries);
-	rx_send_ack_pkt(server, &control_pkt, &path);
+	send_control_pkt(server, rx_state->session, &control_pkt, &path);
 	for(; curr < rx_state->total_chunks;) {
 		curr = fill_ack_pkt(rx_state, curr, &control_pkt.payload.ack, max_entries);
 		if(control_pkt.payload.ack.num_acks == 0) break;
-		rx_send_ack_pkt(server, &control_pkt, &path);
+		send_control_pkt(server, rx_state->session, &control_pkt, &path);
 	}
 }
 
-static void rx_trickle_acks(void *arg) {
-  struct hercules_server *server = arg;
-  while (1) {
-	  __sync_synchronize();
-	struct hercules_session *session_rx = atomic_load(&server->session_rx);
-    if (session_rx != NULL &&
-        session_rx->state == SESSION_STATE_RUNNING) {
-      struct receiver_state *rx_state = session_rx->rx_state;
-      // XXX: data races in access to shared rx_state!
-      atomic_store(&rx_state->last_pkt_rcvd, get_nsecs());
-      if (atomic_load(&rx_state->last_pkt_rcvd) +
-              umax64(100 * ACK_RATE_TIME_MS * 1e6,
-                     3 * rx_state->handshake_rtt) <
-          get_nsecs()) {
-        // Transmission timed out
-        quit_session(session_rx, SESSION_ERROR_TIMEOUT);
-      }
-      rx_send_acks(server, rx_state);
-      if (rx_received_all(rx_state)) {
-		  debug_printf("Received all, done.");
-        session_rx->state = SESSION_STATE_DONE;
-        rx_send_acks(server, rx_state);
-        server->session_rx = NULL; // FIXME leak
-		atomic_store(&server->session_rx, NULL);
-      }
-    }
-    sleep_nsecs(ACK_RATE_TIME_MS * 1e6);
-  }
-}
 
 static void rx_send_path_nacks(struct hercules_server *server, struct receiver_state *rx_state, struct receiver_state_per_path *path_state, u8 path_idx, u64 time, u32 nr)
 {
@@ -1012,13 +1017,11 @@ static void rx_send_path_nacks(struct hercules_server *server, struct receiver_s
 		stitch_checksum(&path, path.header.checksum, buf);
 
 		send_eth_frame(server, &path, buf);
-		/* atomic_fetch_add(&rx_state->session->tx_npkts, 1); */
+		atomic_fetch_add(&rx_state->session->tx_npkts, 1);
 	}
 	libbpf_smp_wmb();
-	/* assert(&path_state->seq_rcvd.lock != NULL); */
-	/* assert(path_state->seq_rcvd.lock != NULL); */
 	// FIXME spurious segfault on unlock
-	/* pthread_spin_unlock(&path_state->seq_rcvd.lock); */
+	pthread_spin_unlock(&path_state->seq_rcvd.lock);
 	path_state->nack_end = nack_end;
 }
 
@@ -1031,7 +1034,7 @@ static void rx_send_nacks(struct hercules_server *server, struct receiver_state 
 	}
 }
 
-/// SENDER
+/// OK SENDER
 static bool tx_acked_all(const struct sender_state *tx_state)
 {
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
@@ -1042,6 +1045,8 @@ static bool tx_acked_all(const struct sender_state *tx_state)
 	return true;
 }
 
+// Submitting the frames to the TX ring does not mean they will be sent immediately,
+// this forces all submitted packets to be sent so we can get the frames back
 static void kick_tx(struct hercules_server *server, struct xsk_socket_info *xsk)
 {
 	int ret;
@@ -1060,12 +1065,14 @@ static void kick_all_tx(struct hercules_server *server, struct hercules_interfac
 		kick_tx(server, iface->xsks[s]);
 	}
 }
+
 static void kick_tx_server(struct hercules_server *server){
 
 	for (int i = 0; i < server->num_ifaces; i++){
 		kick_all_tx(server, &server->ifaces[i]);
 	}
 }
+
 static void tx_register_acks(const struct rbudp_ack_pkt *ack, struct sender_state_per_receiver *rcvr)
 {
 	for(uint16_t e = 0; e < ack->num_acks; ++e) {
@@ -1096,7 +1103,7 @@ static void pop_completion_ring(struct hercules_server *server, struct xsk_umem_
 		}
 		frame_queue__push(&umem->available_frames, num);
 		xsk_ring_cons__release(&umem->cq, entries);
-		/* atomic_fetch_add(&server->tx_npkts, entries); */
+		atomic_fetch_add(&server->session_tx->tx_npkts, entries);
 	}
 }
 
@@ -1141,6 +1148,7 @@ static void tx_register_nacks(const struct rbudp_ack_pkt *nack, struct ccontrol_
 	pthread_spin_unlock(&cc_state->lock);
 }
 
+// TODO need to call this somewhere
 bool tx_handle_handshake_reply(const struct rbudp_initial_pkt *initial, struct sender_state_per_receiver *rcvr)
 {
 	bool updated = false;
@@ -1203,8 +1211,10 @@ tx_send_initial(struct hercules_server *server, const struct hercules_path *path
 	stitch_checksum(path, path->header.checksum, buf);
 
 	send_eth_frame(server, path, buf);
-	/* atomic_fetch_add(&server->tx_npkts, 1); */
+	atomic_fetch_add(&server->session_tx->tx_npkts, 1);
 }
+
+// TODO do something instead of spinning until time is up
 static void rate_limit_tx(struct sender_state *tx_state)
 {
 	if(tx_state->prev_tx_npkts_queued + RATE_LIMIT_CHECK > tx_state->tx_npkts_queued)
@@ -1230,13 +1240,13 @@ static void rate_limit_tx(struct sender_state *tx_state)
 	tx_state->prev_rate_check = now;
 	tx_state->prev_tx_npkts_queued = tx_state->tx_npkts_queued;
 }
+
 void send_path_handshakes(struct hercules_server *server, struct sender_state *tx_state) {
   u64 now = get_nsecs();
   struct sender_state_per_receiver *rcvr = &tx_state->receiver[0];
 
   for (u32 p = 0; p < rcvr->num_paths; p++) {
     struct hercules_path *path = &rcvr->paths[p];
-	/* debug_printf("Checking path %d/%d", p, rcvr->num_paths); */
     if (path->enabled) {
       u64 handshake_at = atomic_load(&path->next_handshake_at);
       if (handshake_at < now) {
@@ -1253,6 +1263,7 @@ void send_path_handshakes(struct hercules_server *server, struct sender_state *t
     }
   }
 }
+
 // TODO
 static void update_hercules_tx_paths(struct sender_state *tx_state)
 {
@@ -1322,7 +1333,6 @@ static void update_hercules_tx_paths(struct sender_state *tx_state)
 
 static void claim_tx_frames(struct hercules_server *server, struct hercules_interface *iface, u64 *addrs, size_t num_frames)
 {
-	/* assert(num_frames == 7); */
 	pthread_spin_lock(&iface->umem->lock);
 	size_t reserved = frame_queue__cons_reserve(&iface->umem->available_frames, num_frames);
 	while(reserved != num_frames) {
@@ -1376,7 +1386,7 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 
 	u32 idx;
 	if(xsk_ring_prod__reserve(&xsk->tx, num_chunks_in_unit, &idx) != num_chunks_in_unit) {
-		// As there are less frames in the loop than slots in the TX ring, this should not happen
+		// As there are fewer frames in the loop than slots in the TX ring, this should not happen
 		exit_with_error(NULL, EINVAL);
 	}
 
@@ -1413,14 +1423,7 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, seqnr, tx_state->mem + chunk_start, len, path->payloadlen);
 		stitch_checksum(path, path->header.checksum, pkt);
 	}
-
-	/* debug_printf("submitting %d chunks in unit", num_chunks_in_unit); */
 	xsk_ring_prod__submit(&xsk->tx, num_chunks_in_unit);
-	if (num_chunks_in_unit != SEND_QUEUE_ENTRIES_PER_UNIT){
-		/* debug_printf("Submitting only %d frames", num_chunks_in_unit); */
-	}
-	__sync_synchronize();
-	/* debug_printf("submit returns"); */
 }
 
 static inline void tx_handle_send_queue_unit(struct hercules_server *server, struct sender_state *tx_state, struct xsk_socket_info *xsks[],
@@ -1434,10 +1437,9 @@ static inline void tx_handle_send_queue_unit(struct hercules_server *server, str
 }
 
 static void
-produce_batch(struct hercules_server *server, struct hercules_session *session, struct sender_state *tx_state, const u8 *path_by_rcvr, const u32 *chunks,
+produce_batch(struct hercules_server *server, struct hercules_session *session, const u8 *path_by_rcvr, const u32 *chunks,
 			  const u8 *rcvr_by_chunk, u32 num_chunks)
 {
-	(void)tx_state; // FIXME
 	u32 chk;
 	u32 num_chunks_in_unit;
 	struct send_queue_unit *unit = NULL;
@@ -1480,11 +1482,11 @@ static inline void allocate_tx_frames(struct hercules_server *server,
 				break;
 			}
 		}
-		/* debug_printf("claiming %d frames", num_frames); */
 		claim_tx_frames(server, &server->ifaces[i], frame_addrs[i], num_frames);
 	}
 }
-// Collect path rate limits
+
+// Compute rate limit for the path currently marked active
 static u32 compute_max_chunks_current_path(struct sender_state *tx_state) {
 	u32 allowed_chunks = 0;
 	u64 now = get_nsecs();
@@ -1492,22 +1494,18 @@ static u32 compute_max_chunks_current_path(struct sender_state *tx_state) {
 	if (!tx_state->receiver[0]
 			 .paths[tx_state->receiver[0].path_index]
 			 .enabled) {
-		debug_printf("path not enabled");
 		return 0;  // if a receiver does not have any enabled paths, we can
 				   // actually end up here ... :(
 	}
 
 	if (tx_state->receiver[0].cc_states != NULL) {	// use PCC
-		debug_printf("using pcc");
 		struct ccontrol_state *cc_state =
 			&tx_state->receiver[0].cc_states[tx_state->receiver[0].path_index];
 		allowed_chunks =
 			umin32(BATCH_SIZE, ccontrol_can_send_npkts(cc_state, now));
 	} else {  // no path-based limit
-		debug_printf("no pcc");
 		allowed_chunks = BATCH_SIZE;
 	}
-	debug_printf("allowed %d chunks", allowed_chunks);
 	return allowed_chunks;
 }
 
@@ -1525,6 +1523,7 @@ static u32 shrink_sending_rates(struct sender_state *tx_state, u32 *max_chunks_p
 	}
 	return total_chunks;
 }
+
 static void prepare_rcvr_paths(struct sender_state *tx_state, u8 *rcvr_path)
 {
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
@@ -1532,6 +1531,7 @@ static void prepare_rcvr_paths(struct sender_state *tx_state, u8 *rcvr_path)
 	}
 }
 
+// Mark the next available path as active
 static void iterate_paths(struct sender_state *tx_state)
 {
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
@@ -1607,14 +1607,11 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 		const u64 prev_transmit = umin64(rcvr->prev_round_start + rcvr->prev_slope * chunk_idx, rcvr->prev_round_end);
 		const u64 ack_due = prev_transmit + rcvr->ack_wait_duration; // 0 for first round
 		if(now >= ack_due) { // add the chunk to the current batch
-			/* debug_printf("now >= ack due, adding chunk"); */
-			/* debug_printf("adding chunk idx %d", chunk_idx); */
 			*chunks = chunk_idx++;
 			*chunk_rcvr = rcvr_idx;
 			chunks++;
 			chunk_rcvr++;
 		} else { // no chunk to send - skip this receiver in the current batch
-			/* debug_printf("now < ack due, no chunk to send"); */
 			(*wait_until) = ack_due;
 			break;
 		}
@@ -1625,22 +1622,27 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 
 
 
-static struct sender_state *
-init_tx_state(struct hercules_session *session, size_t filesize, int chunklen, int max_rate_limit, char *mem,
-			  const struct hercules_app_addr *dests, struct hercules_path *paths, u32 num_dests, const int num_paths,
-			  u32 max_paths_per_dest)
-{
+// Initialise new sender state. Returns null in case of error.
+static struct sender_state *init_tx_state(struct hercules_session *session,
+										  size_t filesize, int chunklen,
+										  int max_rate_limit, char *mem,
+										  const struct hercules_app_addr *dests,
+										  struct hercules_path *paths,
+										  u32 num_dests, const int num_paths,
+										  u32 max_paths_per_dest) {
 	u64 total_chunks = (filesize + chunklen - 1) / chunklen;
-	if(total_chunks >= UINT_MAX) {
-		fprintf(stderr, "File too big, not enough chunks available (chunks needed: %llu, chunks available: %u)\n",
-		        total_chunks, UINT_MAX - 1);
-		exit(1);
+	if (total_chunks >= UINT_MAX) {
+		fprintf(stderr,
+				"File too big, not enough chunks available (chunks needed: "
+				"%llu, chunks available: %u)\n",
+				total_chunks, UINT_MAX - 1);
+		return NULL;
 	}
 
-	/* debug_printf("Sending a file consisting of %lld chunks (ANY KEY TO CONTINUE)", total_chunks); */
-	/* getchar(); */
-
 	struct sender_state *tx_state = calloc(1, sizeof(*tx_state));
+	if (tx_state == NULL){
+		return NULL;
+	}
 	tx_state->session = session;
 	tx_state->filesize = filesize;
 	tx_state->chunklen = chunklen;
@@ -1651,9 +1653,13 @@ init_tx_state(struct hercules_session *session, size_t filesize, int chunklen, i
 	tx_state->end_time = 0;
 	tx_state->num_receivers = num_dests;
 	tx_state->receiver = calloc(num_dests, sizeof(*tx_state->receiver));
+	if (tx_state->receiver == NULL){
+		free(tx_state);
+		return NULL;
+	}
 	tx_state->max_paths_per_rcvr = max_paths_per_dest;
 
-	for(u32 d = 0; d < num_dests; d++) {
+	for (u32 d = 0; d < num_dests; d++) {
 		struct sender_state_per_receiver *receiver = &tx_state->receiver[d];
 		bitset__create(&receiver->acked_chunks, tx_state->total_chunks);
 		receiver->path_index = 0;
@@ -1676,10 +1682,6 @@ static void destroy_tx_state(struct sender_state *tx_state)
 	}
 	free(tx_state);
 }
-/// XDP
-
-
-
 
 /// PCC
 #define NACK_TRACE_SIZE (1024*1024)
@@ -1880,6 +1882,37 @@ static void tx_send_p(void *arg) {
                               frame_addrs, &unit);
 	/* assert(num_chunks_in_unit == 7); */
 	kick_tx_server(server);
+  }
+}
+
+// Send ACKs to the sender. Runs in its own thread.
+static void rx_trickle_acks(void *arg) {
+  struct hercules_server *server = arg;
+  while (1) {
+	  __sync_synchronize();
+	struct hercules_session *session_rx = atomic_load(&server->session_rx);
+    if (session_rx != NULL &&
+        session_rx->state == SESSION_STATE_RUNNING) {
+      struct receiver_state *rx_state = session_rx->rx_state;
+      // XXX: data races in access to shared rx_state!
+      atomic_store(&rx_state->last_pkt_rcvd, get_nsecs());
+      if (atomic_load(&rx_state->last_pkt_rcvd) +
+              umax64(100 * ACK_RATE_TIME_MS * 1e6,
+                     3 * rx_state->handshake_rtt) <
+          get_nsecs()) {
+        // Transmission timed out
+        quit_session(session_rx, SESSION_ERROR_TIMEOUT);
+      }
+      rx_send_acks(server, rx_state);
+      if (rx_received_all(rx_state)) {
+		  debug_printf("Received all, done.");
+        session_rx->state = SESSION_STATE_DONE;
+        rx_send_acks(server, rx_state);
+        server->session_rx = NULL; // FIXME leak
+		atomic_store(&server->session_rx, NULL);
+      }
+    }
+    sleep_nsecs(ACK_RATE_TIME_MS * 1e6);
   }
 }
 
@@ -2340,7 +2373,7 @@ static void join_thread(struct hercules_server *server, pthread_t pt)
 		exit_with_error(server, ret);
 	}
 }
-/// stats
+/// (TODO)stats
 struct path_stats *make_path_stats_buffer(int num_paths) {
     struct path_stats *path_stats = calloc(1, sizeof(*path_stats) + num_paths * sizeof(path_stats->paths[0]));
     path_stats->num_paths = num_paths;
@@ -2419,9 +2452,7 @@ struct path_stats *make_path_stats_buffer(int num_paths) {
 /* 			.rate_limit = 0 */
 /* 	}; */
 /* } */
-/// UNASSIGNED
-
-
+/// Hercules main
 void hercules_main(struct hercules_server *server) {
   debug_printf("Hercules main");
 

@@ -63,6 +63,7 @@ struct scionaddrhdr_ipv4 {
 	__u32 src_ip;
 };
 
+// The header used by both control and data packets
 struct hercules_header {
 	__u32 chunk_idx;
 	__u8 path;
@@ -82,8 +83,11 @@ struct rbudp_initial_pkt {
 	__u8 name[];
 };
 
+// Indicates to the receiver this path should be used for (N)ACKs
 #define HANDSHAKE_FLAG_SET_RETURN_PATH 0x1u
+// Indicates that the packet is a reflected HS packet
 #define HANDSHAKE_FLAG_HS_CONFIRM (0x1u << 1)
+// Indicates that the packet is trying to start a new transfer
 #define HANDSHAKE_FLAG_NEW_TRANSFER (0x1u << 2)
 
 // Structure of ACK RBUDP packets sent by the receiver.
@@ -113,9 +117,9 @@ struct hercules_control_packet {
 
 #pragma pack(pop)
 
-// XXX This is placed here (instead of in hercules.h) to avoid clang from
-// complainig about atomics when building redirect_userspace.c with hercules.h
-// included.
+// XXX The following are placed here (instead of in hercules.h) to stop clang
+// complainig about atomics when building redirect_userspace.c with
+// hercules.h included.
 
 // Connection information
 struct hercules_app_addr {

@@ -8,7 +8,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-bool monitor_get_reply_path(int sockfd, char *rx_sample_buf, int rx_sample_len, int etherlen,
+bool monitor_get_reply_path(int sockfd, const char *rx_sample_buf, int rx_sample_len, int etherlen,
                             struct hercules_path *path) {
   struct sockaddr_un monitor;
   monitor.sun_family = AF_UNIX;
