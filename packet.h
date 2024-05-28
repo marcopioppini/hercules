@@ -27,15 +27,15 @@
 // https://stackoverflow.com/questions/15442536/why-ip-header-variable-declarations-are-swapped-depending-on-byte-order
 struct scionhdr {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
-	unsigned int version: 4;
-	unsigned int qos: 8;
-	unsigned int flow_id: 20;
+	unsigned int version : 4;
+	unsigned int qos : 8;
+	unsigned int flow_id : 20;
 #elif __BYTE_ORDER == __BIG_ENDIAN
-	unsigned int flow_id:20;
-	unsigned int qos:8;
-	unsigned int version:4;
+	unsigned int flow_id : 20;
+	unsigned int qos : 8;
+	unsigned int version : 4;
 #else
-# error	"Please fix <packet.h>"
+#error "Please fix <packet.h>"
 #endif
 	/** Type of the next header */
 	__u8 next_header;
@@ -46,13 +46,13 @@ struct scionhdr {
 	/** SCION path type */
 	__u8 path_type;
 	/** Type of destination address */
-	unsigned int dst_type: 2;
+	unsigned int dst_type : 2;
 	/** Type of source address */
-	unsigned int src_type: 2;
+	unsigned int src_type : 2;
 	/** Length of destination address */
-	unsigned int dst_len: 2;
+	unsigned int dst_len : 2;
 	/** Length of source address */
-	unsigned int src_len: 2;
+	unsigned int src_len : 2;
 	__u16 reserved;
 };
 
@@ -64,9 +64,9 @@ struct scionaddrhdr_ipv4 {
 };
 
 struct hercules_header {
-  __u32 chunk_idx;
-  __u8 path;
-  __u32 seqno;
+	__u32 chunk_idx;
+	__u8 path;
+	__u32 seqno;
 };
 
 // Structure of first RBUDP packet sent by sender.
@@ -89,14 +89,14 @@ struct rbudp_initial_pkt {
 // Structure of ACK RBUDP packets sent by the receiver.
 // Integers all transmitted in little endian (host endianness).
 struct rbudp_ack_pkt {
-	__u8 num_acks; //!< number of (valid) entries in `acks`
+	__u8 num_acks;	//!< number of (valid) entries in `acks`
 	__u32 max_seq;
 	__u32 ack_nr;
 	__u64 timestamp;
 	struct {
-		__u32 begin; //!< index of first chunk that is ACKed with this range
-		__u32 end;   //!< one-past-the-last chunk that is ACKed with this range
-	} acks[256]; //!< list of ranges that are ACKed
+		__u32 begin;  //!< index of first chunk that is ACKed with this range
+		__u32 end;	  //!< one-past-the-last chunk that is ACKed with this range
+	} acks[256];	  //!< list of ranges that are ACKed
 };
 
 #define CONTROL_PACKET_TYPE_INITIAL 0
@@ -113,4 +113,20 @@ struct hercules_control_packet {
 
 #pragma pack(pop)
 
-#endif //HERCULES_SCION_H
+// XXX This is placed here (instead of in hercules.h) to avoid clang from
+// complainig about atomics when building redirect_userspace.c with hercules.h
+// included.
+
+// Connection information
+struct hercules_app_addr {
+	/** SCION IA. In network byte order. */
+	__u64 ia;
+	/** SCION IP. In network byte order. */
+	__u32 ip;
+	/** SCION/UDP port (L4, application). In network byte order. */
+	__u16 port;
+};
+typedef __u64 ia;
+#define MAX_NUM_SOCKETS 256
+
+#endif	// HERCULES_SCION_H

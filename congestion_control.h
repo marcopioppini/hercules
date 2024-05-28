@@ -3,6 +3,7 @@
 
 #include "bitset.h"
 #include "hercules.h"
+#include "utils.h"
 #include <pthread.h>
 
 #define RCTS_INTERVALS 4 // Must be even

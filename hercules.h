@@ -15,62 +15,257 @@
 #ifndef __HERCULES_H__
 #define __HERCULES_H__
 
-#include <stdbool.h>
-#include <stdatomic.h>
 #include <linux/types.h>
+#include <net/if.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 
-#define MAX_NUM_SOCKETS 256
+#include "bpf/src/xsk.h"
+#include "congestion_control.h"
+#include "frame_queue.h"
+#include "packet.h"
+
 #define HERCULES_MAX_HEADERLEN 256
-
 #define HERCULES_MAX_PKTSIZE 9000
-
+#define BATCH_SIZE 64
+// Number of frames in UMEM area
+#define NUM_FRAMES (4 * 1024)
 
 struct hercules_path_header {
-	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
-	__u16 checksum;    //SCION L4 checksum over header with 0 payload
+	const char header[HERCULES_MAX_HEADERLEN];	//!< headerlen bytes
+	__u16 checksum;	 // SCION L4 checksum over header with 0 payload
 };
-
-struct hercules_session;
 
 // Path are specified as ETH/IP/UDP/SCION/UDP headers.
 struct hercules_path {
 	__u64 next_handshake_at;
 	int headerlen;
 	int payloadlen;
-	int framelen;    //!< length of ethernet frame; headerlen + payloadlen
+	int framelen;  //!< length of ethernet frame; headerlen + payloadlen
 	int ifid;
 	struct hercules_path_header header;
-	atomic_bool enabled; // e.g. when a path has been revoked and no replacement is available, this will be set to false
+	atomic_bool enabled;  // e.g. when a path has been revoked and no
+						  // replacement is available, this will be set to false
 	atomic_bool replaced;
 };
 
-
-// Connection information
-struct hercules_app_addr {
-	/** SCION IA. In network byte order. */
-	__u64 ia;
-	/** SCION IP. In network byte order. */
-	__u32 ip;
-	/** SCION/UDP port (L4, application). In network byte order. */
-	__u16 port;
+/// RECEIVER
+// Per-path state at the receiver
+struct receiver_state_per_path {
+	struct bitset seq_rcvd;
+	sequence_number nack_end;
+	sequence_number prev_nack_end;
+	u64 rx_npkts;
 };
 
-typedef __u64 ia;
+// Information specific to the receiving side of a session
+struct receiver_state {
+	struct hercules_session *session;
+	atomic_uint_least64_t handshake_rtt;
+	/** Filesize in bytes */
+	size_t filesize;
+	/** Size of file data (in byte) per packet */
+	u32 chunklen;
+	/** Number of packets that will make up the entire file. Equal to
+	 * `ceil(filesize/chunklen)` */
+	u32 total_chunks;
+	/** Memory mapped file for receive */
+	char *mem;
+	/** Packet size */
+	u32 etherlen;
 
+	struct bitset received_chunks;
 
-struct hercules_server;
-struct hercules_session *hercules_init(int *ifindices, int num_ifaces, struct hercules_app_addr local_addr, int queue, int mtu);
-void hercules_close(struct hercules_server *server);
+	// TODO rx_sample can be removed in favour of reply_path
+	// XXX: reads/writes to this is are a huge data race. Need to sync.
+	char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE];
+	int rx_sample_len;
+	int rx_sample_ifid;
+	// The reply path to use for contacting the sender. This is the reversed
+	// path of the last initial packet with the SET_RETURN_PATH flag set.
+	struct hercules_path reply_path;
 
+	// Start/end time of the current transfer
+	u64 start_time;
+	u64 end_time;
+	u64 cts_sent_at;
+	u64 last_pkt_rcvd;	// Timeout detection
+
+	u8 num_tracked_paths;
+	bool is_pcc_benchmark;
+	struct receiver_state_per_path path_state[256];
+};
+
+// SENDER
+struct sender_state_per_receiver {
+	u64 prev_round_start;
+	u64 prev_round_end;
+	u64 prev_slope;
+	u64 ack_wait_duration;
+	u32 prev_chunk_idx;
+	bool finished;
+	/** Next batch should be sent via this path */
+	u8 path_index;
+
+	struct bitset acked_chunks;
+	atomic_uint_least64_t handshake_rtt;  // Handshake RTT in ns
+
+	u32 num_paths;
+	u32 return_path_idx;
+	struct hercules_app_addr addr;
+	struct hercules_path *paths;
+	struct ccontrol_state *cc_states;
+	bool cts_received;
+};
+
+struct sender_state {
+	struct hercules_session *session;
+
+	// State for transmit rate control
+	size_t tx_npkts_queued;
+	u64 prev_rate_check;
+	size_t prev_tx_npkts_queued;
+
+	/** Filesize in bytes */
+	size_t filesize;
+	char filename[100];
+	/** Size of file data (in byte) per packet */
+	u32 chunklen;
+	/** Number of packets that will make up the entire file. Equal to
+	 * `ceil(filesize/chunklen)` */
+	u32 total_chunks;
+	/** Memory mapped file for receive */
+	char *mem;
+
+	_Atomic u32 rate_limit;
+
+	// Start/end time of the current transfer
+	u64 start_time;
+	u64 end_time;
+
+	u32 num_receivers;
+	struct sender_state_per_receiver *receiver;
+	u32 max_paths_per_rcvr;
+
+	// shared with Go
+	struct hercules_path *shd_paths;
+	const int *shd_num_paths;
+
+	atomic_bool has_new_paths;
+};
+
+// SESSION
+// Some states are used only by the TX/RX side and are marked accordingly
+enum session_state {
+	SESSION_STATE_NONE,
+	SESSION_STATE_PENDING,	//< (TX) Need to send HS and repeat until TO,
+							// waiting
+							// for a reflected HS packet
+	SESSION_STATE_NEW,	//< (RX) Received a HS packet, need to send HS reply and
+						// CTS
+	SESSION_STATE_WAIT_CTS,	 //< (TX) Waiting for CTS
+	SESSION_STATE_RUNNING,	 //< Transfer in progress
+	SESSION_STATE_DONE,		 //< Transfer done (or cancelled with error)
+};
+
+enum session_error {
+	SESSION_ERROR_OK,		//< No error, transfer completed successfully
+	SESSION_ERROR_TIMEOUT,	//< Session timed out
+	SESSION_ERROR_PCC,
+};
+
+// A session is a transfer between one sender and one receiver
+struct hercules_session {
+	struct receiver_state *rx_state;
+	struct sender_state *tx_state;
+	enum session_state state;
+	enum session_error error;
+	struct send_queue *send_queue;
+	u64 last_pkt_sent;
+	u64 last_pkt_rcvd;
+
+	struct hercules_app_addr destination;
+	int num_paths;
+	struct hercules_path *paths_to_dest;
+	// State for stat dump
+	/* size_t rx_npkts; */
+	/* size_t tx_npkts; */
+};
+
+// SERVER
+struct hercules_interface {
+	char ifname[IFNAMSIZ];
+	int ifid;
+	int queue;
+	u32 prog_id;
+	int ethtool_rule;
+	u32 num_sockets;
+	struct xsk_umem_info *umem;
+	struct xsk_socket_info **xsks;
+};
+
+// Config determined at program start
+struct hercules_config {
+	u32 xdp_flags;
+	int xdp_mode;
+	int queue;
+	bool configure_queues;
+	struct hercules_app_addr local_addr;
+};
+
+struct hercules_server {
+	struct hercules_config config;
+	int control_sockfd;	 // AF_PACKET socket used for control traffic
+	int n_threads;
+	struct rx_p_args **worker_args;
+	struct hercules_session *session_tx;  // Current TX session
+	u64 session_tx_counter;
+	struct hercules_session *session_rx;  // Current RX session
+	int max_paths;
+	int rate_limit;
+	bool enable_pcc;
+	int *ifindices;
+	int num_ifaces;
+	struct hercules_interface ifaces[];
+};
+
+/// XDP
+struct xsk_umem_info {
+	struct xsk_ring_prod fq;
+	struct xsk_ring_cons cq;
+	struct frame_queue available_frames;
+	pthread_spinlock_t lock;
+	struct xsk_umem *umem;
+	void *buffer;
+	struct hercules_interface *iface;
+};
+
+struct xsk_socket_info {
+	struct xsk_ring_cons rx;
+	struct xsk_ring_prod tx;
+	struct xsk_umem_info *umem;
+	struct xsk_socket *xsk;
+};
+
+typedef int xskmap;
+
+/// Thread args
+struct rx_p_args {
+	struct hercules_server *server;
+	struct xsk_socket_info *xsks[];
+};
+
+/// STATS TODO
 struct path_stats_path {
-    __u64 total_packets;
-    __u64 pps_target;
+	__u64 total_packets;
+	__u64 pps_target;
 };
 
 struct path_stats {
-    __u32 num_paths;
-    struct path_stats_path paths[1]; // XXX this is actually used as a dynamic struct member; the 1 is needed for CGO
+	__u32 num_paths;
+	struct path_stats_path paths[1];  // XXX this is actually used as a dynamic
+									  // struct member; the 1 is needed for CGO
 };
 struct path_stats *make_path_stats_buffer(int num_paths);
 
@@ -86,42 +281,10 @@ struct hercules_stats {
 	__u32 framelen;
 	__u32 chunklen;
 	__u32 total_chunks;
-	__u32 completed_chunks; //!< either number of acked (for sender) or received (for receiver) chunks
+	__u32 completed_chunks;	 //!< either number of acked (for sender) or
+							 //!< received (for receiver) chunks
 
 	__u32 rate_limit;
 };
 
-// Get the current stats of a running transfer.
-// Returns stats with `start_time==0` if no transfer is active.
-struct hercules_stats hercules_get_stats(struct hercules_session *session, struct path_stats* path_stats);
-
-void allocate_path_headers(struct hercules_session *session, struct hercules_path *path, int num_headers);
-void push_hercules_tx_paths(struct hercules_session *session);
-
-// locks for working with the shared path memory
-void acquire_path_lock(void);
-void free_path_lock(void);
-
-// Initiate transfer of file over the given path.
-// Synchronous; returns when the transfer has been completed or if it has failed.
-// Does not take ownership of `paths`.
-struct hercules_stats
-hercules_tx(struct hercules_session *session, const char *filename, int offset, int length,
-            const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests,
-            const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode, int num_threads);
-
-struct receiver_state;
-// Initiate receiver, waiting for a transmitter to initiate the file transfer.
-struct hercules_stats hercules_rx(struct hercules_session *session, const char *filename, int xdp_mode,
-                                  bool configure_queues, int accept_timeout, int num_threads, bool is_pcc_benchmark);
-
-struct hercules_server *
-hercules_init_server(int *ifindices, int num_ifaces,
-                     const struct hercules_app_addr local_addr, int queue,
-                     int xdp_mode, int n_threads, bool configure_queues);
-void hercules_main(struct hercules_server *server);
-void hercules_main_sender(struct hercules_server *server, int xdp_mode, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc);
-void debug_print_rbudp_pkt(const char *pkt, bool recv);
-struct hercules_session *make_session(struct hercules_server *server);
-
-#endif // __HERCULES_H__
+#endif	// __HERCULES_H__

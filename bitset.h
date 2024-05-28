@@ -15,9 +15,9 @@
 #ifndef __HERCULES_BITSET_H__
 #define __HERCULES_BITSET_H__
 
-#include "hercules.h"
 #include "utils.h"
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <string.h>
 #include <pthread.h>

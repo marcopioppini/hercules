@@ -9,7 +9,6 @@
 #include <netinet/udp.h>
 #include <stddef.h>
 #include "packet.h"
-#include "hercules.h"
 
 #include <bpf/src/bpf_helpers.h>
 

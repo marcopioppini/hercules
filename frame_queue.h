@@ -15,6 +15,8 @@
 #ifndef HERCULES_FRAME_QUEUE_H
 #define HERCULES_FRAME_QUEUE_H
 
+#include <stdatomic.h>
+#include <stdlib.h>
 #include "utils.h"
 
 struct frame_queue {
