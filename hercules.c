@@ -1321,30 +1321,10 @@ static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx, sequence
 }
 
 
-static pthread_mutex_t path_lock;
-
-void acquire_path_lock()
-{
-	pthread_mutex_lock(&path_lock);
-}
-
-void free_path_lock()
-{
-	pthread_mutex_unlock(&path_lock);
-}
-
-void push_hercules_tx_paths(struct hercules_session *session)
-{
-	if(session->tx_state != NULL) {
-		debug_printf("Got new paths!");
-		session->tx_state->has_new_paths = true;
-	}
-}
-
+// TODO
 static void update_hercules_tx_paths(struct sender_state *tx_state)
 {
 	return; // FIXME HACK
-	acquire_path_lock();
 	tx_state->has_new_paths = false;
 	u64 now = get_nsecs();
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
@@ -1405,7 +1385,6 @@ static void update_hercules_tx_paths(struct sender_state *tx_state)
 			}
 		}
 	}
-	free_path_lock();
 }
 
 void send_path_handshakes(struct hercules_server *server, struct sender_state *tx_state) {
@@ -2025,13 +2004,6 @@ static char *rx_mmap(struct hercules_server *server, const char *pathname, size_
 		exit_with_error(server, errno);
 	}
 	close(f);
-	// fault and dirty the pages
-	// This may be a terrible idea if filesize is larger than the available memory.
-	// Note: MAP_POPULATE does NOT help when preparing for _writing_.
-	/*int pagesize = getpagesize();
-	for(ssize_t i = (ssize_t)filesize - 1; i > 0; i -= pagesize) {
-		mem[i] = 0;
-	}*/
 	return mem;
 }
 
@@ -2237,14 +2209,6 @@ static int unconfigure_rx_queues(struct hercules_server *server)
 	return error;
 }
 
-static void rx_rtt_and_configure(void *arg)
-{
-	(void)arg;
-	/* struct receiver_state *rx_state = arg; */
-	/* rx_get_rtt_estimate(arg); */
-	// as soon as we got the RTT estimate, we are ready to set up the queues
-	/* configure_rx_queues(rx_state->session); */
-}
 
 static void rx_send_cts_ack(struct hercules_server *server, struct receiver_state *rx_state)
 {
@@ -2838,16 +2802,6 @@ static struct receiver_state *rx_receive_hs(struct hercules_server *server,
   return NULL;
 }
 
-// Helper function: open a AF_PACKET socket.
-// @returns -1 on error
-static int open_control_socket()
-{
-	int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
-	if(sockfd == -1) {
-		return -1;
-	}
-	return sockfd;
-}
 
 static int load_bpf(const void *prgm, ssize_t prgm_size, struct bpf_object **obj)
 {
