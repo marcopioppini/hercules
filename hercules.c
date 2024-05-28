@@ -1414,7 +1414,7 @@ void send_path_handshakes(struct hercules_server *server, struct sender_state *t
 
   for (u32 p = 0; p < rcvr->num_paths; p++) {
     struct hercules_path *path = &rcvr->paths[p];
-	debug_printf("Checking path %d/%d", p, rcvr->num_paths);
+	/* debug_printf("Checking path %d/%d", p, rcvr->num_paths); */
     if (path->enabled) {
       u64 handshake_at = atomic_load(&path->next_handshake_at);
       if (handshake_at < now) {
@@ -1625,7 +1625,7 @@ static void tx_send_p(void *arg) {
 		}
 		num_chunks_in_unit++;
 	}
-	/* debug_printf("unit has %d chunks", num_chunks_in_unit); */
+	debug_printf("unit has %d chunks", num_chunks_in_unit);
     u64 frame_addrs[server->num_ifaces][SEND_QUEUE_ENTRIES_PER_UNIT];
     memset(frame_addrs, 0xFF, sizeof(frame_addrs));
 	for (u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++){
@@ -1667,22 +1667,29 @@ u32 compute_max_chunks_per_rcvr(struct sender_state *tx_state, u32 *max_chunks_p
 }
 // Collect path rate limits
 u32 compute_max_chunks_current_path(struct sender_state *tx_state) {
-  u32 allowed_chunks = 0;
-  u64 now = get_nsecs();
+	u32 allowed_chunks = 0;
+	u64 now = get_nsecs();
 
-  if (!tx_state->receiver[0].paths[tx_state->receiver[0].path_index].enabled) {
-    return 0; // if a receiver does not have any enabled paths, we can actually
-              // end up here ... :(
-  }
+	if (!tx_state->receiver[0]
+			 .paths[tx_state->receiver[0].path_index]
+			 .enabled) {
+		debug_printf("path not enabled");
+		return 0;  // if a receiver does not have any enabled paths, we can
+				   // actually end up here ... :(
+	}
 
-  if (tx_state->receiver[0].cc_states != NULL) { // use PCC
-    struct ccontrol_state *cc_state =
-        &tx_state->receiver[0].cc_states[tx_state->receiver[0].path_index];
-    allowed_chunks = umin32(BATCH_SIZE, ccontrol_can_send_npkts(cc_state, now));
-  } else { // no path-based limit
-    allowed_chunks = BATCH_SIZE;
-  }
-  return allowed_chunks;
+	if (tx_state->receiver[0].cc_states != NULL) {	// use PCC
+		debug_printf("using pcc");
+		struct ccontrol_state *cc_state =
+			&tx_state->receiver[0].cc_states[tx_state->receiver[0].path_index];
+		allowed_chunks =
+			umin32(BATCH_SIZE, ccontrol_can_send_npkts(cc_state, now));
+	} else {  // no path-based limit
+		debug_printf("no pcc");
+		allowed_chunks = BATCH_SIZE;
+	}
+	debug_printf("allowed %d chunks", allowed_chunks);
+	return allowed_chunks;
 }
 
 // exclude receivers that have completed the current iteration
@@ -1714,7 +1721,7 @@ u32 shrink_sending_rates(struct sender_state *tx_state, u32 *max_chunks_per_rcvr
 void prepare_rcvr_paths(struct sender_state *tx_state, u8 *rcvr_path)
 {
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		rcvr_path[r] = tx_state->receiver[r].path_index;
+		rcvr_path[r] = tx_state->receiver->path_index;
 	}
 }
 
@@ -1767,7 +1774,7 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 	struct sender_state_per_receiver *rcvr = &tx_state->receiver[rcvr_idx];
 	u32 num_chunks_prepared = 0;
 	u32 chunk_idx = rcvr->prev_chunk_idx;
-	/* debug_printf("n chunks %d", num_chunks); */
+	debug_printf("n chunks %d", num_chunks);
 	for(; num_chunks_prepared < num_chunks; num_chunks_prepared++) {
 		/* debug_printf("prepared %d/%d chunks", num_chunks_prepared, num_chunks); */
 		chunk_idx = bitset__scan_neg(&rcvr->acked_chunks, chunk_idx);
@@ -2127,6 +2134,7 @@ static void rx_send_rtt_ack(struct hercules_server *server, struct receiver_stat
 static void rx_handle_initial(struct hercules_server *server, struct receiver_state *rx_state, struct rbudp_initial_pkt *initial, const char *buf,
                               int ifid, const char *payload, int payloadlen)
 {
+	debug_printf("handling initial");
 	const int headerlen = (int)(payload - buf);
 	if(initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
 		debug_printf("setting rx sample");
@@ -2135,7 +2143,7 @@ static void rx_handle_initial(struct hercules_server *server, struct receiver_st
 	}
 
 	rx_send_rtt_ack(server, rx_state, initial); // echo back initial pkt to ACK filesize
-	rx_state->cts_sent_at = get_nsecs();
+	rx_state->cts_sent_at = get_nsecs(); // FIXME why is this here?
 }
 
 /* static void rx_get_rtt_estimate(void *arg) */
@@ -2630,13 +2638,14 @@ static void events_p(void *arg) {
               server->session_tx->state == SESSION_STATE_PENDING) {
 			if(server->enable_pcc) {
 				u64 now = get_nsecs();
-					struct sender_state_per_receiver *receiver = &server->session_tx->tx_state->receiver[0];
+					struct sender_state_per_receiver *receiver = server->session_tx->tx_state->receiver;
+					receiver->handshake_rtt = now - parsed_pkt.timestamp;
 					receiver->cc_states = init_ccontrol_state(
-							server->rate_limit,
+							10000,
 							server->session_tx->tx_state->total_chunks,
 							server->session_tx->num_paths,
-							server->max_paths,
-							server->max_paths
+							server->session_tx->num_paths,
+							server->session_tx->num_paths
 					);
 					ccontrol_update_rtt(&receiver->cc_states[0], receiver->handshake_rtt);
 					fprintf(stderr, "[receiver %d] [path 0] handshake_rtt: %fs, MI: %fs\n",
@@ -2649,8 +2658,21 @@ static void events_p(void *arg) {
 			}
             server->session_tx->state = SESSION_STATE_WAIT_CTS;
           }
+		  if (server->session_tx != NULL && server->session_tx->state == SESSION_STATE_RUNNING){
+				u64 now = get_nsecs();
+					struct sender_state_per_receiver *receiver = server->session_tx->tx_state->receiver;
+			  ccontrol_update_rtt(&receiver->cc_states[parsed_pkt.path_index], now - parsed_pkt.timestamp);
+			  receiver->paths[parsed_pkt.path_index].next_handshake_at = UINT64_MAX;
+		  }
           break; // Make sure we don't process this further
         }
+		if (server->session_rx != NULL && server->session_rx->state == SESSION_STATE_RUNNING){
+			debug_printf("possible path hs");
+			if (!( parsed_pkt.flags & HANDSHAKE_FLAG_NEW_TRANSFER )){
+			debug_printf("send to handle initial");
+				rx_handle_initial(server, server->session_rx->rx_state, &parsed_pkt, buf, addr.sll_ifindex, rbudp_pkt + rbudp_headerlen, len);
+			}
+		}
         // If a transfer is already running, ignore
         // XXX breaks multipath, for now
         if (server->session_rx == NULL) {
@@ -2952,7 +2974,7 @@ static void *tx_p(void *arg) {
     if (session_tx != NULL &&
         atomic_load(&session_tx->state) == SESSION_STATE_RUNNING) {
       struct sender_state *tx_state = session_tx->tx_state;
-      debug_printf("Start transmit round");
+      /* debug_printf("Start transmit round"); */
       tx_state->prev_rate_check = get_nsecs();
 
       pop_completion_rings(server);
@@ -3001,6 +3023,7 @@ static void *tx_p(void *arg) {
           }
         }
       }
+	  debug_printf("continue iwth %d chunks", num_chunks);
 
       if (num_chunks > 0) {
         u8 rcvr_path[tx_state->num_receivers];
@@ -3060,6 +3083,7 @@ hercules_init_server(int *ifindices, int num_ifaces,
   server->worker_args = calloc(server->n_threads, sizeof(struct rx_p_args *));
   server->config.local_addr = local_addr;
   server->config.configure_queues = configure_queues;
+  server->enable_pcc = true;
 
   for (int i = 0; i < num_ifaces; i++) {
     server->ifaces[i] = (struct hercules_interface){
