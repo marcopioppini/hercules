@@ -1713,6 +1713,101 @@ static void destroy_tx_state(struct sender_state *tx_state)
 	free(tx_state);
 }
 
+// (Re)send HS if needed
+static void tx_retransmit_initial(struct hercules_server *server, u64 now) {
+	struct hercules_session *session_tx = server->session_tx;
+	if (session_tx && session_tx->state == SESSION_STATE_PENDING) {
+		if (now >
+			session_tx->last_pkt_sent + session_hs_retransmit_interval) {
+			struct sender_state *tx_state = session_tx->tx_state;
+			tx_send_initial(server, &tx_state->receiver[0].paths[0],
+							tx_state->filename, tx_state->filesize,
+							tx_state->chunklen, now, 0, session_tx->etherlen, true, true);
+			session_tx->last_pkt_sent = now;
+		}
+	}
+}
+
+static void tx_handle_hs_confirm(struct hercules_server *server,
+							  struct rbudp_initial_pkt *parsed_pkt) {
+	if (server->session_tx != NULL &&
+		server->session_tx->state == SESSION_STATE_PENDING) {
+		// This is a reply to the very first packet and confirms connection
+		// setup
+		if (!(parsed_pkt->flags & HANDSHAKE_FLAG_NEW_TRANSFER)) {
+			debug_printf("Handshake did not have correct flag set");
+			return;
+		}
+		if (server->enable_pcc) {
+			u64 now = get_nsecs();
+			struct sender_state_per_receiver *receiver =
+				server->session_tx->tx_state->receiver;
+			receiver->handshake_rtt = now - parsed_pkt->timestamp;
+			// TODO where to get rate limit?
+			receiver->cc_states = init_ccontrol_state(
+				10000, server->session_tx->tx_state->total_chunks,
+				server->session_tx->num_paths, server->session_tx->num_paths,
+				server->session_tx->num_paths);
+			ccontrol_update_rtt(&receiver->cc_states[0],
+								receiver->handshake_rtt);
+			fprintf(stderr,
+					"[receiver %d] [path 0] handshake_rtt: "
+					"%fs, MI: %fs\n",
+					0, receiver->handshake_rtt / 1e9,
+					receiver->cc_states[0].pcc_mi_duration);
+
+			// make sure we later perform RTT estimation
+			// on every enabled path
+			receiver->paths[0].next_handshake_at =
+				UINT64_MAX;	 // We just completed the HS for this path
+			for (u32 p = 1; p < receiver->num_paths; p++) {
+				receiver->paths[p].next_handshake_at = now;
+			}
+		}
+		server->session_tx->state = SESSION_STATE_WAIT_CTS;
+		return;
+	}
+
+	if (server->session_tx != NULL &&
+		server->session_tx->state == SESSION_STATE_RUNNING) {
+		// This is a reply to some handshake we sent during an already
+		// established session (e.g. to open a new path)
+		u64 now = get_nsecs();
+		struct sender_state_per_receiver *receiver =
+			server->session_tx->tx_state->receiver;
+		// TODO re-enable
+		/* ccontrol_update_rtt(&receiver->cc_states[parsed_pkt->path_index], */
+		/* 					now - parsed_pkt->timestamp); */
+		receiver->paths[parsed_pkt->path_index].next_handshake_at = UINT64_MAX;
+		return;
+	}
+	// In other cases we just drop the packet
+	debug_printf("Dropping HS confirm packet, was not expecting one");
+}
+
+// Map the provided file into memory for reading. Returns pointer to the mapped
+// area, or null on error.
+static char *tx_mmap(char *fname, size_t *filesize) {
+	int f = open(fname, O_RDONLY);
+	if (f == -1) {
+		return NULL;
+	}
+	struct stat stat;
+	int ret = fstat(f, &stat);
+	if (ret) {
+		close(f);
+		return NULL;
+	}
+	const size_t fsize = stat.st_size;
+	char *mem = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, f, 0);
+	if (mem == MAP_FAILED) {
+		close(f);
+		return NULL;
+	}
+	close(f);
+	*filesize = fsize;
+	return mem;
+}
 /// OK PCC
 #define NACK_TRACE_SIZE (1024*1024)
 static u32 nack_trace_count = 0;
@@ -1996,30 +2091,6 @@ static void rx_p(void *arg) {
 	}
 }
 
-// Map the provided file into memory for reading. Returns pointer to the mapped
-// area, or null on error.
-static char *tx_mmap(char *fname, size_t *filesize) {
-	int f = open(fname, O_RDONLY);
-	if (f == -1) {
-		return NULL;
-	}
-	struct stat stat;
-	int ret = fstat(f, &stat);
-	if (ret) {
-		close(f);
-		return NULL;
-	}
-	const size_t fsize = stat.st_size;
-	char *mem = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, f, 0);
-	if (mem == MAP_FAILED) {
-		close(f);
-		return NULL;
-	}
-	close(f);
-	*filesize = fsize;
-	return mem;
-}
-
 // Check if the monitor has new transfer jobs available and, if so, start one
 static void new_tx_if_available(struct hercules_server *server) {
 	char fname[1000];
@@ -2131,79 +2202,8 @@ static void mark_timed_out_sessions(struct hercules_server *server, u64 now) {
 	}
 }
 
-// (Re)send HS if needed
-static void tx_retransmit_initial(struct hercules_server *server, u64 now) {
-	struct hercules_session *session_tx = server->session_tx;
-	if (session_tx && session_tx->state == SESSION_STATE_PENDING) {
-		if (now >
-			session_tx->last_pkt_sent + session_hs_retransmit_interval) {
-			struct sender_state *tx_state = session_tx->tx_state;
-			tx_send_initial(server, &tx_state->receiver[0].paths[0],
-							tx_state->filename, tx_state->filesize,
-							tx_state->chunklen, now, 0, session_tx->etherlen, true, true);
-			session_tx->last_pkt_sent = now;
-		}
-	}
-}
-
-static void tx_handle_hs_confirm(struct hercules_server *server,
-							  struct rbudp_initial_pkt *parsed_pkt) {
-	if (server->session_tx != NULL &&
-		server->session_tx->state == SESSION_STATE_PENDING) {
-		// This is a reply to the very first packet and confirms connection
-		// setup
-		if (!(parsed_pkt->flags & HANDSHAKE_FLAG_NEW_TRANSFER)) {
-			debug_printf("Handshake did not have correct flag set");
-			return;
-		}
-		if (server->enable_pcc) {
-			u64 now = get_nsecs();
-			struct sender_state_per_receiver *receiver =
-				server->session_tx->tx_state->receiver;
-			receiver->handshake_rtt = now - parsed_pkt->timestamp;
-			// TODO where to get rate limit?
-			receiver->cc_states = init_ccontrol_state(
-				10000, server->session_tx->tx_state->total_chunks,
-				server->session_tx->num_paths, server->session_tx->num_paths,
-				server->session_tx->num_paths);
-			ccontrol_update_rtt(&receiver->cc_states[0],
-								receiver->handshake_rtt);
-			fprintf(stderr,
-					"[receiver %d] [path 0] handshake_rtt: "
-					"%fs, MI: %fs\n",
-					0, receiver->handshake_rtt / 1e9,
-					receiver->cc_states[0].pcc_mi_duration);
-
-			// make sure we later perform RTT estimation
-			// on every enabled path
-			receiver->paths[0].next_handshake_at =
-				UINT64_MAX;	 // We just completed the HS for this path
-			for (u32 p = 1; p < receiver->num_paths; p++) {
-				receiver->paths[p].next_handshake_at = now;
-			}
-		}
-		server->session_tx->state = SESSION_STATE_WAIT_CTS;
-		return;
-	}
-
-	if (server->session_tx != NULL &&
-		server->session_tx->state == SESSION_STATE_RUNNING) {
-		// This is a reply to some handshake we sent during an already
-		// established session (e.g. to open a new path)
-		u64 now = get_nsecs();
-		struct sender_state_per_receiver *receiver =
-			server->session_tx->tx_state->receiver;
-		// TODO re-enable
-		/* ccontrol_update_rtt(&receiver->cc_states[parsed_pkt->path_index], */
-		/* 					now - parsed_pkt->timestamp); */
-		receiver->paths[parsed_pkt->path_index].next_handshake_at = UINT64_MAX;
-		return;
-	}
-	// In other cases we just drop the packet
-	debug_printf("Dropping HS confirm packet, was not expecting one");
-}
-
-
+// Read control packets from the control socket and process them; also handles
+// interaction with the monitor
 static void events_p(void *arg) {
 	debug_printf("event listener thread started");
 	struct hercules_server *server = arg;
@@ -2217,20 +2217,20 @@ static void events_p(void *arg) {
 	u64 lastpoll = 0;
 	while (1) {	 // event handler thread loop
 		u64 now = get_nsecs();
-		if (now > lastpoll + 1e9){
-			if (server->session_tx == NULL) {
-				new_tx_if_available(server);
-			}
-			mark_timed_out_sessions(server, now);
-			cleanup_finished_sessions(server, now);
-			tx_retransmit_initial(server, now);
-			lastpoll = now;
+		/* if (now > lastpoll + 1e9){ */
+		// XXX run the following every n seconds or every n socket reads?
+		if (server->session_tx == NULL) {
+			new_tx_if_available(server);
 		}
+		mark_timed_out_sessions(server, now);
+		cleanup_finished_sessions(server, now);
+		tx_retransmit_initial(server, now);
+		/* 	lastpoll = now; */
+		/* } */
 
 		// XXX This is a bit of a hack: We want to handle received packets more
 		// frequently than we poll the monitor or check for expired sessions, so
 		// try to receive 100 times (non-blocking) before doing anything else.
-		// TODO re-enable dontwait flag + loop
 		for (int i = 0; i < 100; i++) {
 			ssize_t len = recvfrom(server->control_sockfd, buf, sizeof(buf),
 								   MSG_DONTWAIT, (struct sockaddr *)&addr,
@@ -2505,6 +2505,7 @@ static void *tx_p(void *arg) {
 
   return NULL;
 }
+
 static pthread_t start_thread(struct hercules_server *server, void *(start_routine), void *arg)
 {
 	pthread_t pt;
