@@ -84,7 +84,6 @@ bool monitor_get_new_job(int sockfd, char *name, u16 *job_id, struct hercules_ap
 
   struct hercules_sockmsg_A reply;
   int n = recv(sockfd, &reply, sizeof(reply), 0);
-  debug_printf("receive %d bytes", n);
   if (!reply.payload.newjob.has_job){
     return false;
   }

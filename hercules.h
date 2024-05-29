@@ -27,7 +27,13 @@
 #include "packet.h"
 
 #define HERCULES_MAX_HEADERLEN 256
-#define HERCULES_MAX_PKTSIZE 9000
+// NOTE: The maximum packet size is limited by the size of a single XDP frame
+// (page size - metadata overhead). This is around 3500, but the exact value
+// depends on the driver. We're being conservative here. Support for larger
+// packets is possible by using xdp in multibuffer mode, but this requires code
+// to handle multi-buffer packets.
+#define HERCULES_MAX_PKTSIZE 3000
+// Batch size for send/receive operations
 #define BATCH_SIZE 64
 // Number of frames in UMEM area
 #define NUM_FRAMES (4 * 1024)
@@ -188,6 +194,7 @@ struct hercules_session {
 	struct send_queue *send_queue;
 	u64 last_pkt_sent;
 	u64 last_pkt_rcvd;
+	u32 etherlen;
 
 	struct hercules_app_addr destination;
 	int num_paths;
