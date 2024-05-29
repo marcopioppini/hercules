@@ -714,7 +714,7 @@ submit_rx_frames(struct hercules_session *session, struct xsk_umem_info *umem, c
 	size_t reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
 	while(reserved != num_frames) {
 		reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
-		if(session->state != SESSION_STATE_RUNNING) {
+		if(session == NULL || session->state != SESSION_STATE_RUNNING) {
 			pthread_spin_unlock(&umem->lock);
 			return;
 		}
@@ -768,6 +768,20 @@ static void rx_receive_batch(struct receiver_state *rx_state,
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 	atomic_fetch_add(&rx_state->session->rx_npkts, (rcvd - ignored));
 	submit_rx_frames(rx_state->session, xsk->umem, frame_addrs, rcvd);
+}
+
+static void rx_receive_and_drop(struct xsk_socket_info *xsk){
+	u32 idx_rx = 0;
+	size_t rcvd = xsk_ring_cons__peek(&xsk->rx, BATCH_SIZE, &idx_rx);
+	u64 frame_addrs[BATCH_SIZE];
+	for (size_t i = 0; i < rcvd; i++) {
+		u64 addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->addr;
+		frame_addrs[i] = addr;
+		u32 len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->len;
+		const char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+	}
+	xsk_ring_cons__release(&xsk->rx, rcvd);
+	submit_rx_frames(NULL, xsk->umem, frame_addrs, rcvd);
 }
 
 // Prepare a file and memory mapping to receive a file
@@ -1968,6 +1982,15 @@ static void rx_p(void *arg) {
 		struct hercules_session *session_rx = atomic_load(&server->session_rx);
 		if (session_rx != NULL && session_rx->state == SESSION_STATE_RUNNING) {
 			rx_receive_batch(session_rx->rx_state, args->xsks[i % num_ifaces]);
+			i++;
+		}
+		else {
+			// Even though we don't currently have a running session, we might
+			// not have processed all received packets before stopping the
+			// previous session (or they might still be in flight). Drain any
+			// received packets to avoid erroneously assigning them to the next
+			// session.
+			rx_receive_and_drop(args->xsks[i % num_ifaces]);
 			i++;
 		}
 	}
