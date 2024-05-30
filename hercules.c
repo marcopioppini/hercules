@@ -2124,6 +2124,7 @@ static void new_tx_if_available(struct hercules_server *server) {
 	}
 	session->state = SESSION_STATE_PENDING;
 	session->etherlen = mtu;
+	session->jobid = jobid;
 
 	int n_paths;
 	struct hercules_path *paths;
@@ -2163,6 +2164,8 @@ static void cleanup_finished_sessions(struct hercules_server *server, u64 now) {
 	struct hercules_session *session_tx = atomic_load(&server->session_tx);
 	if (session_tx && session_tx->state == SESSION_STATE_DONE) {
 		if (now > session_tx->last_pkt_rcvd + session_timeout * 2) {
+			monitor_update_job(usock, session_tx->jobid, session_tx->state,
+							   session_tx->error);
 			atomic_store(&server->session_tx, NULL);  // FIXME leak
 			fprintf(stderr, "Cleaning up TX session...\n");
 		}

@@ -195,6 +195,7 @@ struct hercules_session {
 	u64 last_pkt_sent;
 	u64 last_pkt_rcvd;
 	u32 etherlen;
+	u32 jobid;
 
 	struct hercules_app_addr destination;
 	int num_paths;

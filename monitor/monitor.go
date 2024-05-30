@@ -404,13 +404,16 @@ const (
 	Done
 )
 
+// TODO state/status names are confusing
 type HerculesTransfer struct {
 	id     int
-	status TransferState
+	status TransferState //< State as seen by the monitor
 	file   string
 	dest   snet.UDPAddr
 	mtu    int
 	nPaths int
+	state  C.enum_session_state //< The state returned by the server
+	err    C.enum_session_error //< The error returned by the server
 }
 
 var transfersLock sync.Mutex
@@ -567,7 +570,21 @@ func main() {
 				usock.WriteToUnix(b, a)
 
 			case C.SOCKMSG_TYPE_UPDATE_JOB:
-				fallthrough
+				job_id := binary.LittleEndian.Uint16(buf[:2])
+				buf = buf[2:]
+				status := binary.LittleEndian.Uint32(buf[:4])
+				buf = buf[4:]
+				errorcode := binary.LittleEndian.Uint32(buf[:4])
+				buf = buf[4:]
+				fmt.Println("updating job", job_id, status, errorcode)
+				transfersLock.Lock()
+				job, _ := transfers[int(job_id)]
+				job.state = status
+				job.err = errorcode
+				fmt.Println(job, job.state)
+				transfersLock.Unlock()
+				b := binary.LittleEndian.AppendUint16(nil, uint16(1))
+				usock.WriteToUnix(b, a)
 
 			default:
 				fmt.Println("unknown message?")

@@ -95,9 +95,27 @@ bool monitor_get_new_job(int sockfd, char *name, u16 *job_id, struct hercules_ap
   return true;
 }
 
+bool monitor_update_job(int sockfd, int job_id, enum session_state state, enum session_error err){
+  struct sockaddr_un monitor;
+  monitor.sun_family = AF_UNIX;
+  strcpy(monitor.sun_path, "/var/herculesmon.sock");
+
+  struct hercules_sockmsg_Q msg;
+  msg.msgtype = SOCKMSG_TYPE_UPDATE_JOB;
+  msg.payload.job_update.job_id = job_id;
+  msg.payload.job_update.status = state;
+  msg.payload.job_update.error = err;
+  sendto(sockfd, &msg, sizeof(msg), 0, &monitor, sizeof(monitor));
+
+  struct hercules_sockmsg_A reply;
+  int n = recv(sockfd, &reply, sizeof(reply), 0);
+  if (!reply.payload.job_update.ok){
+    return false;
+  }
+  return true;
+}
+
 #define HERCULES_DAEMON_SOCKET_PATH "/var/hercules.sock"
-// Bind the socket for the daemon. The file is deleted if already present.
-// Returns the file descriptor if successful, 0 otherwise.
 int monitor_bind_daemon_socket(){
   int usock = socket(AF_UNIX, SOCK_DGRAM, 0);
   if (usock <= 0){
