@@ -104,11 +104,9 @@ u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now)
 	u32 tx_pps = atomic_load(&cc_state->mi_tx_npkts) * 1000000000. / dt;
 
 	if(tx_pps > cc_state->curr_rate) {
-		debug_printf("ret 0");
 		return 0;
 	}
 	u32 ret = (cc_state->curr_rate - tx_pps) * cc_state->pcc_mi_duration;
-	debug_printf("ret %u", ret);
 	return ret;
 }
 

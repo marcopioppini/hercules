@@ -58,7 +58,7 @@
 
 #define MAX_MIDDLEBOX_PROTO_EXTENSION_SIZE 128 // E.g., SCION SPAO header added by LightningFilter
 
-#define L4_SCMP 1
+#define L4_SCMP 202
 
 
 #define RANDOMIZE_FLOWID
@@ -170,7 +170,7 @@ static void send_eth_frame(struct hercules_server *server,
 	}
 }
 
-#define DEBUG_PRINT_PKTS
+/* #define DEBUG_PRINT_PKTS */
 #ifdef DEBUG_PRINT_PKTS
 // recv indicates whether printed packets should be prefixed with TX or RX
 void debug_print_rbudp_pkt(const char *pkt, bool recv) {
@@ -196,7 +196,7 @@ void debug_print_rbudp_pkt(const char *pkt, bool recv) {
 					cp->payload.initial.name);
 				break;
 			case CONTROL_PACKET_TYPE_ACK:
-				printf("%s   ACK ", prefix);
+				printf("%s   ACK (%d) ", prefix, cp->payload.ack.num_acks);
 				for (int r = 0; r < cp->payload.ack.num_acks; r++) {
 					printf("[%d - %d] ", cp->payload.ack.acks[r].begin,
 						   cp->payload.ack.acks[r].end);
@@ -204,7 +204,7 @@ void debug_print_rbudp_pkt(const char *pkt, bool recv) {
 				printf("\n");
 				break;
 			case CONTROL_PACKET_TYPE_NACK:
-				printf("%s   NACK \n", prefix);
+				printf("%s   NACK (%d) ", prefix, cp->payload.ack.num_acks);
 				for (int r = 0; r < cp->payload.ack.num_acks; r++) {
 					printf("[%d - %d] ", cp->payload.ack.acks[r].begin,
 						   cp->payload.ack.acks[r].end);
@@ -280,7 +280,7 @@ struct hercules_server *hercules_init_server(
 	server->config.local_addr = local_addr;
 	server->config.configure_queues = configure_queues;
 	server->enable_pcc =
-		false;	// TODO this should be per-path or at least per-transfer
+		true;	// TODO this should be per-path or at least per-transfer
 
 	for (int i = 0; i < num_ifaces; i++) {
 		server->ifaces[i] = (struct hercules_interface){
@@ -594,7 +594,7 @@ static void set_rx_sample(struct receiver_state *rx_state, int ifid, const char 
 static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *pkt, size_t length)
 {
 	if(length < rbudp_headerlen + rx_state->chunklen) {
-		debug_printf("packet too short");
+		debug_printf("packet too short: have %lu, expect %d", length, rbudp_headerlen + rx_state->chunklen );
 		return false;
 	}
 
@@ -745,6 +745,7 @@ static void rx_receive_batch(struct receiver_state *rx_state,
 		atomic_compare_exchange_strong(&rx_state->last_pkt_rcvd,
 									   &old_last_pkt_rcvd, now);
 	}
+	atomic_store(&rx_state->session->last_pkt_rcvd, now);
 
 	u64 frame_addrs[BATCH_SIZE];
 	for (size_t i = 0; i < rcvd; i++) {
@@ -1177,35 +1178,6 @@ static void tx_register_nacks(const struct rbudp_ack_pkt *nack, struct ccontrol_
 	pthread_spin_unlock(&cc_state->lock);
 }
 
-// TODO need to call this somewhere
-bool tx_handle_handshake_reply(const struct rbudp_initial_pkt *initial, struct sender_state_per_receiver *rcvr)
-{
-	bool updated = false;
-	if(initial->path_index < rcvr->num_paths) {
-		u64 rtt_estimate = get_nsecs() - initial->timestamp;
-		if(atomic_load(&rcvr->paths[initial->path_index].next_handshake_at) != UINT64_MAX) {
-			atomic_store(&rcvr->paths[initial->path_index].next_handshake_at, UINT64_MAX);
-			if(rcvr->cc_states != NULL && rcvr->cc_states[initial->path_index].rtt == DBL_MAX) {
-				ccontrol_update_rtt(&rcvr->cc_states[initial->path_index], rtt_estimate);
-				updated = true;
-			}
-			if(initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
-				rcvr->handshake_rtt = rtt_estimate;
-				if(rcvr->cc_states != NULL) {
-					u64 now = get_nsecs();
-					for(u32 p = 0; p < rcvr->num_paths; p++) {
-						if(p != initial->path_index && rcvr->paths[p].enabled) {
-							rcvr->paths[p].next_handshake_at = now;
-							rcvr->cc_states[p].pcc_mi_duration = DBL_MAX;
-							rcvr->cc_states[p].rtt = DBL_MAX;
-						}
-					}
-				}
-			}
-		}
-	}
-	return updated;
-}
 
 static void
 tx_send_initial(struct hercules_server *server, const struct hercules_path *path, char *filename, size_t filesize, u32 chunklen, unsigned long timestamp, u32 path_index, u32 etherlen, bool set_return_path, bool new_transfer)
@@ -1531,6 +1503,7 @@ static u32 compute_max_chunks_current_path(struct sender_state *tx_state) {
 	if (tx_state->receiver[0].cc_states != NULL) {	// use PCC
 		struct ccontrol_state *cc_state =
 			&tx_state->receiver[0].cc_states[tx_state->receiver[0].path_index];
+		/* debug_printf("path idx %d", tx_state->receiver[0].path_index); */
 		allowed_chunks =
 			umin32(BATCH_SIZE, ccontrol_can_send_npkts(cc_state, now));
 	} else {  // no path-based limit
@@ -1610,12 +1583,12 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 	struct sender_state_per_receiver *rcvr = &tx_state->receiver[rcvr_idx];
 	u32 num_chunks_prepared = 0;
 	u32 chunk_idx = rcvr->prev_chunk_idx;
-	debug_printf("n chunks %d", num_chunks);
+	/* debug_printf("n chunks %d", num_chunks); */
 	for(; num_chunks_prepared < num_chunks; num_chunks_prepared++) {
 		/* debug_printf("prepared %d/%d chunks", num_chunks_prepared, num_chunks); */
 		chunk_idx = bitset__scan_neg(&rcvr->acked_chunks, chunk_idx);
 		if(chunk_idx == tx_state->total_chunks) {
-			debug_printf("prev %d", rcvr->prev_chunk_idx);
+			/* debug_printf("prev %d", rcvr->prev_chunk_idx); */
 			if(rcvr->prev_chunk_idx == 0) { // this receiver has finished
 				debug_printf("receiver has finished");
 				rcvr->finished = true;
@@ -1744,8 +1717,11 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 				server->session_tx->tx_state->receiver;
 			receiver->handshake_rtt = now - parsed_pkt->timestamp;
 			// TODO where to get rate limit?
+			// below is ~in Mb/s (but really pps)
+			u32 rate = 2000e3; // 20 Gbps
+			debug_printf("rate limit %u", rate);
 			receiver->cc_states = init_ccontrol_state(
-				10000, server->session_tx->tx_state->total_chunks,
+				rate, server->session_tx->tx_state->total_chunks,
 				server->session_tx->num_paths, server->session_tx->num_paths,
 				server->session_tx->num_paths);
 			ccontrol_update_rtt(&receiver->cc_states[0],
@@ -1775,10 +1751,23 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 		u64 now = get_nsecs();
 		struct sender_state_per_receiver *receiver =
 			server->session_tx->tx_state->receiver;
-		// TODO re-enable
-		/* ccontrol_update_rtt(&receiver->cc_states[parsed_pkt->path_index], */
-		/* 					now - parsed_pkt->timestamp); */
+		if (server->enable_pcc) {
+			ccontrol_update_rtt(&receiver->cc_states[parsed_pkt->path_index],
+								now - parsed_pkt->timestamp);
+		}
 		receiver->paths[parsed_pkt->path_index].next_handshake_at = UINT64_MAX;
+
+		// We have a new return path, redo handshakes on all other paths
+		if (parsed_pkt->flags & HANDSHAKE_FLAG_SET_RETURN_PATH){
+			receiver->handshake_rtt = now - parsed_pkt->timestamp;
+			for (u32 p = 0; p < receiver->num_paths; p++){
+				if (p != parsed_pkt->path_index && receiver->paths[p].enabled){
+					receiver->paths[p].next_handshake_at = now;
+					receiver->cc_states[p].pcc_mi_duration = DBL_MAX;
+					receiver->cc_states[p].rtt = DBL_MAX;
+				}
+			}
+		}
 		return;
 	}
 	// In other cases we just drop the packet
@@ -2054,9 +2043,9 @@ static void rx_trickle_nacks(void *arg) {
 				u64 ack_round_end = get_nsecs();
 				if (ack_round_end >
 					ack_round_start + rx_state->handshake_rtt * 1000 / 4) {
-					// fprintf(stderr, "NACK send too slow (took %lld of
-					// %ld)\n", ack_round_end - ack_round_start,
-					// rx_state->handshake_rtt * 1000 / 4);
+					/* fprintf(stderr, "NACK send too slow (took %lld of %ld)\n", */
+					/* 		ack_round_end - ack_round_start, */
+					/* 		rx_state->handshake_rtt * 1000 / 4); */
 				} else {
 					sleep_until(ack_round_start +
 								rx_state->handshake_rtt * 1000 / 4);
@@ -2150,6 +2139,9 @@ static void new_tx_if_available(struct hercules_server *server) {
 	session->num_paths = n_paths;
 	session->paths_to_dest = paths;
 
+	// TODO If the paths don't have the same header length this does not work:
+	// If the first path has a shorter header than the second, chunks won't fit
+	// on the second path
 	u32 chunklen = session->paths_to_dest[0].payloadlen - rbudp_headerlen;
 	atomic_store(&server->session_tx, session);
 	struct sender_state *tx_state = init_tx_state(
@@ -2202,6 +2194,61 @@ static void mark_timed_out_sessions(struct hercules_server *server, u64 now) {
 	}
 }
 
+static inline void count_received_pkt(struct hercules_session *session,
+									  u32 path_idx) {
+	atomic_fetch_add(&session->rx_npkts, 1);
+	if (path_idx < PCC_NO_PATH && session->rx_state != NULL) {
+		atomic_fetch_add(&session->rx_state->path_state[path_idx].rx_npkts, 1);
+	}
+}
+
+struct prints{
+	u32 rx_received;
+	u32 tx_sent;
+	u64 ts;
+};
+
+static void print_session_stats(struct hercules_server *server,
+								struct prints *p) {
+	u64 now = get_nsecs();
+	if (now < p->ts + 500e6) {
+		return;
+	}
+	u64 tdiff = now - p->ts;
+	p->ts = now;
+	struct hercules_session *session_tx = server->session_tx;
+	if (session_tx && session_tx->state != SESSION_STATE_DONE) {
+		u32 sent_now = session_tx->tx_npkts;
+		double send_rate_pps =
+			(sent_now - p->tx_sent) / ( (double)tdiff / 1e9 );
+		p->tx_sent = sent_now;
+		double send_rate =
+			8 * send_rate_pps * server->session_tx->tx_state->chunklen / 1e6;
+		fprintf(stderr, "(TX) last: %llu, rx: %ld, tx:%ld, rate %.2f Mbps\n",
+				session_tx->last_pkt_rcvd, session_tx->rx_npkts,
+				session_tx->tx_npkts, send_rate);
+	}
+	struct hercules_session *session_rx = server->session_rx;
+	if (session_rx && session_rx->state != SESSION_STATE_DONE) {
+		u32 begin = bitset__scan_neg(&session_rx->rx_state->received_chunks, 0);
+		u32 rec_count = session_rx->rx_state->received_chunks.num_set;
+		u32 total = session_rx->rx_state->received_chunks.num;
+		u32 rcvd_now = session_rx->rx_npkts;
+		double recv_rate_pps =
+			(rcvd_now - p->rx_received) / ( (double)tdiff / 1e9 );
+		p->rx_received = rcvd_now;
+		double recv_rate =
+			8 * recv_rate_pps * server->session_rx->rx_state->chunklen / 1e6;
+		fprintf(
+			stderr,
+			"(RX) last: %llu, rx: %ld, tx:%ld, first missing %u, total %u/%u, rate %.2f\n",
+			session_rx->last_pkt_rcvd, session_rx->rx_npkts,
+			session_rx->tx_npkts, begin, rec_count, total, recv_rate);
+	}
+}
+
+#define PRINT_STATS
+
 // Read control packets from the control socket and process them; also handles
 // interaction with the monitor
 static void events_p(void *arg) {
@@ -2215,6 +2262,7 @@ static void events_p(void *arg) {
 	const struct udphdr *udphdr;
 
 	u64 lastpoll = 0;
+	struct prints prints = {.rx_received=0, .ts=0, .tx_sent=0};
 	while (1) {	 // event handler thread loop
 		u64 now = get_nsecs();
 		/* if (now > lastpoll + 1e9){ */
@@ -2225,6 +2273,9 @@ static void events_p(void *arg) {
 		mark_timed_out_sessions(server, now);
 		cleanup_finished_sessions(server, now);
 		tx_retransmit_initial(server, now);
+#ifdef PRINT_STATS
+		print_session_stats(server, &prints);
+#endif
 		/* 	lastpoll = now; */
 		/* } */
 
@@ -2269,23 +2320,15 @@ static void events_p(void *arg) {
 			}
 
 			debug_print_rbudp_pkt(rbudp_pkt, true);
-			// TODO Count received pkt
-			/*     atomic_fetch_add(&session->rx_npkts, 1); */
-			/* 	if(path_idx < PCC_NO_PATH && session->rx_state != NULL) { */
-			/*         atomic_fetch_add(&session->rx_state->path_state[path_idx].rx_npkts,
-			 * 1); */
-			/*     } */
+			// TODO Count received pkt, call count_received_pkt everywhere
 
-			// TODO this belongs somewhere?
-			/* 		if(tx_state->receiver[0].cc_states) { */
-			/* 			pcc_monitor(tx_state); */
-			/* 		} */
 			// TODO check received packet has expected source address
 			struct hercules_header *h = (struct hercules_header *)rbudp_pkt;
 			if (h->chunk_idx == UINT_MAX) {	 // This is a control packet
 				const char *pl = rbudp_pkt + rbudp_headerlen;
 				struct hercules_control_packet *cp =
 					(struct hercules_control_packet *)pl;
+				u32 control_pkt_payloadlen = rbudp_len - rbudp_headerlen;
 
 				switch (cp->type) {
 					case CONTROL_PACKET_TYPE_INITIAL:;
@@ -2345,6 +2388,10 @@ static void events_p(void *arg) {
 						break;
 
 					case CONTROL_PACKET_TYPE_ACK:
+						if (control_pkt_payloadlen < ack__len(&cp->payload.ack)){
+							debug_printf("ACK packet too short");
+							break;
+						}
 						if (server->session_tx != NULL &&
 							server->session_tx->state ==
 								SESSION_STATE_WAIT_CTS) {
@@ -2360,6 +2407,8 @@ static void events_p(void *arg) {
 							tx_register_acks(
 								&cp->payload.ack,
 								&server->session_tx->tx_state->receiver[0]);
+							count_received_pkt(server->session_tx, h->path);
+							atomic_store(&server->session_tx->last_pkt_rcvd, get_nsecs());
 							if (tx_acked_all(server->session_tx->tx_state)) {
 								debug_printf("TX done, received all acks");
 								quit_session(server->session_tx,
@@ -2369,7 +2418,22 @@ static void events_p(void *arg) {
 						break;
 
 					case CONTROL_PACKET_TYPE_NACK:
-						// nack_trace_push(nack.timestamp, nack.ack_nr)
+						if (control_pkt_payloadlen <
+							ack__len(&cp->payload.ack)) {
+							debug_printf("NACK packet too short");
+							break;
+						}
+						if (server->session_tx != NULL &&
+							server->session_tx->state ==
+								SESSION_STATE_RUNNING) {
+							count_received_pkt(server->session_tx, h->path);
+							nack_trace_push(cp->payload.ack.timestamp,
+											cp->payload.ack.ack_nr);
+							tx_register_nacks(
+								&cp->payload.ack,
+								&server->session_tx->tx_state->receiver
+									->cc_states[h->path]);
+						}
 						break;
 					default:
 						debug_printf("Received control packet of unknown type");
@@ -2379,6 +2443,9 @@ static void events_p(void *arg) {
 				// This should never happen beacuse the xdp program redirects
 				// all data packets
 				debug_printf("Non-control packet received on control socket");
+			}
+			if (server->session_tx && server->session_tx->tx_state->receiver->cc_states){
+				pcc_monitor(server->session_tx->tx_state);
 			}
 		}
 	}
