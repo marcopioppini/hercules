@@ -26,6 +26,8 @@ import (
 	"time"
 )
 
+var GlobalQuerier snet.PathQuerier
+
 type PathsToDestination struct {
 	pm             *PathManager
 	dst            *Destination
@@ -33,7 +35,7 @@ type PathsToDestination struct {
 	ExtnUpdated    atomic.Bool
 	allPaths       []snet.Path
 	paths          []PathMeta // nil indicates that the destination is in the same AS as the sender and we can use an empty path
-	canSendLocally bool       // (only if destination in same AS) indicates if we can send packets
+	canSendLocally bool // (only if destination in same AS) indicates if we can send packets
 }
 
 type PathMeta struct {
@@ -59,14 +61,10 @@ func initNewPathsToDestinationWithEmptyPath(pm *PathManager, dst *Destination) *
 }
 
 func initNewPathsToDestination(pm *PathManager, src *snet.UDPAddr, dst *Destination) (*PathsToDestination, error) {
-	paths, err := newPathQuerier().Query(context.Background(), dst.hostAddr.IA)
-	if err != nil {
-		return nil, err
-	}
 	return &PathsToDestination{
 		pm:         pm,
 		dst:        dst,
-		allPaths:   paths,
+		allPaths:   nil,
 		paths:      make([]PathMeta, dst.numPaths),
 		modifyTime: time.Unix(0, 0),
 	}, nil
@@ -85,15 +83,13 @@ func (ptd *PathsToDestination) hasUsablePaths() bool {
 }
 
 func (ptd *PathsToDestination) choosePaths() bool {
-	if ptd.allPaths == nil {
+	var err error
+	ptd.allPaths, err = GlobalQuerier.Query(context.Background(), ptd.dst.hostAddr.IA)
+	if err != nil {
 		return false
 	}
 
-	if ptd.modifyTime.After(time.Unix(0, 0)) { // TODO this chooses paths only once
-		if ptd.ExtnUpdated.Swap(false) {
-			ptd.modifyTime = time.Now()
-			return true
-		}
+	if ptd.allPaths == nil {
 		return false
 	}
 
@@ -103,23 +99,11 @@ func (ptd *PathsToDestination) choosePaths() bool {
 		log.Error(fmt.Sprintf("no paths to destination %s", ptd.dst.hostAddr.IA.String()))
 	}
 
-	previousPathAvailable := make([]bool, ptd.dst.numPaths)
-	updated := ptd.choosePreviousPaths(&previousPathAvailable, &availablePaths)
+	// TODO Ensure this still does the right thing when the number of paths decreases (how to test?)
+	ptd.chooseNewPaths(&availablePaths)
 
-	if ptd.disableVanishedPaths(&previousPathAvailable) {
-		updated = true
-	}
-	// Note: we keep vanished paths around until they can be replaced or re-enabled
-
-	if ptd.chooseNewPaths(&previousPathAvailable, &availablePaths) {
-		updated = true
-	}
-
-	if ptd.ExtnUpdated.Swap(false) || updated {
-		ptd.modifyTime = time.Now()
-		return true
-	}
-	return false
+	fmt.Println("chosen paths", ptd.paths)
+	return true
 }
 
 func (ptd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool, availablePaths *AppPathSet) bool {
@@ -154,15 +138,8 @@ func (ptd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]boo
 	return updated
 }
 
-func (ptd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, availablePaths *AppPathSet) bool {
+func (ptd *PathsToDestination) chooseNewPaths(availablePaths *AppPathSet) bool {
 	updated := false
-	// XXX for now, we do not support replacing vanished paths
-	// check that no previous path available
-	for _, prev := range *previousPathAvailable {
-		if prev {
-			return false
-		}
-	}
 
 	// pick paths
 	picker := makePathPicker(ptd.dst.pathSpec, availablePaths, ptd.dst.numPaths)
@@ -233,5 +210,5 @@ func (ptd *PathsToDestination) preparePath(p *PathMeta) (*HerculesPathHeader, er
 	// 	return nil, err
 	// }
 	// return path, nil
-	return nil, fmt.Errorf("NOPE");
+	return nil, fmt.Errorf("NOPE")
 }

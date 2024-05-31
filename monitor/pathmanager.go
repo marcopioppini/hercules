@@ -31,11 +31,10 @@ type Destination struct {
 type PathManager struct {
 	numPathSlotsPerDst int
 	interfaces         map[int]*net.Interface
-	dsts               []*PathsToDestination
+	dst                *PathsToDestination
 	src                *snet.UDPAddr
 	syncTime           time.Time
 	maxBps             uint64
-	// cStruct            CPathManagement
 }
 
 type PathWithInterface struct {
@@ -47,66 +46,39 @@ type AppPathSet map[snet.PathFingerprint]PathWithInterface
 
 const numPathsResolved = 20
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func initNewPathManager(interfaces []*net.Interface, dsts []*Destination, src *snet.UDPAddr, maxBps uint64) (*PathManager, error) {
+func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet.UDPAddr, maxBps uint64) (*PathManager, error) {
 	ifMap := make(map[int]*net.Interface)
 	for _, iface := range interfaces {
 		ifMap[iface.Index] = iface
 	}
 
-	numPathsPerDst := 0
 	pm := &PathManager{
 		interfaces: ifMap,
 		src:        src,
-		dsts:       make([]*PathsToDestination, 0, len(dsts)),
+		dst:        &PathsToDestination{},
 		syncTime:   time.Unix(0, 0),
 		maxBps:     maxBps,
 	}
 
-	for _, dst := range dsts {
-		var dstState *PathsToDestination
-		if src.IA == dst.hostAddr.IA {
-			dstState = initNewPathsToDestinationWithEmptyPath(pm, dst)
-		} else {
-			var err error
-			dstState, err = initNewPathsToDestination(pm, src, dst)
-			if err != nil {
-				return nil, err
-			}
+	if src.IA == dst.hostAddr.IA {
+		pm.dst = initNewPathsToDestinationWithEmptyPath(pm, dst)
+	} else {
+		var err error
+		pm.dst, err = initNewPathsToDestination(pm, src, dst)
+		if err != nil {
+			return nil, err
 		}
-		pm.dsts = append(pm.dsts, dstState)
-		numPathsPerDst = max(numPathsPerDst, dst.numPaths)
 	}
 
-	// allocate memory to pass paths to C
-	pm.numPathSlotsPerDst = numPathsPerDst
-	// pm.cStruct.initialize(len(dsts), numPathsPerDst)
 	return pm, nil
 }
 
-func (pm *PathManager) canSendToAllDests() bool {
-	for _, dst := range pm.dsts {
-		if !dst.hasUsablePaths() {
-			return false
-		}
-	}
-	return true
+func (pm *PathManager) canSendToDest() bool {
+	return pm.dst.hasUsablePaths()
 }
 
 func (pm *PathManager) choosePaths() bool {
-	updated := false
-	for _, dst := range pm.dsts {
-		if dst.choosePaths() {
-			updated = true
-		}
-	}
-	return updated
+	return pm.dst.choosePaths()
 }
 
 func (pm *PathManager) filterPathsByActiveInterfaces(pathsAvail []snet.Path) AppPathSet {

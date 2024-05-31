@@ -206,6 +206,11 @@ func SerializePath(from *HerculesPathHeader, ifid int) []byte {
 	out = binary.LittleEndian.AppendUint16(out, uint16(ifid))
 	fmt.Println(out)
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(from.Header)))
+	if len(from.Header) > C.HERCULES_MAX_HEADERLEN {
+		// Header does not fit in the C struct
+		fmt.Println("!! Header too long !!")
+		// TODO This will panic in the below call to bytes.Repeat(), do something more appropriate
+	}
 	fmt.Println(out)
 	out = append(out, from.Header...)
 	out = append(out, bytes.Repeat([]byte{0x00}, C.HERCULES_MAX_HEADERLEN-len(from.Header))...)
@@ -365,55 +370,46 @@ func prepareHeader(path PathMeta, etherLen int, srcUDP, dstUDP net.UDPAddr, srcA
 	return herculesPath
 }
 
-func pickPathsToDestination(etherLen int, numPaths int, localAddress snet.UDPAddr, interfaces []*net.Interface, destination snet.UDPAddr) []PathMeta {
-	dest := []*Destination{{hostAddr: &destination, numPaths: numPaths, pathSpec: &[]PathSpec{}}}
-	// TODO replace bps limit with the correct value
-	pm, _ := initNewPathManager(interfaces, dest, &localAddress, uint64(etherLen))
-	pm.choosePaths()
-	numSelectedPaths := len(pm.dsts[0].paths)
-	fmt.Println("selected paths", numSelectedPaths)
-	return pm.dsts[0].paths
-}
-
-func headersToDestination(src, dst snet.UDPAddr, ifs []*net.Interface, etherLen int, nPaths int) (int, []byte) {
-	fmt.Println("making headers", src, dst, nPaths)
+func headersToDestination(transfer HerculesTransfer) (int, []byte) {
+	fmt.Println("making headers", transfer.pm.src, transfer.dest, transfer.nPaths)
 	srcA := addr.Addr{
-		IA:   src.IA,
-		Host: addr.MustParseHost(src.Host.IP.String()),
+		IA:   localAddress.IA,
+		Host: addr.MustParseHost(localAddress.Host.IP.String()),
 	}
 	dstA := addr.Addr{
-		IA:   dst.IA,
-		Host: addr.MustParseHost(dst.Host.IP.String()),
+		IA:   transfer.dest.IA,
+		Host: addr.MustParseHost(transfer.dest.Host.IP.String()),
 	}
-	// TODO numpaths should come from somewhere
-	paths := pickPathsToDestination(etherLen, nPaths, src, ifs, dst)
+	transfer.pm.choosePaths()
+	paths := transfer.pm.dst.paths
 	numSelectedPaths := len(paths)
 	headers_ser := []byte{}
 	for _, p := range paths {
-		preparedHeader := prepareHeader(p, etherLen, *src.Host, *dst.Host, srcA, dstA)
+		preparedHeader := prepareHeader(p, transfer.mtu, *transfer.pm.src.Host, *transfer.dest.Host, srcA, dstA)
 		headers_ser = append(headers_ser, SerializePath(&preparedHeader, p.iface.Index)...)
 	}
 	return numSelectedPaths, headers_ser
 }
 
-type TransferState int
+type TransferStatus int
 
 const (
-	Queued TransferState = iota
+	Queued TransferStatus = iota
 	Submitted
 	Done
 )
 
-// TODO state/status names are confusing
 type HerculesTransfer struct {
-	id     int
-	status TransferState //< State as seen by the monitor
-	file   string
-	dest   snet.UDPAddr
-	mtu    int
-	nPaths int
-	state  C.enum_session_state //< The state returned by the server
-	err    C.enum_session_error //< The error returned by the server
+	id     int            // ID identifying this transfer
+	status TransferStatus // Status as seen by the monitor
+	file   string         // Name of the file to transfer
+	dest   snet.UDPAddr   // Destination
+	mtu    int            // MTU to use
+	nPaths int            // Maximum number of paths to use
+	pm     *PathManager
+	// The following two fields are meaningless if the job's status is 'Queued'
+	state C.enum_session_state // The state returned by the server
+	err   C.enum_session_error // The error returned by the server
 }
 
 var transfersLock sync.Mutex
@@ -454,6 +450,8 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	fmt.Println(destParsed)
+	destination := &Destination{hostAddr: destParsed, numPaths: nPaths, pathSpec: &[]PathSpec{}}
+	pm, _ := initNewPathManager(interfaces, destination, localAddress, uint64(mtu))
 	transfersLock.Lock()
 	transfers[nextID] = &HerculesTransfer{
 		id:     nextID,
@@ -462,6 +460,7 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 		dest:   *destParsed,
 		mtu:    mtu,
 		nPaths: nPaths,
+		pm:     pm,
 	}
 	nextID += 1
 	transfersLock.Unlock()
@@ -469,10 +468,8 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "OK")
 }
 
-func pathsForTransfer(id int) []C.struct_hercules_path {
-	paths := []C.struct_hercules_path{}
-	return paths
-}
+var localAddress *snet.UDPAddr
+var interfaces []*net.Interface
 
 func main() {
 	var localAddr string
@@ -484,6 +481,8 @@ func main() {
 		flag.Usage()
 		return
 	}
+	localAddress = src
+	GlobalQuerier = newPathQuerier()
 
 	// TODO make socket paths congfigurable
 	daemon, err := net.ResolveUnixAddr("unixgram", "/var/hercules.sock")
@@ -499,8 +498,12 @@ func main() {
 	for i, _ := range ifs {
 		iffs = append(iffs, &ifs[i])
 	}
+	interfaces = iffs
 
-	pm, err := initNewPathManager(iffs, nil, src, 0)
+	// used for looking up reply path interface
+	pm, err := initNewPathManager(iffs, &Destination{
+		hostAddr: localAddress,
+	}, src, 0)
 	fmt.Println(err)
 
 	http.HandleFunc("/", httpreq)
@@ -563,7 +566,7 @@ func main() {
 				fmt.Println("fetch path, job", job_id)
 				transfersLock.Lock()
 				job, _ := transfers[int(job_id)]
-				n_headers, headers := headersToDestination(*src, job.dest, iffs, job.mtu, job.nPaths)
+				n_headers, headers := headersToDestination(*job)
 				transfersLock.Unlock()
 				b := binary.LittleEndian.AppendUint16(nil, uint16(n_headers))
 				b = append(b, headers...)

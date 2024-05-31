@@ -1718,7 +1718,8 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 			receiver->handshake_rtt = now - parsed_pkt->timestamp;
 			// TODO where to get rate limit?
 			// below is ~in Mb/s (but really pps)
-			u32 rate = 2000e3; // 20 Gbps
+			/* u32 rate = 2000e3; // 20 Gbps */
+			u32 rate = 100; // 1 Mbps
 			debug_printf("rate limit %u", rate);
 			receiver->cc_states = init_ccontrol_state(
 				rate, server->session_tx->tx_state->total_chunks,
@@ -2197,6 +2198,25 @@ static void mark_timed_out_sessions(struct hercules_server *server, u64 now) {
 	}
 }
 
+static void tx_update_paths(struct hercules_server *server) {
+	struct hercules_session *session_tx = server->session_tx;
+	if (session_tx && session_tx->state == SESSION_STATE_RUNNING) {
+		int n_paths;
+		struct hercules_path *paths;
+		bool ret =
+			monitor_get_paths(usock, session_tx->jobid, &n_paths, &paths);
+		if (!ret) {
+			debug_printf("error getting paths");
+			return;
+		}
+		debug_printf("received %d paths", n_paths);
+		// XXX doesn't this break if we get more paths and the update is not
+		// atomic?
+		session_tx->num_paths = n_paths;
+		session_tx->paths_to_dest = paths;
+	}
+}
+
 static inline void count_received_pkt(struct hercules_session *session,
 									  u32 path_idx) {
 	atomic_fetch_add(&session->rx_npkts, 1);
@@ -2219,18 +2239,21 @@ static void print_session_stats(struct hercules_server *server,
 	}
 	u64 tdiff = now - p->ts;
 	p->ts = now;
+
 	struct hercules_session *session_tx = server->session_tx;
 	if (session_tx && session_tx->state != SESSION_STATE_DONE) {
 		u32 sent_now = session_tx->tx_npkts;
-		double send_rate_pps =
-			(sent_now - p->tx_sent) / ( (double)tdiff / 1e9 );
+		u32 acked_count = session_tx->tx_state->receiver->acked_chunks.num_set;
+		u32 total = session_tx->tx_state->receiver->acked_chunks.num;
+		double send_rate_pps = (sent_now - p->tx_sent) / ((double)tdiff / 1e9);
 		p->tx_sent = sent_now;
 		double send_rate =
 			8 * send_rate_pps * server->session_tx->tx_state->chunklen / 1e6;
-		fprintf(stderr, "(TX) last: %llu, rx: %ld, tx:%ld, rate %.2f Mbps\n",
-				session_tx->last_pkt_rcvd, session_tx->rx_npkts,
-				session_tx->tx_npkts, send_rate);
+		fprintf(stderr, "(TX) Chunks: %u/%u, rx: %ld, tx:%ld, rate %.2f Mbps\n",
+				acked_count, total, session_tx->rx_npkts, session_tx->tx_npkts,
+				send_rate);
 	}
+
 	struct hercules_session *session_rx = server->session_rx;
 	if (session_rx && session_rx->state != SESSION_STATE_DONE) {
 		u32 begin = bitset__scan_neg(&session_rx->rx_state->received_chunks, 0);
@@ -2238,15 +2261,13 @@ static void print_session_stats(struct hercules_server *server,
 		u32 total = session_rx->rx_state->received_chunks.num;
 		u32 rcvd_now = session_rx->rx_npkts;
 		double recv_rate_pps =
-			(rcvd_now - p->rx_received) / ( (double)tdiff / 1e9 );
+			(rcvd_now - p->rx_received) / ((double)tdiff / 1e9);
 		p->rx_received = rcvd_now;
 		double recv_rate =
 			8 * recv_rate_pps * server->session_rx->rx_state->chunklen / 1e6;
-		fprintf(
-			stderr,
-			"(RX) last: %llu, rx: %ld, tx:%ld, first missing %u, total %u/%u, rate %.2f\n",
-			session_rx->last_pkt_rcvd, session_rx->rx_npkts,
-			session_rx->tx_npkts, begin, rec_count, total, recv_rate);
+		fprintf(stderr, "(RX) Chunks: %u/%u, rx: %ld, tx:%ld, rate %.2f Mbps\n",
+				rec_count, total, session_rx->rx_npkts, session_rx->tx_npkts,
+				recv_rate);
 	}
 }
 
@@ -2279,6 +2300,10 @@ static void events_p(void *arg) {
 #ifdef PRINT_STATS
 		print_session_stats(server, &prints);
 #endif
+		if (now > lastpoll + 10e9){
+			tx_update_paths(server);
+			lastpoll = now;
+		}
 		/* 	lastpoll = now; */
 		/* } */
 
