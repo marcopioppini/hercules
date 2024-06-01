@@ -250,7 +250,42 @@ static struct hercules_session *make_session(struct hercules_server *server) {
 	return s;
 }
 
-static void destroy_session(struct hercules_session *session) {
+// Cleanup and free TX session
+static void destroy_session_tx(struct hercules_session *session) {
+	if (session == NULL) {
+		return;
+	}
+	assert(session->state == SESSION_STATE_DONE);
+
+	int ret = munmap(session->tx_state->mem, session->tx_state->filesize);
+	assert(ret == 0);  // No reason this should ever fail
+
+	free(session->paths_to_dest);
+	bitset__destroy(&session->tx_state->receiver->acked_chunks);
+	free(session->tx_state->receiver->paths);
+	bitset__destroy(&session->tx_state->receiver->cc_states->mi_nacked);
+	free(session->tx_state->receiver->cc_states);
+	free(session->tx_state->receiver);
+	free(session->tx_state);
+
+	destroy_send_queue(session->send_queue);
+	free(session->send_queue);
+	free(session);
+}
+
+// Cleanup and free RX session
+static void destroy_session_rx(struct hercules_session *session) {
+	if (session == NULL) {
+		return;
+	}
+	assert(session->state == SESSION_STATE_DONE);
+
+	int ret = munmap(session->rx_state->mem, session->rx_state->filesize);
+	assert(ret == 0);  // No reason this should ever fail
+
+	bitset__destroy(&session->rx_state->received_chunks);
+	free(session->rx_state);
+
 	destroy_send_queue(session->send_queue);
 	free(session->send_queue);
 	free(session);
@@ -272,7 +307,6 @@ struct hercules_server *hercules_init_server(
 	server->n_threads = n_threads;
 	server->session_rx = NULL;
 	server->session_tx = NULL;
-	server->session_tx_counter = 0;
 	server->worker_args = calloc(server->n_threads, sizeof(struct rx_p_args *));
 	if (server->worker_args == NULL){
 		exit_with_error(NULL, ENOMEM);
@@ -2167,15 +2201,29 @@ static void cleanup_finished_sessions(struct hercules_server *server, u64 now) {
 		if (now > session_tx->last_pkt_rcvd + session_timeout * 2) {
 			monitor_update_job(usock, session_tx->jobid, session_tx->state,
 							   session_tx->error);
-			atomic_store(&server->session_tx, NULL);  // FIXME leak
+			struct hercules_session *current = server->session_tx;
+			atomic_store(&server->session_tx, NULL);
 			fprintf(stderr, "Cleaning up TX session...\n");
+			// At this point we don't know if some other thread still has a
+			// pointer to the session that it might dereference, so we cannot
+			// safely free it. So, we record the pointer and defer freeing it
+			// until after the next session has completed. At that point, no
+			// references to the deferred session should be around, so we then
+			// free it.
+			// XXX Is this really good enough?
+			destroy_session_tx(server->deferred_tx);
+			server->deferred_tx = current;
 		}
 	}
 	struct hercules_session *session_rx = atomic_load(&server->session_rx);
 	if (session_rx && session_rx->state == SESSION_STATE_DONE) {
 		if (now > session_rx->last_pkt_rcvd + session_timeout * 2) {
-			atomic_store(&server->session_rx, NULL);  // FIXME leak
+			struct hercules_session *current = server->session_rx;
+			atomic_store(&server->session_rx, NULL);
 			fprintf(stderr, "Cleaning up RX session...\n");
+			// See the note above on deferred freeing
+			destroy_session_rx(server->deferred_rx);
+			server->deferred_rx = current;
 		}
 	}
 }

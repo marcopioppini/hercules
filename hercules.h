@@ -189,8 +189,8 @@ enum session_error {
 struct hercules_session {
 	struct receiver_state *rx_state;
 	struct sender_state *tx_state;
-	enum session_state state;
-	enum session_error error;
+	_Atomic enum session_state state;
+	_Atomic enum session_error error;
 	struct send_queue *send_queue;
 	u64 last_pkt_sent;
 	u64 last_pkt_rcvd;
@@ -231,9 +231,10 @@ struct hercules_server {
 	int control_sockfd;	 // AF_PACKET socket used for control traffic
 	int n_threads;
 	struct rx_p_args **worker_args;
-	struct hercules_session *session_tx;  // Current TX session
-	u64 session_tx_counter;
-	struct hercules_session *session_rx;  // Current RX session
+	struct hercules_session * _Atomic session_tx;  // Current TX session
+	struct hercules_session * deferred_tx;
+	struct hercules_session * _Atomic session_rx;  // Current RX session
+	struct hercules_session * deferred_rx;
 	int max_paths;
 	int rate_limit;
 	bool enable_pcc;
