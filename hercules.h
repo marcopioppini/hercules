@@ -183,6 +183,7 @@ enum session_error {
 	SESSION_ERROR_TIMEOUT,	//< Session timed out
 	SESSION_ERROR_PCC,		//< Something wrong with PCC
 	SESSION_ERROR_SEQNO_OVERFLOW,
+	SESSION_ERROR_NO_PATHS, //< Monitor returned no paths to destination
 };
 
 // A session is a transfer between one sender and one receiver

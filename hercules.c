@@ -2164,10 +2164,11 @@ static void new_tx_if_available(struct hercules_server *server) {
 	int n_paths;
 	struct hercules_path *paths;
 	ret = monitor_get_paths(usock, jobid, &n_paths, &paths);
-	if (!ret){
+	if (!ret || n_paths == 0){
 		debug_printf("error getting paths");
 		munmap(mem, filesize);
-		destroy_session(session);
+		/* destroy_session(session); */ // FIXME
+										// TODO update job err
 		return;
 	}
 	// TODO free paths
@@ -2258,6 +2259,11 @@ static void tx_update_paths(struct hercules_server *server) {
 			return;
 		}
 		debug_printf("received %d paths", n_paths);
+		if (n_paths == 0){
+			free(paths);
+			quit_session(session_tx, SESSION_ERROR_NO_PATHS);
+			return;
+		}
 		// XXX doesn't this break if we get more paths and the update is not
 		// atomic?
 		session_tx->num_paths = n_paths;

@@ -167,6 +167,10 @@ func (ptd *PathsToDestination) chooseNewPaths(availablePaths *AppPathSet) bool {
 	}
 
 	log.Info(fmt.Sprintf("[Destination %s] using %d paths:", ptd.dst.hostAddr.IA, len(pathSet)))
+	if (len(pathSet) == 0){
+		ptd.paths = []PathMeta{}
+		return false
+	}
 	for i, path := range pathSet {
 		log.Info(fmt.Sprintf("\t%s", path))
 		fingerprint := snet.Fingerprint(path)
