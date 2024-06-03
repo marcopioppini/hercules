@@ -15,10 +15,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 
-	// "github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/private/topology"
@@ -382,9 +382,15 @@ func headersToDestination(transfer HerculesTransfer) (int, []byte) {
 	}
 	transfer.pm.choosePaths()
 	paths := transfer.pm.dst.paths
-	numSelectedPaths := len(paths)
-	headers_ser := []byte{}
+	enabledPaths := []PathMeta{}
 	for _, p := range paths {
+		if p.enabled {
+			enabledPaths = append(enabledPaths, p)
+		}
+	}
+	numSelectedPaths := len(enabledPaths)
+	headers_ser := []byte{}
+	for _, p := range enabledPaths {
 		preparedHeader := prepareHeader(p, transfer.mtu, *transfer.pm.src.Host, *transfer.dest.Host, srcA, dstA)
 		headers_ser = append(headers_ser, SerializePath(&preparedHeader, p.iface.Index)...)
 	}
@@ -450,8 +456,8 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	fmt.Println(destParsed)
-	destination := &Destination{hostAddr: destParsed, numPaths: nPaths, pathSpec: &[]PathSpec{}}
-	pm, _ := initNewPathManager(interfaces, destination, localAddress, uint64(mtu))
+	destination := findPathRule(&pathRules, destParsed)
+	pm, _ := initNewPathManager(interfaces, &destination, localAddress, uint64(mtu))
 	transfersLock.Lock()
 	transfers[nextID] = &HerculesTransfer{
 		id:     nextID,
@@ -471,15 +477,120 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 var localAddress *snet.UDPAddr
 var interfaces []*net.Interface
 
+type HostConfig struct {
+	HostAddr addr.Addr
+	NumPaths int
+	PathSpec []PathSpec
+}
+type ASConfig struct {
+	IA       addr.IA
+	NumPaths int
+	PathSpec []PathSpec
+}
+
+type MonitorConfig struct {
+	DestinationHosts []HostConfig
+	DestinationASes  []ASConfig
+	DefaultNumPaths  int
+}
+
+type PathRules struct {
+	Hosts           map[addr.Addr]HostConfig
+	ASes            map[addr.IA]ASConfig
+	DefaultNumPaths int
+}
+
+var config MonitorConfig
+var pathRules PathRules = PathRules{}
+
+func findPathRule(p *PathRules, dest *snet.UDPAddr) Destination {
+	a := addr.Addr{
+		IA:   dest.IA,
+		Host: addr.MustParseHost(dest.Host.IP.String()),
+	}
+	confHost, ok := p.Hosts[a]
+	if ok {
+		return Destination{
+			hostAddr: dest,
+			pathSpec: &confHost.PathSpec,
+			numPaths: confHost.NumPaths,
+		}
+	}
+	conf, ok := p.ASes[dest.IA]
+	if ok {
+		return Destination{
+			hostAddr: dest,
+			pathSpec: &conf.PathSpec,
+			numPaths: conf.NumPaths,
+		}
+	}
+	return Destination{
+		hostAddr: dest,
+		pathSpec: &[]PathSpec{},
+		numPaths: p.DefaultNumPaths,
+	}
+}
+
 func main() {
 	var localAddr string
+	var configFile string
 	flag.StringVar(&localAddr, "l", "", "local address")
+	flag.StringVar(&configFile, "c", "herculesmon.conf", "Path to the monitor configuration file")
 	flag.Parse()
+
+	meta, err := toml.DecodeFile(configFile, &config)
+	if err != nil {
+		fmt.Printf("Error reading configuration file (%v): %v\n", configFile, err)
+		os.Exit(1)
+	}
+	if len(meta.Undecoded()) > 0 {
+		fmt.Printf("Unknown element(s) in config file: %v\n", meta.Undecoded())
+		os.Exit(1)
+	}
+	// TODO Would be nice not to have to do this dance and specify the maps directly in the config file,
+	// but the toml package crashes if the keys are addr.Addr
+	if config.DefaultNumPaths == 0 {
+		fmt.Println("Config: Default number of paths to use not set, using 1.")
+		config.DefaultNumPaths = 1
+	}
+	pathRules.Hosts = map[addr.Addr]HostConfig{}
+	for _, host := range config.DestinationHosts {
+		numpaths := config.DefaultNumPaths
+		if host.NumPaths != 0 {
+			numpaths = host.NumPaths
+		}
+		pathspec := []PathSpec{}
+		if host.PathSpec != nil {
+			pathspec = host.PathSpec
+		}
+		pathRules.Hosts[host.HostAddr] = HostConfig{
+			HostAddr: host.HostAddr,
+			NumPaths: numpaths,
+			PathSpec: pathspec,
+		}
+	}
+	pathRules.ASes = map[addr.IA]ASConfig{}
+	for _, as := range config.DestinationASes {
+		numpaths := config.DefaultNumPaths
+		if as.NumPaths != 0 {
+			numpaths = as.NumPaths
+		}
+		pathspec := []PathSpec{}
+		if as.PathSpec != nil {
+			pathspec = as.PathSpec
+		}
+		pathRules.ASes[as.IA] = ASConfig{
+			IA:       as.IA,
+			NumPaths: numpaths,
+			PathSpec: pathspec,
+		}
+	}
+	pathRules.DefaultNumPaths = config.DefaultNumPaths
 
 	src, err := snet.ParseUDPAddr(localAddr)
 	if err != nil || src.Host.Port == 0 {
 		flag.Usage()
-		return
+		os.Exit(1)
 	}
 	localAddress = src
 	GlobalQuerier = newPathQuerier()

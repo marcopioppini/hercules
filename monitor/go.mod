@@ -1,11 +1,11 @@
 module monitor
 
-
 go 1.21
 
 toolchain go1.21.6
 
 require (
+	github.com/BurntSushi/toml v0.3.1
 	github.com/google/gopacket v1.1.19
 	github.com/inconshreveable/log15 v2.16.0+incompatible
 	github.com/scionproto/scion v0.10.0
@@ -36,6 +36,7 @@ require (
 	github.com/prometheus/common v0.37.0 // indirect
 	github.com/prometheus/procfs v0.12.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/stretchr/objx v0.5.0 // indirect
 	github.com/uber/jaeger-client-go v2.30.0+incompatible // indirect
 	github.com/uber/jaeger-lib v2.0.0+incompatible // indirect
 	github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae // indirect
