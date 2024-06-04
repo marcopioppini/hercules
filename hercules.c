@@ -72,6 +72,7 @@
 static const int rbudp_headerlen = sizeof(struct hercules_header);
 static const u64 session_timeout = 10e9; // 10 sec
 static const u64 session_hs_retransmit_interval = 2e9; // 2 sec
+static const u64 session_stale_timeout = 30e9; // 30 sec
 #define PCC_NO_PATH UINT8_MAX // tell the receiver not to count the packet on any path
 
 // TODO move and see if we can't use this from only 1 thread so no locks
@@ -94,21 +95,13 @@ static struct hercules_session *make_session(struct hercules_server *server);
 
 /// OK COMMON
 
-/**
- * @param scionaddrhdr
- * @return The receiver index given by the sender address in scionaddrhdr
- */
-static u32 rcvr_by_src_address(struct sender_state *tx_state, const struct scionaddrhdr_ipv4 *scionaddrhdr,
-                               const struct udphdr *udphdr)
-{
-	u32 r;
-	for(r = 0; r < tx_state->num_receivers; r++) {
-		struct hercules_app_addr *addr = &tx_state->receiver[r].addr;
-		if(scionaddrhdr->src_ia == addr->ia && scionaddrhdr->src_ip == addr->ip && udphdr->uh_sport == addr->port) {
-			break;
-		}
-	}
-	return r;
+// Check the SCION UDP address matches the session's peer
+static inline bool src_matches_address(struct hercules_session *session,
+								const struct scionaddrhdr_ipv4 *scionaddrhdr,
+								const struct udphdr *udphdr) {
+	struct hercules_app_addr *addr = &session->peer;
+	return scionaddrhdr->src_ia == addr->ia &&
+		   scionaddrhdr->src_ip == addr->ip && udphdr->uh_sport == addr->port;
 }
 
 static void __exit_with_error(struct hercules_server *server, int error, const char *file, const char *func, int line)
@@ -260,12 +253,10 @@ static void destroy_session_tx(struct hercules_session *session) {
 	int ret = munmap(session->tx_state->mem, session->tx_state->filesize);
 	assert(ret == 0);  // No reason this should ever fail
 
-	free(session->paths_to_dest);
-	bitset__destroy(&session->tx_state->receiver->acked_chunks);
-	free(session->tx_state->receiver->paths);
-	bitset__destroy(&session->tx_state->receiver->cc_states->mi_nacked);
-	free(session->tx_state->receiver->cc_states);
-	free(session->tx_state->receiver);
+	bitset__destroy(&session->tx_state->acked_chunks);
+	free(session->tx_state->paths);
+	bitset__destroy(&session->tx_state->cc_states->mi_nacked);
+	free(session->tx_state->cc_states);
 	free(session->tx_state);
 
 	destroy_send_queue(session->send_queue);
@@ -618,13 +609,6 @@ static bool rx_received_all(const struct receiver_state *rx_state)
 	return (rx_state->received_chunks.num_set == rx_state->total_chunks);
 }
 
-static void set_rx_sample(struct receiver_state *rx_state, int ifid, const char *pkt, int len)
-{
-	rx_state->rx_sample_len = len;
-	rx_state->rx_sample_ifid = ifid;
-	memcpy(rx_state->rx_sample_buf, pkt, len);
-}
-
 static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *pkt, size_t length)
 {
 	if(length < rbudp_headerlen + rx_state->chunklen) {
@@ -689,6 +673,8 @@ static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *p
 		const size_t chunk_start = (size_t)chunk_idx * rx_state->chunklen;
 		const size_t len = umin64(rx_state->chunklen, rx_state->filesize - chunk_start);
 		memcpy(rx_state->mem + chunk_start, payload, len);
+		// Update last new pkt timestamp
+		atomic_store(&rx_state->session->last_new_pkt_rcvd, get_nsecs());
 	}
 	return true;
 }
@@ -779,6 +765,7 @@ static void rx_receive_batch(struct receiver_state *rx_state,
 		atomic_compare_exchange_strong(&rx_state->last_pkt_rcvd,
 									   &old_last_pkt_rcvd, now);
 	}
+	// TODO timestamps in multiple places...
 	atomic_store(&rx_state->session->last_pkt_rcvd, now);
 
 	u64 frame_addrs[BATCH_SIZE];
@@ -960,7 +947,6 @@ static void rx_handle_initial(struct hercules_server *server,
 	}
 	rx_send_rtt_ack(server, rx_state,
 					initial);  // echo back initial pkt to ACK filesize
-	rx_state->cts_sent_at = get_nsecs();  // FIXME why is this here?
 }
 
 // Send an empty ACK, indicating to the sender that it may start sending data
@@ -1099,12 +1085,9 @@ static void rx_send_nacks(struct hercules_server *server, struct receiver_state 
 }
 
 /// OK SENDER
-static bool tx_acked_all(const struct sender_state *tx_state)
-{
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		if(tx_state->receiver[r].acked_chunks.num_set != tx_state->total_chunks) {
-			return false;
-		}
+static bool tx_acked_all(const struct sender_state *tx_state) {
+	if (tx_state->acked_chunks.num_set != tx_state->total_chunks) {
+		return false;
 	}
 	return true;
 }
@@ -1137,16 +1120,16 @@ static void kick_tx_server(struct hercules_server *server){
 	}
 }
 
-static void tx_register_acks(const struct rbudp_ack_pkt *ack, struct sender_state_per_receiver *rcvr)
+static void tx_register_acks(const struct rbudp_ack_pkt *ack, struct sender_state *tx_state)
 {
 	for(uint16_t e = 0; e < ack->num_acks; ++e) {
 		const u32 begin = ack->acks[e].begin;
 		const u32 end = ack->acks[e].end;
-		if(begin >= end || end > rcvr->acked_chunks.num) {
+		if(begin >= end || end > tx_state->acked_chunks.num) {
 			return; // Abort
 		}
 		for(u32 i = begin; i < end; ++i) { // XXX: this can *obviously* be optimized
-			bitset__set(&rcvr->acked_chunks, i); // don't need thread-safety here, all updates in same thread
+			bitset__set(&tx_state->acked_chunks, i); // don't need thread-safety here, all updates in same thread
 		}
 	}
 }
@@ -1279,10 +1262,9 @@ static void rate_limit_tx(struct sender_state *tx_state)
 
 void send_path_handshakes(struct hercules_server *server, struct sender_state *tx_state) {
   u64 now = get_nsecs();
-  struct sender_state_per_receiver *rcvr = &tx_state->receiver[0];
 
-  for (u32 p = 0; p < rcvr->num_paths; p++) {
-    struct hercules_path *path = &rcvr->paths[p];
+  for (u32 p = 0; p < tx_state->num_paths; p++) {
+    struct hercules_path *path = &tx_state->paths[p];
     if (path->enabled) {
       u64 handshake_at = atomic_load(&path->next_handshake_at);
       if (handshake_at < now) {
@@ -1304,66 +1286,66 @@ void send_path_handshakes(struct hercules_server *server, struct sender_state *t
 static void update_hercules_tx_paths(struct sender_state *tx_state)
 {
 	return; // FIXME HACK
-	tx_state->has_new_paths = false;
-	u64 now = get_nsecs();
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
-		receiver->num_paths = tx_state->shd_num_paths[r];
+	/* tx_state->has_new_paths = false; */
+	/* u64 now = get_nsecs(); */
+	/* for(u32 r = 0; r < tx_state->num_receivers; r++) { */
+	/* 	struct sender_state_per_receiver *receiver = &tx_state->receiver[r]; */
+	/* 	receiver->num_paths = tx_state->shd_num_paths[r]; */
 
-		bool replaced_return_path = false;
-		for(u32 p = 0; p < receiver->num_paths; p++) {
-			struct hercules_path *shd_path = &tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p];
-			if(!shd_path->enabled && p == receiver->return_path_idx) {
-				receiver->return_path_idx++;
-			}
-			if(shd_path->replaced) {
-				shd_path->replaced = false;
-				// assert that chunk length fits into packet with new header
-				if(shd_path->payloadlen < (int)tx_state->chunklen + rbudp_headerlen) {
-					fprintf(stderr,
-					        "cannot use path %d for receiver %d: header too big, chunk does not fit into payload\n", p,
-					        r);
-					receiver->paths[p].enabled = false;
-					continue;
-				}
-				memcpy(&receiver->paths[p], shd_path, sizeof(struct hercules_path));
+	/* 	bool replaced_return_path = false; */
+	/* 	for(u32 p = 0; p < receiver->num_paths; p++) { */
+	/* 		struct hercules_path *shd_path = &tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p]; */
+	/* 		if(!shd_path->enabled && p == receiver->return_path_idx) { */
+	/* 			receiver->return_path_idx++; */
+	/* 		} */
+	/* 		if(shd_path->replaced) { */
+	/* 			shd_path->replaced = false; */
+	/* 			// assert that chunk length fits into packet with new header */
+	/* 			if(shd_path->payloadlen < (int)tx_state->chunklen + rbudp_headerlen) { */
+	/* 				fprintf(stderr, */
+	/* 				        "cannot use path %d for receiver %d: header too big, chunk does not fit into payload\n", p, */
+	/* 				        r); */
+	/* 				receiver->paths[p].enabled = false; */
+	/* 				continue; */
+	/* 			} */
+	/* 			memcpy(&receiver->paths[p], shd_path, sizeof(struct hercules_path)); */
 
-				atomic_store(&receiver->paths[p].next_handshake_at,
-				             UINT64_MAX); // by default do not send a new handshake
-				if(p == receiver->return_path_idx) {
-					atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure handshake_rtt is adapted
-					// don't trigger RTT estimate on other paths, as it will be triggered by the ACK on the new return path
-					replaced_return_path = true;
-				}
-				// reset PCC state
-				if(!replaced_return_path && receiver->cc_states != NULL) {
-					terminate_ccontrol(&receiver->cc_states[p]);
-					continue_ccontrol(&receiver->cc_states[p]);
-					atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure mi_duration is set
-				}
-			} else {
-				if(p == receiver->return_path_idx) {
-					atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure handshake_rtt is adapted
-					// don't trigger RTT estimate on other paths, as it will be triggered by the ACK on the new return path
-					replaced_return_path = true;
-				}
-				if(receiver->cc_states != NULL && receiver->paths[p].enabled != shd_path->enabled) {
-					if(shd_path->enabled) { // reactivate PCC
-						if(receiver->cc_states != NULL) {
-							double rtt = receiver->cc_states[p].rtt;
-							double mi_duration = receiver->cc_states[p].pcc_mi_duration;
-							continue_ccontrol(&receiver->cc_states[p]);
-							receiver->cc_states[p].rtt = rtt;
-							receiver->cc_states[p].pcc_mi_duration = mi_duration;
-						}
-					} else { // deactivate PCC
-						terminate_ccontrol(&receiver->cc_states[p]);
-					}
-				}
-				receiver->paths[p].enabled = shd_path->enabled;
-			}
-		}
-	}
+	/* 			atomic_store(&receiver->paths[p].next_handshake_at, */
+	/* 			             UINT64_MAX); // by default do not send a new handshake */
+	/* 			if(p == receiver->return_path_idx) { */
+	/* 				atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure handshake_rtt is adapted */
+	/* 				// don't trigger RTT estimate on other paths, as it will be triggered by the ACK on the new return path */
+	/* 				replaced_return_path = true; */
+	/* 			} */
+	/* 			// reset PCC state */
+	/* 			if(!replaced_return_path && receiver->cc_states != NULL) { */
+	/* 				terminate_ccontrol(&receiver->cc_states[p]); */
+	/* 				continue_ccontrol(&receiver->cc_states[p]); */
+	/* 				atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure mi_duration is set */
+	/* 			} */
+	/* 		} else { */
+	/* 			if(p == receiver->return_path_idx) { */
+	/* 				atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure handshake_rtt is adapted */
+	/* 				// don't trigger RTT estimate on other paths, as it will be triggered by the ACK on the new return path */
+	/* 				replaced_return_path = true; */
+	/* 			} */
+	/* 			if(receiver->cc_states != NULL && receiver->paths[p].enabled != shd_path->enabled) { */
+	/* 				if(shd_path->enabled) { // reactivate PCC */
+	/* 					if(receiver->cc_states != NULL) { */
+	/* 						double rtt = receiver->cc_states[p].rtt; */
+	/* 						double mi_duration = receiver->cc_states[p].pcc_mi_duration; */
+	/* 						continue_ccontrol(&receiver->cc_states[p]); */
+	/* 						receiver->cc_states[p].rtt = rtt; */
+	/* 						receiver->cc_states[p].pcc_mi_duration = mi_duration; */
+	/* 					} */
+	/* 				} else { // deactivate PCC */
+	/* 					terminate_ccontrol(&receiver->cc_states[p]); */
+	/* 				} */
+	/* 			} */
+	/* 			receiver->paths[p].enabled = shd_path->enabled; */
+	/* 		} */
+	/* 	} */
+	/* } */
 }
 
 
@@ -1413,8 +1395,7 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 		if(unit->paths[i] == UINT8_MAX) {
 			break;
 		}
-		struct sender_state_per_receiver *rcvr = &tx_state->receiver[unit->rcvr[i]];
-		struct hercules_path *path = &rcvr->paths[unit->paths[i]];
+		struct hercules_path *path = &tx_state->paths[unit->paths[i]];
 		if(path->ifid == ifid) {
 			num_chunks_in_unit++;
 		}
@@ -1431,8 +1412,7 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 		if(unit->paths[i] == UINT8_MAX) {
 			break;
 		}
-		const struct sender_state_per_receiver *receiver = &tx_state->receiver[unit->rcvr[i]];
-		const struct hercules_path *path = &receiver->paths[unit->paths[i]];
+		const struct hercules_path *path = &tx_state->paths[unit->paths[i]];
 		if(path->ifid != ifid) {
 			continue;
 		}
@@ -1452,9 +1432,9 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 #endif
 		u8 track_path = PCC_NO_PATH; // put path_idx iff PCC is enabled
 		sequence_number seqnr = 0;
-		if(receiver->cc_states != NULL) {
+		if(tx_state->cc_states != NULL) {
 			track_path = unit->paths[i];
-			seqnr = atomic_fetch_add(&receiver->cc_states[unit->paths[i]].last_seqnr, 1);
+			seqnr = atomic_fetch_add(&tx_state->cc_states[unit->paths[i]].last_seqnr, 1);
 		}
 		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, seqnr, tx_state->mem + chunk_start, len, path->payloadlen);
 		stitch_checksum(path, path->header.checksum, pkt);
@@ -1527,16 +1507,14 @@ static u32 compute_max_chunks_current_path(struct sender_state *tx_state) {
 	u32 allowed_chunks = 0;
 	u64 now = get_nsecs();
 
-	if (!tx_state->receiver[0]
-			 .paths[tx_state->receiver[0].path_index]
-			 .enabled) {
+	if (!tx_state->paths[tx_state->path_index].enabled) {
 		return 0;  // if a receiver does not have any enabled paths, we can
 				   // actually end up here ... :(
 	}
 
-	if (tx_state->receiver[0].cc_states != NULL) {	// use PCC
+	if (tx_state->cc_states != NULL) {	// use PCC
 		struct ccontrol_state *cc_state =
-			&tx_state->receiver[0].cc_states[tx_state->receiver[0].path_index];
+			&tx_state->cc_states[tx_state->path_index];
 		/* debug_printf("path idx %d", tx_state->receiver[0].path_index); */
 		allowed_chunks =
 			umin32(BATCH_SIZE, ccontrol_can_send_npkts(cc_state, now));
@@ -1548,60 +1526,52 @@ static u32 compute_max_chunks_current_path(struct sender_state *tx_state) {
 
 
 // Send a total max of BATCH_SIZE
-static u32 shrink_sending_rates(struct sender_state *tx_state, u32 *max_chunks_per_rcvr, u32 total_chunks)
-{
-	if(total_chunks > BATCH_SIZE) {
-		u32 new_total_chunks = 0; // due to rounding errors, we need to aggregate again
-		for(u32 r = 0; r < tx_state->num_receivers; r++) {
-			max_chunks_per_rcvr[r] = max_chunks_per_rcvr[r] * BATCH_SIZE / total_chunks;
-			new_total_chunks += max_chunks_per_rcvr[r];
-		}
+static u32 shrink_sending_rates(struct sender_state *tx_state,
+								u32 *max_chunks_per_rcvr, u32 total_chunks) {
+	if (total_chunks > BATCH_SIZE) {
+		u32 new_total_chunks =
+			0;	// due to rounding errors, we need to aggregate again
+		max_chunks_per_rcvr[0] =
+			max_chunks_per_rcvr[0] * BATCH_SIZE / total_chunks;
+		new_total_chunks += max_chunks_per_rcvr[0];
 		return new_total_chunks;
 	}
 	return total_chunks;
 }
 
-static void prepare_rcvr_paths(struct sender_state *tx_state, u8 *rcvr_path)
-{
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		rcvr_path[r] = tx_state->receiver->path_index;
-	}
+static void prepare_rcvr_paths(struct sender_state *tx_state, u8 *rcvr_path) {
+	rcvr_path[0] = tx_state->path_index;
 }
 
 // Mark the next available path as active
-static void iterate_paths(struct sender_state *tx_state)
-{
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
-		if(receiver->num_paths == 0) {
-			continue;
-		}
-		u32 prev_path_index = receiver->path_index; // we need this to break the loop if all paths are disabled
-		if(prev_path_index >= receiver->num_paths) {
-			prev_path_index = 0;
-		}
-		do {
-			receiver->path_index = (receiver->path_index + 1) % receiver->num_paths;
-		} while(!receiver->paths[receiver->path_index].enabled && receiver->path_index != prev_path_index);
+static void iterate_paths(struct sender_state *tx_state) {
+	if (tx_state->num_paths == 0) {
+		return;
+	}
+	u32 prev_path_index =
+		tx_state->path_index;  // we need this to break the loop if all paths
+							   // are disabled
+	if (prev_path_index >= tx_state->num_paths) {
+		prev_path_index = 0;
+	}
+	do {
+		tx_state->path_index = (tx_state->path_index + 1) % tx_state->num_paths;
+	} while (!tx_state->paths[tx_state->path_index].enabled &&
+			 tx_state->path_index != prev_path_index);
+}
+
+static void terminate_cc(const struct sender_state *tx_state) {
+	for (u32 i = 0; i < tx_state->num_paths; i++) {
+		terminate_ccontrol(&tx_state->cc_states[i]);
 	}
 }
 
-static void terminate_cc(const struct sender_state_per_receiver *receiver)
-{
-	for(u32 i = 0; i < receiver->num_paths; i++) {
-		terminate_ccontrol(&receiver->cc_states[i]);
+static void kick_cc(struct sender_state *tx_state) {
+	if (tx_state->finished) {
+		return;
 	}
-}
-
-static void kick_cc(struct sender_state *tx_state)
-{
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		if(tx_state->receiver[r].finished) {
-			continue;
-		}
-		for(u32 p = 0; p < tx_state->receiver[r].num_paths; p++) {
-			kick_ccontrol(&tx_state->receiver[r].cc_states[p]);
-		}
+	for (u32 p = 0; p < tx_state->num_paths; p++) {
+		kick_ccontrol(&tx_state->cc_states[p]);
 	}
 }
 // Select batch of un-ACKed chunks for (re)transmit:
@@ -1614,18 +1584,17 @@ static void kick_cc(struct sender_state *tx_state)
 static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 *chunks, u8 *chunk_rcvr, const u64 now,
                                u64 *wait_until, u32 num_chunks)
 {
-	struct sender_state_per_receiver *rcvr = &tx_state->receiver[rcvr_idx];
 	u32 num_chunks_prepared = 0;
-	u32 chunk_idx = rcvr->prev_chunk_idx;
+	u32 chunk_idx = tx_state->prev_chunk_idx;
 	/* debug_printf("n chunks %d", num_chunks); */
 	for(; num_chunks_prepared < num_chunks; num_chunks_prepared++) {
 		/* debug_printf("prepared %d/%d chunks", num_chunks_prepared, num_chunks); */
-		chunk_idx = bitset__scan_neg(&rcvr->acked_chunks, chunk_idx);
+		chunk_idx = bitset__scan_neg(&tx_state->acked_chunks, chunk_idx);
 		if(chunk_idx == tx_state->total_chunks) {
 			/* debug_printf("prev %d", rcvr->prev_chunk_idx); */
-			if(rcvr->prev_chunk_idx == 0) { // this receiver has finished
+			if(tx_state->prev_chunk_idx == 0) { // this receiver has finished
 				debug_printf("receiver has finished");
-				rcvr->finished = true;
+				tx_state->finished = true;
 				break;
 			}
 
@@ -1633,16 +1602,16 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 			debug_printf("Receiver %d switches to next round", rcvr_idx);
 
 			chunk_idx = 0;
-			rcvr->prev_round_start = rcvr->prev_round_end;
-			rcvr->prev_round_end = get_nsecs();
-			u64 prev_round_dt = rcvr->prev_round_end - rcvr->prev_round_start;
-			rcvr->prev_slope = (prev_round_dt + tx_state->total_chunks - 1) / tx_state->total_chunks; // round up
-			rcvr->ack_wait_duration = 3 * (ACK_RATE_TIME_MS * 1000000UL + rcvr->handshake_rtt);
+			tx_state->prev_round_start = tx_state->prev_round_end;
+			tx_state->prev_round_end = get_nsecs();
+			u64 prev_round_dt = tx_state->prev_round_end - tx_state->prev_round_start;
+			tx_state->prev_slope = (prev_round_dt + tx_state->total_chunks - 1) / tx_state->total_chunks; // round up
+			tx_state->ack_wait_duration = 3 * (ACK_RATE_TIME_MS * 1000000UL + tx_state->handshake_rtt);
 			break;
 		}
 
-		const u64 prev_transmit = umin64(rcvr->prev_round_start + rcvr->prev_slope * chunk_idx, rcvr->prev_round_end);
-		const u64 ack_due = prev_transmit + rcvr->ack_wait_duration; // 0 for first round
+		const u64 prev_transmit = umin64(tx_state->prev_round_start + tx_state->prev_slope * chunk_idx, tx_state->prev_round_end);
+		const u64 ack_due = prev_transmit + tx_state->ack_wait_duration; // 0 for first round
 		if(now >= ack_due) { // add the chunk to the current batch
 			*chunks = chunk_idx++;
 			*chunk_rcvr = rcvr_idx;
@@ -1653,7 +1622,7 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 			break;
 		}
 	}
-	rcvr->prev_chunk_idx = chunk_idx;
+	tx_state->prev_chunk_idx = chunk_idx;
 	return num_chunks_prepared;
 }
 
@@ -1688,35 +1657,20 @@ static struct sender_state *init_tx_state(struct hercules_session *session,
 	tx_state->rate_limit = max_rate_limit;
 	tx_state->start_time = 0;
 	tx_state->end_time = 0;
-	tx_state->num_receivers = num_dests;
-	tx_state->receiver = calloc(num_dests, sizeof(*tx_state->receiver));
-	if (tx_state->receiver == NULL){
-		free(tx_state);
-		return NULL;
-	}
-	tx_state->max_paths_per_rcvr = max_paths_per_dest;
 
-	for (u32 d = 0; d < num_dests; d++) {
-		struct sender_state_per_receiver *receiver = &tx_state->receiver[d];
-		bitset__create(&receiver->acked_chunks, tx_state->total_chunks);
-		receiver->path_index = 0;
-		receiver->handshake_rtt = 0;
-		receiver->num_paths = num_paths;
-		receiver->paths = paths;
-		receiver->addr = *dests;
-		receiver->cts_received = false;
-	}
+	bitset__create(&tx_state->acked_chunks, tx_state->total_chunks);
+	tx_state->path_index = 0;
+	tx_state->handshake_rtt = 0;
+	tx_state->num_paths = num_paths;
+	tx_state->paths = paths;
+	tx_state->session->peer = *dests;
 	update_hercules_tx_paths(tx_state);
 	return tx_state;
 }
 
-static void destroy_tx_state(struct sender_state *tx_state)
-{
-	for(u32 d = 0; d < tx_state->num_receivers; d++) {
-		struct sender_state_per_receiver *receiver = &tx_state->receiver[d];
-		bitset__destroy(&receiver->acked_chunks);
-		free(receiver->paths);
-	}
+static void destroy_tx_state(struct sender_state *tx_state) {
+	bitset__destroy(&tx_state->acked_chunks);
+	free(tx_state->paths);
 	free(tx_state);
 }
 
@@ -1727,7 +1681,7 @@ static void tx_retransmit_initial(struct hercules_server *server, u64 now) {
 		if (now >
 			session_tx->last_pkt_sent + session_hs_retransmit_interval) {
 			struct sender_state *tx_state = session_tx->tx_state;
-			tx_send_initial(server, &tx_state->receiver[0].paths[0],
+			tx_send_initial(server, &tx_state->paths[tx_state->return_path_idx],
 							tx_state->filename, tx_state->filesize,
 							tx_state->chunklen, now, 0, session_tx->etherlen, true, true);
 			session_tx->last_pkt_sent = now;
@@ -1737,8 +1691,10 @@ static void tx_retransmit_initial(struct hercules_server *server, u64 now) {
 
 static void tx_handle_hs_confirm(struct hercules_server *server,
 							  struct rbudp_initial_pkt *parsed_pkt) {
-	if (server->session_tx != NULL &&
-		server->session_tx->state == SESSION_STATE_PENDING) {
+	struct hercules_session *session_tx = server->session_tx;
+	if (session_tx != NULL &&
+		session_tx->state == SESSION_STATE_PENDING) {
+		struct sender_state *tx_state = session_tx->tx_state;
 		// This is a reply to the very first packet and confirms connection
 		// setup
 		if (!(parsed_pkt->flags & HANDSHAKE_FLAG_NEW_TRANSFER)) {
@@ -1747,59 +1703,56 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 		}
 		if (server->enable_pcc) {
 			u64 now = get_nsecs();
-			struct sender_state_per_receiver *receiver =
-				server->session_tx->tx_state->receiver;
-			receiver->handshake_rtt = now - parsed_pkt->timestamp;
+			tx_state->handshake_rtt = now - parsed_pkt->timestamp;
 			// TODO where to get rate limit?
 			// below is ~in Mb/s (but really pps)
 			/* u32 rate = 2000e3; // 20 Gbps */
 			u32 rate = 100; // 1 Mbps
 			debug_printf("rate limit %u", rate);
-			receiver->cc_states = init_ccontrol_state(
-				rate, server->session_tx->tx_state->total_chunks,
-				server->session_tx->num_paths, server->session_tx->num_paths,
-				server->session_tx->num_paths);
-			ccontrol_update_rtt(&receiver->cc_states[0],
-								receiver->handshake_rtt);
+			tx_state->cc_states = init_ccontrol_state(
+				rate, tx_state->total_chunks,
+				tx_state->num_paths, tx_state->num_paths,
+				tx_state->num_paths);
+			ccontrol_update_rtt(&tx_state->cc_states[0],
+								tx_state->handshake_rtt);
 			fprintf(stderr,
 					"[receiver %d] [path 0] handshake_rtt: "
 					"%fs, MI: %fs\n",
-					0, receiver->handshake_rtt / 1e9,
-					receiver->cc_states[0].pcc_mi_duration);
+					0, tx_state->handshake_rtt / 1e9,
+					tx_state->cc_states[0].pcc_mi_duration);
 
 			// make sure we later perform RTT estimation
 			// on every enabled path
-			receiver->paths[0].next_handshake_at =
+			tx_state->paths[0].next_handshake_at =
 				UINT64_MAX;	 // We just completed the HS for this path
-			for (u32 p = 1; p < receiver->num_paths; p++) {
-				receiver->paths[p].next_handshake_at = now;
+			for (u32 p = 1; p < tx_state->num_paths; p++) {
+				tx_state->paths[p].next_handshake_at = now;
 			}
 		}
-		server->session_tx->state = SESSION_STATE_WAIT_CTS;
+		session_tx->state = SESSION_STATE_WAIT_CTS;
 		return;
 	}
 
-	if (server->session_tx != NULL &&
-		server->session_tx->state == SESSION_STATE_RUNNING) {
+	if (session_tx != NULL &&
+		session_tx->state == SESSION_STATE_RUNNING) {
+		struct sender_state *tx_state = session_tx->tx_state;
 		// This is a reply to some handshake we sent during an already
 		// established session (e.g. to open a new path)
 		u64 now = get_nsecs();
-		struct sender_state_per_receiver *receiver =
-			server->session_tx->tx_state->receiver;
 		if (server->enable_pcc) {
-			ccontrol_update_rtt(&receiver->cc_states[parsed_pkt->path_index],
+			ccontrol_update_rtt(&tx_state->cc_states[parsed_pkt->path_index],
 								now - parsed_pkt->timestamp);
 		}
-		receiver->paths[parsed_pkt->path_index].next_handshake_at = UINT64_MAX;
+		tx_state->paths[parsed_pkt->path_index].next_handshake_at = UINT64_MAX;
 
 		// We have a new return path, redo handshakes on all other paths
 		if (parsed_pkt->flags & HANDSHAKE_FLAG_SET_RETURN_PATH){
-			receiver->handshake_rtt = now - parsed_pkt->timestamp;
-			for (u32 p = 0; p < receiver->num_paths; p++){
-				if (p != parsed_pkt->path_index && receiver->paths[p].enabled){
-					receiver->paths[p].next_handshake_at = now;
-					receiver->cc_states[p].pcc_mi_duration = DBL_MAX;
-					receiver->cc_states[p].rtt = DBL_MAX;
+			tx_state->handshake_rtt = now - parsed_pkt->timestamp;
+			for (u32 p = 0; p < tx_state->num_paths; p++){
+				if (p != parsed_pkt->path_index && tx_state->paths[p].enabled){
+					tx_state->paths[p].next_handshake_at = now;
+					tx_state->cc_states[p].pcc_mi_duration = DBL_MAX;
+					tx_state->cc_states[p].rtt = DBL_MAX;
 				}
 			}
 		}
@@ -1917,64 +1870,62 @@ static bool pcc_mi_elapsed(struct ccontrol_state *cc_state)
 
 static void pcc_monitor(struct sender_state *tx_state)
 {
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		for(u32 cur_path = 0; cur_path < tx_state->receiver[r].num_paths; cur_path++) {
-			struct ccontrol_state *cc_state = &tx_state->receiver[r].cc_states[cur_path];
-			pthread_spin_lock(&cc_state->lock);
-			if(pcc_mi_elapsed(cc_state)) {
-				u64 now = get_nsecs();
-				if(cc_state->mi_end == 0) { // TODO should not be necessary
-					fprintf(stderr, "Assumption violated.\n");
-                    quit_session(tx_state->session, SESSION_ERROR_PCC);
-					cc_state->mi_end = now;
-				}
-				u32 throughput = cc_state->mi_seq_end - cc_state->mi_seq_start; // pkts sent in MI
-
-				u32 excess = 0;
-				if (cc_state->curr_rate * cc_state->pcc_mi_duration > throughput) {
-					excess = cc_state->curr_rate * cc_state->pcc_mi_duration - throughput;
-				}
-				u32 lost_npkts = atomic_load(&cc_state->mi_nacked.num_set);
-				// account for packets that are "stuck in queue"
-				if(cc_state->mi_seq_end > cc_state->mi_seq_max) {
-					lost_npkts += cc_state->mi_seq_end - cc_state->mi_seq_max;
-				}
-				lost_npkts = umin32(lost_npkts, throughput);
-				float loss = (float)(lost_npkts + excess) / (throughput + excess);
-				sequence_number start = cc_state->mi_seq_start;
-				sequence_number end = cc_state->mi_seq_end;
-				sequence_number mi_min = cc_state->mi_seq_min;
-				sequence_number mi_max = cc_state->mi_seq_max;
-				sequence_number delta_left = cc_state->mi_seq_start - cc_state->mi_seq_min;
-				sequence_number delta_right = cc_state->mi_seq_max - cc_state->mi_seq_end;
-				u32 nnacks = cc_state->num_nacks;
-				u32 nack_pkts = cc_state->num_nack_pkts;
-				enum pcc_state state = cc_state->state;
-				double actual_duration = (double)(cc_state->mi_end - cc_state->mi_start) / 1e9;
-
-				pcc_trace_push(now, start, end, mi_min, mi_max, excess, loss, delta_left, delta_right, nnacks, nack_pkts, state,
-							   cc_state->curr_rate * cc_state->pcc_mi_duration, throughput, cc_state->pcc_mi_duration, actual_duration);
-
-				if(cc_state->num_nack_pkts != 0) { // skip PCC control if no NACKs received
-					if(cc_state->ignored_first_mi) { // first MI after booting will only contain partial feedback, skip it as well
-						pcc_control(cc_state, throughput, loss);
-					}
-					cc_state->ignored_first_mi = true;
-				}
-
-				// TODO move the neccessary ones to cc_start_mi below
-				cc_state->mi_seq_min = UINT32_MAX;
-				cc_state->mi_seq_max = 0;
-				cc_state->mi_seq_max_rcvd = 0;
-				atomic_store(&cc_state->num_nacks, 0);
-				atomic_store(&cc_state->num_nack_pkts, 0);
-				cc_state->mi_end = 0;
-
-				// Start new MI; only safe because no acks are processed during those updates
-				ccontrol_start_monitoring_interval(cc_state);
+	for(u32 cur_path = 0; cur_path < tx_state->num_paths; cur_path++) {
+		struct ccontrol_state *cc_state = &tx_state->cc_states[cur_path];
+		pthread_spin_lock(&cc_state->lock);
+		if(pcc_mi_elapsed(cc_state)) {
+			u64 now = get_nsecs();
+			if(cc_state->mi_end == 0) { // TODO should not be necessary
+				fprintf(stderr, "Assumption violated.\n");
+				quit_session(tx_state->session, SESSION_ERROR_PCC);
+				cc_state->mi_end = now;
 			}
-			pthread_spin_unlock(&cc_state->lock);
+			u32 throughput = cc_state->mi_seq_end - cc_state->mi_seq_start; // pkts sent in MI
+
+			u32 excess = 0;
+			if (cc_state->curr_rate * cc_state->pcc_mi_duration > throughput) {
+				excess = cc_state->curr_rate * cc_state->pcc_mi_duration - throughput;
+			}
+			u32 lost_npkts = atomic_load(&cc_state->mi_nacked.num_set);
+			// account for packets that are "stuck in queue"
+			if(cc_state->mi_seq_end > cc_state->mi_seq_max) {
+				lost_npkts += cc_state->mi_seq_end - cc_state->mi_seq_max;
+			}
+			lost_npkts = umin32(lost_npkts, throughput);
+			float loss = (float)(lost_npkts + excess) / (throughput + excess);
+			sequence_number start = cc_state->mi_seq_start;
+			sequence_number end = cc_state->mi_seq_end;
+			sequence_number mi_min = cc_state->mi_seq_min;
+			sequence_number mi_max = cc_state->mi_seq_max;
+			sequence_number delta_left = cc_state->mi_seq_start - cc_state->mi_seq_min;
+			sequence_number delta_right = cc_state->mi_seq_max - cc_state->mi_seq_end;
+			u32 nnacks = cc_state->num_nacks;
+			u32 nack_pkts = cc_state->num_nack_pkts;
+			enum pcc_state state = cc_state->state;
+			double actual_duration = (double)(cc_state->mi_end - cc_state->mi_start) / 1e9;
+
+			pcc_trace_push(now, start, end, mi_min, mi_max, excess, loss, delta_left, delta_right, nnacks, nack_pkts, state,
+							cc_state->curr_rate * cc_state->pcc_mi_duration, throughput, cc_state->pcc_mi_duration, actual_duration);
+
+			if(cc_state->num_nack_pkts != 0) { // skip PCC control if no NACKs received
+				if(cc_state->ignored_first_mi) { // first MI after booting will only contain partial feedback, skip it as well
+					pcc_control(cc_state, throughput, loss);
+				}
+				cc_state->ignored_first_mi = true;
+			}
+
+			// TODO move the neccessary ones to cc_start_mi below
+			cc_state->mi_seq_min = UINT32_MAX;
+			cc_state->mi_seq_max = 0;
+			cc_state->mi_seq_max_rcvd = 0;
+			atomic_store(&cc_state->num_nacks, 0);
+			atomic_store(&cc_state->num_nack_pkts, 0);
+			cc_state->mi_end = 0;
+
+			// Start new MI; only safe because no acks are processed during those updates
+			ccontrol_start_monitoring_interval(cc_state);
 		}
+		pthread_spin_unlock(&cc_state->lock);
 	}
 }
 
@@ -2173,17 +2124,15 @@ static void new_tx_if_available(struct hercules_server *server) {
 	}
 	// TODO free paths
 	debug_printf("received %d paths", n_paths);
-	session->num_paths = n_paths;
-	session->paths_to_dest = paths;
 
 	// TODO If the paths don't have the same header length this does not work:
 	// If the first path has a shorter header than the second, chunks won't fit
 	// on the second path
-	u32 chunklen = session->paths_to_dest[0].payloadlen - rbudp_headerlen;
+	u32 chunklen = paths[0].payloadlen - rbudp_headerlen;
 	atomic_store(&server->session_tx, session);
 	struct sender_state *tx_state = init_tx_state(
 		server->session_tx, filesize, chunklen, server->rate_limit, mem,
-		&session->destination, session->paths_to_dest, 1, session->num_paths,
+		&session->peer, paths, 1, n_paths,
 		server->max_paths);
 	strncpy(tx_state->filename, fname, 99);
 	server->session_tx->tx_state = tx_state;
@@ -2244,6 +2193,10 @@ static void mark_timed_out_sessions(struct hercules_server *server, u64 now) {
 			quit_session(session_rx, SESSION_ERROR_TIMEOUT);
 			debug_printf("Session (RX) timed out!");
 		}
+		else if (new > session_rx->last_new_pkt_rcvd + session_stale_timeout){
+			quit_session(session_tx, SESSION_ERROR_STALE);
+			debug_printf("Session (RX) stale!")
+		}
 	}
 }
 
@@ -2266,8 +2219,8 @@ static void tx_update_paths(struct hercules_server *server) {
 		}
 		// XXX doesn't this break if we get more paths and the update is not
 		// atomic?
-		session_tx->num_paths = n_paths;
-		session_tx->paths_to_dest = paths;
+		session_tx->tx_state->num_paths = n_paths;
+		session_tx->tx_state->paths = paths;
 	}
 }
 
@@ -2297,8 +2250,8 @@ static void print_session_stats(struct hercules_server *server,
 	struct hercules_session *session_tx = server->session_tx;
 	if (session_tx && session_tx->state != SESSION_STATE_DONE) {
 		u32 sent_now = session_tx->tx_npkts;
-		u32 acked_count = session_tx->tx_state->receiver->acked_chunks.num_set;
-		u32 total = session_tx->tx_state->receiver->acked_chunks.num;
+		u32 acked_count = session_tx->tx_state->acked_chunks.num_set;
+		u32 total = session_tx->tx_state->acked_chunks.num;
 		double send_rate_pps = (sent_now - p->tx_sent) / ((double)tdiff / 1e9);
 		p->tx_sent = sent_now;
 		double send_rate =
@@ -2488,7 +2441,7 @@ static void events_p(void *arg) {
 								SESSION_STATE_RUNNING) {
 							tx_register_acks(
 								&cp->payload.ack,
-								&server->session_tx->tx_state->receiver[0]);
+								server->session_tx->tx_state);
 							count_received_pkt(server->session_tx, h->path);
 							atomic_store(&server->session_tx->last_pkt_rcvd, get_nsecs());
 							if (tx_acked_all(server->session_tx->tx_state)) {
@@ -2513,7 +2466,7 @@ static void events_p(void *arg) {
 											cp->payload.ack.ack_nr);
 							tx_register_nacks(
 								&cp->payload.ack,
-								&server->session_tx->tx_state->receiver
+								&server->session_tx->tx_state
 									->cc_states[h->path]);
 						}
 						break;
@@ -2526,7 +2479,7 @@ static void events_p(void *arg) {
 				// all data packets
 				debug_printf("Non-control packet received on control socket");
 			}
-			if (server->session_tx && server->session_tx->tx_state->receiver->cc_states){
+			if (server->session_tx && server->session_tx->tx_state->cc_states){
 				pcc_monitor(server->session_tx->tx_state);
 			}
 		}
@@ -2593,8 +2546,7 @@ static void *tx_p(void *arg) {
 
       const u64 now = get_nsecs();
       u32 num_chunks = 0;
-      struct sender_state_per_receiver *rcvr = &tx_state->receiver[0];
-      if (!rcvr->finished) {
+      if (!tx_state->finished) {
         u64 ack_due = 0;
         // for each receiver, we prepare up to max_chunks_per_rcvr[r] chunks to
         // send
@@ -2602,9 +2554,9 @@ static void *tx_p(void *arg) {
             tx_state, 0, &chunks[num_chunks], &chunk_rcvr[num_chunks], now,
             &ack_due, allowed_chunks);
         num_chunks += cur_num_chunks;
-        if (rcvr->finished) {
-          if (rcvr->cc_states) {
-            terminate_cc(rcvr);
+        if (tx_state->finished) {
+          if (tx_state->cc_states) {
+            terminate_cc(tx_state);
             kick_cc(tx_state);
           }
         } else {
@@ -2620,7 +2572,7 @@ static void *tx_p(void *arg) {
       }
 
       if (num_chunks > 0) {
-        u8 rcvr_path[tx_state->num_receivers];
+        u8 rcvr_path[1];
         prepare_rcvr_paths(tx_state, rcvr_path);
         produce_batch(server, session_tx, rcvr_path, chunks, chunk_rcvr,
                       num_chunks);
@@ -2628,10 +2580,9 @@ static void *tx_p(void *arg) {
         rate_limit_tx(tx_state);
 
         // update book-keeping
-        struct sender_state_per_receiver *receiver = &tx_state->receiver[0];
-        u32 path_idx = tx_state->receiver[0].path_index;
-        if (receiver->cc_states != NULL) {
-          struct ccontrol_state *cc_state = &receiver->cc_states[path_idx];
+        u32 path_idx = tx_state->path_index;
+        if (tx_state->cc_states != NULL) {
+          struct ccontrol_state *cc_state = &tx_state->cc_states[path_idx];
 		  // FIXME allowed_chunks below is not correct (3x)
           atomic_fetch_add(&cc_state->mi_tx_npkts, allowed_chunks);
           atomic_fetch_add(&cc_state->total_tx_npkts, allowed_chunks);

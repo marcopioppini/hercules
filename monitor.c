@@ -31,7 +31,6 @@ bool monitor_get_reply_path(int sockfd, const char *rx_sample_buf, int rx_sample
   path->headerlen = reply.payload.reply_path.path.headerlen;
   path->header.checksum = reply.payload.reply_path.path.chksum;
   path->enabled = true;
-  path->replaced = false;
   path->payloadlen = 1200 - path->headerlen; // TODO set correctly
   path->framelen = 1200;
   path->ifid = reply.payload.reply_path.path.ifid;
@@ -63,7 +62,6 @@ bool monitor_get_paths(int sockfd, int job_id, int *n_paths,
            p[i].headerlen);
     p[i].header.checksum = reply.payload.paths.paths[i].chksum;
     p[i].enabled = true;
-    p[i].replaced = false;
     p[i].payloadlen = 1200 - p[i].headerlen; // TODO set correctly
     p[i].framelen = 1200;
     p[i].ifid = reply.payload.paths.paths[i].ifid;

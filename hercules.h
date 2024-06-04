@@ -33,6 +33,7 @@
 // packets is possible by using xdp in multibuffer mode, but this requires code
 // to handle multi-buffer packets.
 #define HERCULES_MAX_PKTSIZE 3000
+#define HERCULES_FILENAME_SIZE 1000
 // Batch size for send/receive operations
 #define BATCH_SIZE 64
 // Number of frames in UMEM area
@@ -53,7 +54,6 @@ struct hercules_path {
 	struct hercules_path_header header;
 	atomic_bool enabled;  // e.g. when a path has been revoked and no
 						  // replacement is available, this will be set to false
-	atomic_bool replaced;
 };
 
 /// RECEIVER
@@ -83,31 +83,29 @@ struct receiver_state {
 
 	struct bitset received_chunks;
 
-	// TODO rx_sample can be removed in favour of reply_path
-	// XXX: reads/writes to this is are a huge data race. Need to sync.
-	char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE];
-	int rx_sample_len;
-	int rx_sample_ifid;
 	// The reply path to use for contacting the sender. This is the reversed
 	// path of the last initial packet with the SET_RETURN_PATH flag set.
+	// TODO needs atomic?
 	struct hercules_path reply_path;
 
 	// Start/end time of the current transfer
 	u64 start_time;
 	u64 end_time;
-	u64 cts_sent_at;
 	u64 last_pkt_rcvd;		// Timeout detection
-	u64 last_new_pkt_rcvd;	// If we don't receive any new chunks for a while
-							// something is presumably wrong and we abort the
-							// transfer
-
 	u8 num_tracked_paths;
 	bool is_pcc_benchmark;
 	struct receiver_state_per_path path_state[256];
 };
 
-// SENDER
-struct sender_state_per_receiver {
+/// SENDER
+struct sender_state {
+	struct hercules_session *session;
+
+	// State for transmit rate control
+	size_t tx_npkts_queued;
+	u64 prev_rate_check;
+	size_t prev_tx_npkts_queued;
+	_Atomic u32 rate_limit;
 	u64 prev_round_start;
 	u64 prev_round_end;
 	u64 prev_slope;
@@ -116,26 +114,13 @@ struct sender_state_per_receiver {
 	bool finished;
 	/** Next batch should be sent via this path */
 	u8 path_index;
-
-	struct bitset acked_chunks;
+	struct bitset acked_chunks;			  //< Chunks we've received an ack for
 	atomic_uint_least64_t handshake_rtt;  // Handshake RTT in ns
 
-	u32 num_paths;
 	u32 return_path_idx;
-	struct hercules_app_addr addr;
+	u32 num_paths;
 	struct hercules_path *paths;
 	struct ccontrol_state *cc_states;
-	bool cts_received;
-};
-
-struct sender_state {
-	struct hercules_session *session;
-
-	// State for transmit rate control
-	size_t tx_npkts_queued;
-	u64 prev_rate_check;
-	size_t prev_tx_npkts_queued;
-
 	/** Filesize in bytes */
 	size_t filesize;
 	char filename[100];
@@ -146,25 +131,12 @@ struct sender_state {
 	u32 total_chunks;
 	/** Memory mapped file for receive */
 	char *mem;
-
-	_Atomic u32 rate_limit;
-
 	// Start/end time of the current transfer
 	u64 start_time;
 	u64 end_time;
-
-	u32 num_receivers;
-	struct sender_state_per_receiver *receiver;
-	u32 max_paths_per_rcvr;
-
-	// shared with Go
-	struct hercules_path *shd_paths;
-	const int *shd_num_paths;
-
-	atomic_bool has_new_paths;
 };
 
-// SESSION
+/// SESSION
 // Some states are used only by the TX/RX side and are marked accordingly
 enum session_state {
 	SESSION_STATE_NONE,
@@ -181,32 +153,36 @@ enum session_state {
 enum session_error {
 	SESSION_ERROR_OK,		//< No error, transfer completed successfully
 	SESSION_ERROR_TIMEOUT,	//< Session timed out
+	SESSION_ERROR_STALE,	//< Packets are being received, but none are new
 	SESSION_ERROR_PCC,		//< Something wrong with PCC
 	SESSION_ERROR_SEQNO_OVERFLOW,
-	SESSION_ERROR_NO_PATHS, //< Monitor returned no paths to destination
+	SESSION_ERROR_NO_PATHS,	 //< Monitor returned no paths to destination
 };
 
 // A session is a transfer between one sender and one receiver
 struct hercules_session {
-	struct receiver_state *rx_state;
-	struct sender_state *tx_state;
+	struct receiver_state *rx_state;  //< Valid if this is the receiving side
+	struct sender_state *tx_state;	  //< Valid if this is the sending side
 	_Atomic enum session_state state;
-	_Atomic enum session_error error;
+	_Atomic enum session_error error;  //< Valid if the session's state is DONE
 	struct send_queue *send_queue;
+
 	u64 last_pkt_sent;
-	u64 last_pkt_rcvd;
+	u64 last_pkt_rcvd;		//< Used for timeout detection
+	u64 last_new_pkt_rcvd;	//< If we only receive packets containing
+							// already-seen chunks for a while something is
+							// probably wrong
+	u32 jobid;	//< The monitor's ID for this job
 	u32 etherlen;
-	u32 jobid;
 
-	struct hercules_app_addr destination;
-	int num_paths;
-	struct hercules_path *paths_to_dest;
+	struct hercules_app_addr peer;
 
+	// Number of sent/received packets (for stats)
 	size_t rx_npkts;
 	size_t tx_npkts;
 };
 
-// SERVER
+/// SERVER
 struct hercules_interface {
 	char ifname[IFNAMSIZ];
 	int ifid;
@@ -230,15 +206,18 @@ struct hercules_config {
 struct hercules_server {
 	struct hercules_config config;
 	int control_sockfd;	 // AF_PACKET socket used for control traffic
-	int n_threads;
-	struct rx_p_args **worker_args;
-	struct hercules_session * _Atomic session_tx;  // Current TX session
-	struct hercules_session * deferred_tx;
-	struct hercules_session * _Atomic session_rx;  // Current RX session
-	struct hercules_session * deferred_rx;
 	int max_paths;
 	int rate_limit;
-	bool enable_pcc;
+	int n_threads;		 // Number of RX/TX worker threads
+	struct rx_p_args **worker_args;	 // Args passed to RX workers
+
+	struct hercules_session *_Atomic session_tx;  // Current TX session
+	struct hercules_session *deferred_tx;  // Previous TX session, no longer
+										   // active, waiting to be freed
+	struct hercules_session *_Atomic session_rx;  // Current RX session
+	struct hercules_session *deferred_rx;
+
+	bool enable_pcc;  // TODO make per path or session or something
 	int *ifindices;
 	int num_ifaces;
 	struct hercules_interface ifaces[];
@@ -302,3 +281,8 @@ struct hercules_stats {
 };
 
 #endif	// __HERCULES_H__
+
+/// Local Variables:
+/// outline-regexp: "/// "
+/// eval:(outline-minor-mode 1)
+/// End:
