@@ -76,7 +76,7 @@ struct ccontrol_state {
 */
 // Initialize congestion control state
 struct ccontrol_state *
-init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, size_t num_paths, size_t max_paths, size_t total_num_paths);
+init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, u32 num_paths);
 void terminate_ccontrol(struct ccontrol_state *cc_state);
 void continue_ccontrol(struct ccontrol_state *cc_state);
 void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt);

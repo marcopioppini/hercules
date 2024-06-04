@@ -236,10 +236,12 @@ static struct hercules_session *make_session(struct hercules_server *server) {
 	}
 	init_send_queue(s->send_queue, BATCH_SIZE);
 	s->last_pkt_sent = 0;
+	u64 now = get_nsecs();
 	s->last_pkt_rcvd =
-		get_nsecs();  // Set this to "now" to allow timing out HS at sender
-					  // (when no packet was received yet), once packets are
-					  // received it will be updated accordingly
+		now;  // Set this to "now" to allow timing out HS at sender
+			  // (when no packet was received yet), once packets are
+			  // received it will be updated accordingly
+	s->last_new_pkt_rcvd = now;
 	return s;
 }
 
@@ -254,9 +256,10 @@ static void destroy_session_tx(struct hercules_session *session) {
 	assert(ret == 0);  // No reason this should ever fail
 
 	bitset__destroy(&session->tx_state->acked_chunks);
-	free(session->tx_state->paths);
-	bitset__destroy(&session->tx_state->cc_states->mi_nacked);
-	free(session->tx_state->cc_states);
+	// TODO when can we free pathset?
+	/* free(session->tx_state->paths); */
+	/* bitset__destroy(&session->tx_state->cc_states->mi_nacked); */
+	/* free(session->tx_state->cc_states); */
 	free(session->tx_state);
 
 	destroy_send_queue(session->send_queue);
@@ -1263,8 +1266,9 @@ static void rate_limit_tx(struct sender_state *tx_state)
 void send_path_handshakes(struct hercules_server *server, struct sender_state *tx_state) {
   u64 now = get_nsecs();
 
-  for (u32 p = 0; p < tx_state->num_paths; p++) {
-    struct hercules_path *path = &tx_state->paths[p];
+  struct path_set *pathset = tx_state->pathset;
+  for (u32 p = 0; p < pathset->n_paths; p++) {
+    struct hercules_path *path = &pathset->paths[p];
     if (path->enabled) {
       u64 handshake_at = atomic_load(&path->next_handshake_at);
       if (handshake_at < now) {
@@ -1281,73 +1285,6 @@ void send_path_handshakes(struct hercules_server *server, struct sender_state *t
     }
   }
 }
-
-// TODO
-static void update_hercules_tx_paths(struct sender_state *tx_state)
-{
-	return; // FIXME HACK
-	/* tx_state->has_new_paths = false; */
-	/* u64 now = get_nsecs(); */
-	/* for(u32 r = 0; r < tx_state->num_receivers; r++) { */
-	/* 	struct sender_state_per_receiver *receiver = &tx_state->receiver[r]; */
-	/* 	receiver->num_paths = tx_state->shd_num_paths[r]; */
-
-	/* 	bool replaced_return_path = false; */
-	/* 	for(u32 p = 0; p < receiver->num_paths; p++) { */
-	/* 		struct hercules_path *shd_path = &tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p]; */
-	/* 		if(!shd_path->enabled && p == receiver->return_path_idx) { */
-	/* 			receiver->return_path_idx++; */
-	/* 		} */
-	/* 		if(shd_path->replaced) { */
-	/* 			shd_path->replaced = false; */
-	/* 			// assert that chunk length fits into packet with new header */
-	/* 			if(shd_path->payloadlen < (int)tx_state->chunklen + rbudp_headerlen) { */
-	/* 				fprintf(stderr, */
-	/* 				        "cannot use path %d for receiver %d: header too big, chunk does not fit into payload\n", p, */
-	/* 				        r); */
-	/* 				receiver->paths[p].enabled = false; */
-	/* 				continue; */
-	/* 			} */
-	/* 			memcpy(&receiver->paths[p], shd_path, sizeof(struct hercules_path)); */
-
-	/* 			atomic_store(&receiver->paths[p].next_handshake_at, */
-	/* 			             UINT64_MAX); // by default do not send a new handshake */
-	/* 			if(p == receiver->return_path_idx) { */
-	/* 				atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure handshake_rtt is adapted */
-	/* 				// don't trigger RTT estimate on other paths, as it will be triggered by the ACK on the new return path */
-	/* 				replaced_return_path = true; */
-	/* 			} */
-	/* 			// reset PCC state */
-	/* 			if(!replaced_return_path && receiver->cc_states != NULL) { */
-	/* 				terminate_ccontrol(&receiver->cc_states[p]); */
-	/* 				continue_ccontrol(&receiver->cc_states[p]); */
-	/* 				atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure mi_duration is set */
-	/* 			} */
-	/* 		} else { */
-	/* 			if(p == receiver->return_path_idx) { */
-	/* 				atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure handshake_rtt is adapted */
-	/* 				// don't trigger RTT estimate on other paths, as it will be triggered by the ACK on the new return path */
-	/* 				replaced_return_path = true; */
-	/* 			} */
-	/* 			if(receiver->cc_states != NULL && receiver->paths[p].enabled != shd_path->enabled) { */
-	/* 				if(shd_path->enabled) { // reactivate PCC */
-	/* 					if(receiver->cc_states != NULL) { */
-	/* 						double rtt = receiver->cc_states[p].rtt; */
-	/* 						double mi_duration = receiver->cc_states[p].pcc_mi_duration; */
-	/* 						continue_ccontrol(&receiver->cc_states[p]); */
-	/* 						receiver->cc_states[p].rtt = rtt; */
-	/* 						receiver->cc_states[p].pcc_mi_duration = mi_duration; */
-	/* 					} */
-	/* 				} else { // deactivate PCC */
-	/* 					terminate_ccontrol(&receiver->cc_states[p]); */
-	/* 				} */
-	/* 			} */
-	/* 			receiver->paths[p].enabled = shd_path->enabled; */
-	/* 		} */
-	/* 	} */
-	/* } */
-}
-
 
 static void claim_tx_frames(struct hercules_server *server, struct hercules_interface *iface, u64 *addrs, size_t num_frames)
 {
@@ -1391,11 +1328,13 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 													   struct send_queue_unit *unit)
 {
 	u32 num_chunks_in_unit = 0;
+	struct path_set *pathset = tx_state->pathset;
 	for(u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++) {
 		if(unit->paths[i] == UINT8_MAX) {
 			break;
 		}
-		struct hercules_path *path = &tx_state->paths[unit->paths[i]];
+		// TODO path idx may be larger if paths changed in meantime
+		struct hercules_path *path = &pathset->paths[unit->paths[i]];
 		if(path->ifid == ifid) {
 			num_chunks_in_unit++;
 		}
@@ -1412,7 +1351,8 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 		if(unit->paths[i] == UINT8_MAX) {
 			break;
 		}
-		const struct hercules_path *path = &tx_state->paths[unit->paths[i]];
+		// TODO check idx not too large (see above)
+		const struct hercules_path *path = &pathset->paths[unit->paths[i]];
 		if(path->ifid != ifid) {
 			continue;
 		}
@@ -1432,9 +1372,9 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 #endif
 		u8 track_path = PCC_NO_PATH; // put path_idx iff PCC is enabled
 		sequence_number seqnr = 0;
-		if(tx_state->cc_states != NULL) {
+		if(path->cc_state != NULL) {
 			track_path = unit->paths[i];
-			seqnr = atomic_fetch_add(&tx_state->cc_states[unit->paths[i]].last_seqnr, 1);
+			seqnr = atomic_fetch_add(&path->cc_state->last_seqnr, 1);
 		}
 		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, seqnr, tx_state->mem + chunk_start, len, path->payloadlen);
 		stitch_checksum(path, path->header.checksum, pkt);
@@ -1507,15 +1447,17 @@ static u32 compute_max_chunks_current_path(struct sender_state *tx_state) {
 	u32 allowed_chunks = 0;
 	u64 now = get_nsecs();
 
-	if (!tx_state->paths[tx_state->path_index].enabled) {
+	// TODO pass in pathset instead? (atomics/free)
+	struct path_set *pathset = tx_state->pathset;
+	// TODO make sure path_index is reset correctly on pathset change
+	struct hercules_path *path = &pathset->paths[pathset->path_index];
+	if (!path->enabled) {
 		return 0;  // if a receiver does not have any enabled paths, we can
 				   // actually end up here ... :(
 	}
 
-	if (tx_state->cc_states != NULL) {	// use PCC
-		struct ccontrol_state *cc_state =
-			&tx_state->cc_states[tx_state->path_index];
-		/* debug_printf("path idx %d", tx_state->receiver[0].path_index); */
+	if (path->cc_state) {	// use PCC
+		struct ccontrol_state *cc_state = path->cc_state;
 		allowed_chunks =
 			umin32(BATCH_SIZE, ccontrol_can_send_npkts(cc_state, now));
 	} else {  // no path-based limit
@@ -1539,30 +1481,33 @@ static u32 shrink_sending_rates(struct sender_state *tx_state,
 	return total_chunks;
 }
 
-static void prepare_rcvr_paths(struct sender_state *tx_state, u8 *rcvr_path) {
-	rcvr_path[0] = tx_state->path_index;
+// TODO remove
+static inline void prepare_rcvr_paths(struct sender_state *tx_state, u8 *rcvr_path) {
+	rcvr_path[0] = tx_state->pathset->path_index;
 }
 
 // Mark the next available path as active
 static void iterate_paths(struct sender_state *tx_state) {
-	if (tx_state->num_paths == 0) {
+	struct path_set *pathset = tx_state->pathset;
+	if (pathset->n_paths == 0) {
 		return;
 	}
 	u32 prev_path_index =
-		tx_state->path_index;  // we need this to break the loop if all paths
-							   // are disabled
-	if (prev_path_index >= tx_state->num_paths) {
+		pathset->path_index;  // we need this to break the loop if all paths
+							  // are disabled
+	if (prev_path_index >= pathset->n_paths) {
 		prev_path_index = 0;
 	}
 	do {
-		tx_state->path_index = (tx_state->path_index + 1) % tx_state->num_paths;
-	} while (!tx_state->paths[tx_state->path_index].enabled &&
-			 tx_state->path_index != prev_path_index);
+		pathset->path_index = (pathset->path_index + 1) % pathset->n_paths;
+	} while (!pathset->paths[pathset->path_index].enabled &&
+			 pathset->path_index != prev_path_index);
 }
 
 static void terminate_cc(const struct sender_state *tx_state) {
-	for (u32 i = 0; i < tx_state->num_paths; i++) {
-		terminate_ccontrol(&tx_state->cc_states[i]);
+	struct path_set *pathset = tx_state->pathset;
+	for (u32 i = 0; i < pathset->n_paths; i++) {
+		terminate_ccontrol(pathset->paths[i].cc_state);
 	}
 }
 
@@ -1570,8 +1515,9 @@ static void kick_cc(struct sender_state *tx_state) {
 	if (tx_state->finished) {
 		return;
 	}
-	for (u32 p = 0; p < tx_state->num_paths; p++) {
-		kick_ccontrol(&tx_state->cc_states[p]);
+	struct path_set *pathset = tx_state->pathset;
+	for (u32 p = 0; p < pathset->n_paths; p++) {
+		kick_ccontrol(pathset->paths[p].cc_state);
 	}
 }
 // Select batch of un-ACKed chunks for (re)transmit:
@@ -1659,18 +1605,23 @@ static struct sender_state *init_tx_state(struct hercules_session *session,
 	tx_state->end_time = 0;
 
 	bitset__create(&tx_state->acked_chunks, tx_state->total_chunks);
-	tx_state->path_index = 0;
 	tx_state->handshake_rtt = 0;
-	tx_state->num_paths = num_paths;
-	tx_state->paths = paths;
+	struct path_set *pathset = calloc(1, sizeof(*tx_state->pathset));
+	if (pathset == NULL){
+		free(tx_state);
+		return NULL;
+	}
+	pathset->n_paths = num_paths;
+	memcpy(pathset->paths, paths, sizeof(*paths)*num_paths);
+	tx_state->pathset = pathset;
 	tx_state->session->peer = *dests;
-	update_hercules_tx_paths(tx_state);
 	return tx_state;
 }
 
 static void destroy_tx_state(struct sender_state *tx_state) {
 	bitset__destroy(&tx_state->acked_chunks);
-	free(tx_state->paths);
+	// TODO freeing pathset
+	/* free(tx_state->paths); */
 	free(tx_state);
 }
 
@@ -1681,7 +1632,8 @@ static void tx_retransmit_initial(struct hercules_server *server, u64 now) {
 		if (now >
 			session_tx->last_pkt_sent + session_hs_retransmit_interval) {
 			struct sender_state *tx_state = session_tx->tx_state;
-			tx_send_initial(server, &tx_state->paths[tx_state->return_path_idx],
+			struct path_set *pathset = tx_state->pathset;
+			tx_send_initial(server, &pathset->paths[tx_state->return_path_idx],
 							tx_state->filename, tx_state->filesize,
 							tx_state->chunklen, now, 0, session_tx->etherlen, true, true);
 			session_tx->last_pkt_sent = now;
@@ -1702,6 +1654,7 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 			return;
 		}
 		if (server->enable_pcc) {
+			struct path_set *pathset = tx_state->pathset;
 			u64 now = get_nsecs();
 			tx_state->handshake_rtt = now - parsed_pkt->timestamp;
 			// TODO where to get rate limit?
@@ -1709,24 +1662,26 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 			/* u32 rate = 2000e3; // 20 Gbps */
 			u32 rate = 100; // 1 Mbps
 			debug_printf("rate limit %u", rate);
-			tx_state->cc_states = init_ccontrol_state(
-				rate, tx_state->total_chunks,
-				tx_state->num_paths, tx_state->num_paths,
-				tx_state->num_paths);
-			ccontrol_update_rtt(&tx_state->cc_states[0],
+			for (u32 i = 0; i < pathset->n_paths; i++){
+				pathset->paths[i].cc_state = init_ccontrol_state(
+					rate, tx_state->total_chunks,
+					pathset->n_paths);
+			}
+			ccontrol_update_rtt(pathset->paths[0].cc_state,
 								tx_state->handshake_rtt);
+			// TODO assumption: return path is always idx 0
 			fprintf(stderr,
 					"[receiver %d] [path 0] handshake_rtt: "
 					"%fs, MI: %fs\n",
 					0, tx_state->handshake_rtt / 1e9,
-					tx_state->cc_states[0].pcc_mi_duration);
+					pathset->paths[0].cc_state->pcc_mi_duration);
 
 			// make sure we later perform RTT estimation
 			// on every enabled path
-			tx_state->paths[0].next_handshake_at =
+			pathset->paths[0].next_handshake_at =
 				UINT64_MAX;	 // We just completed the HS for this path
-			for (u32 p = 1; p < tx_state->num_paths; p++) {
-				tx_state->paths[p].next_handshake_at = now;
+			for (u32 p = 1; p < pathset->n_paths; p++) {
+				pathset->paths[p].next_handshake_at = now;
 			}
 		}
 		session_tx->state = SESSION_STATE_WAIT_CTS;
@@ -1736,23 +1691,24 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 	if (session_tx != NULL &&
 		session_tx->state == SESSION_STATE_RUNNING) {
 		struct sender_state *tx_state = session_tx->tx_state;
+		struct path_set *pathset = tx_state->pathset;
 		// This is a reply to some handshake we sent during an already
 		// established session (e.g. to open a new path)
 		u64 now = get_nsecs();
 		if (server->enable_pcc) {
-			ccontrol_update_rtt(&tx_state->cc_states[parsed_pkt->path_index],
+			ccontrol_update_rtt(pathset->paths[parsed_pkt->path_index].cc_state,
 								now - parsed_pkt->timestamp);
 		}
-		tx_state->paths[parsed_pkt->path_index].next_handshake_at = UINT64_MAX;
+		pathset->paths[parsed_pkt->path_index].next_handshake_at = UINT64_MAX;
 
 		// We have a new return path, redo handshakes on all other paths
 		if (parsed_pkt->flags & HANDSHAKE_FLAG_SET_RETURN_PATH){
 			tx_state->handshake_rtt = now - parsed_pkt->timestamp;
-			for (u32 p = 0; p < tx_state->num_paths; p++){
-				if (p != parsed_pkt->path_index && tx_state->paths[p].enabled){
-					tx_state->paths[p].next_handshake_at = now;
-					tx_state->cc_states[p].pcc_mi_duration = DBL_MAX;
-					tx_state->cc_states[p].rtt = DBL_MAX;
+			for (u32 p = 0; p < pathset->n_paths; p++){
+				if (p != parsed_pkt->path_index && pathset->paths[p].enabled){
+					pathset->paths[p].next_handshake_at = now;
+					pathset->paths[p].cc_state->pcc_mi_duration = DBL_MAX;
+					pathset->paths[p].cc_state->rtt = DBL_MAX;
 				}
 			}
 		}
@@ -1870,8 +1826,12 @@ static bool pcc_mi_elapsed(struct ccontrol_state *cc_state)
 
 static void pcc_monitor(struct sender_state *tx_state)
 {
-	for(u32 cur_path = 0; cur_path < tx_state->num_paths; cur_path++) {
-		struct ccontrol_state *cc_state = &tx_state->cc_states[cur_path];
+	struct path_set *pathset = tx_state->pathset;
+	for(u32 cur_path = 0; cur_path < pathset->n_paths; cur_path++) {
+		struct ccontrol_state *cc_state = pathset->paths[cur_path].cc_state;
+		if (cc_state == NULL){ // Not using PCC
+			continue;
+		}
 		pthread_spin_lock(&cc_state->lock);
 		if(pcc_mi_elapsed(cc_state)) {
 			u64 now = get_nsecs();
@@ -2193,9 +2153,9 @@ static void mark_timed_out_sessions(struct hercules_server *server, u64 now) {
 			quit_session(session_rx, SESSION_ERROR_TIMEOUT);
 			debug_printf("Session (RX) timed out!");
 		}
-		else if (new > session_rx->last_new_pkt_rcvd + session_stale_timeout){
-			quit_session(session_tx, SESSION_ERROR_STALE);
-			debug_printf("Session (RX) stale!")
+		else if (now > session_rx->last_new_pkt_rcvd + session_stale_timeout){
+			quit_session(session_rx, SESSION_ERROR_STALE);
+			debug_printf("Session (RX) stale!");
 		}
 	}
 }
@@ -2203,6 +2163,8 @@ static void mark_timed_out_sessions(struct hercules_server *server, u64 now) {
 static void tx_update_paths(struct hercules_server *server) {
 	struct hercules_session *session_tx = server->session_tx;
 	if (session_tx && session_tx->state == SESSION_STATE_RUNNING) {
+		struct sender_state *tx_state = session_tx->tx_state;
+		struct path_set *old_pathset = tx_state->pathset;
 		int n_paths;
 		struct hercules_path *paths;
 		bool ret =
@@ -2212,15 +2174,68 @@ static void tx_update_paths(struct hercules_server *server) {
 			return;
 		}
 		debug_printf("received %d paths", n_paths);
-		if (n_paths == 0){
+		if (n_paths == 0) {
 			free(paths);
 			quit_session(session_tx, SESSION_ERROR_NO_PATHS);
 			return;
 		}
-		// XXX doesn't this break if we get more paths and the update is not
-		// atomic?
-		session_tx->tx_state->num_paths = n_paths;
-		session_tx->tx_state->paths = paths;
+		struct path_set *new_pathset = calloc(1, sizeof(*new_pathset));
+		if (new_pathset == NULL) {
+			return;
+		}
+		new_pathset->n_paths = n_paths;
+		memcpy(new_pathset->paths, paths, sizeof(*paths) * n_paths);
+		u32 path_lim =
+			(old_pathset->n_paths > (u32)n_paths) ? (u32)n_paths : old_pathset->n_paths;
+		bool replaced_return_path = false;
+		for (u32 i = 0; i < path_lim; i++) {
+			// Set these two values before the comparison or it would fail even
+			// if paths are the same.
+			new_pathset->paths[i].next_handshake_at =
+				old_pathset->paths[i].next_handshake_at;
+			new_pathset->paths[i].cc_state = old_pathset->paths[i].cc_state;
+
+			if (memcmp(&old_pathset->paths[i], &new_pathset->paths[i],
+					   sizeof(struct hercules_path)) == 0) {
+				// Old and new path are the same, CC state carries over.
+				// Since we copied the CC state before just leave as-is.
+				debug_printf("Path %d not changed", i);
+			} else {
+				debug_printf("Path %d changed, resetting CC", i);
+				if (i == 0) {
+					// TODO assumption (also in other places): return path is
+					// always idx 0
+					replaced_return_path = true;
+				}
+				// TODO whether to use pcc should be decided on a per-path basis
+				// by the monitor
+				if (server->enable_pcc) {
+					// TODO assert chunk length fits onto path
+					// The new path is different, restart CC
+					// TODO where to get rate
+					u32 rate = 100;
+					new_pathset->paths[i].cc_state = init_ccontrol_state(
+						rate, tx_state->total_chunks, new_pathset->n_paths);
+					// Re-send a handshake to update path rtt
+					new_pathset->paths[i].next_handshake_at = 0;
+				}
+			}
+			if (replaced_return_path) {
+				// If we changed the return path we re-send the handshake on all
+				// paths to update RTT
+				debug_printf(
+					"Re-sending HS on path %d because return path changed", i);
+				new_pathset->paths[i].next_handshake_at = 0;
+			}
+		}
+		// Finally, swap in the new pathset
+		tx_state->pathset = new_pathset;
+		free(paths); // These were *copied* into the new pathset
+		// TODO when it's safe (when?), free:
+		// - the old pathset
+		// - its cc states that were not carried over
+		// - ! If we have fewer paths in the new set than in the old one don't
+		// forget to free ALL old states
 	}
 }
 
@@ -2466,8 +2481,8 @@ static void events_p(void *arg) {
 											cp->payload.ack.ack_nr);
 							tx_register_nacks(
 								&cp->payload.ack,
-								&server->session_tx->tx_state
-									->cc_states[h->path]);
+								// TODO h->path may be too large if pathset changed
+								server->session_tx->tx_state->pathset->paths[h->path].cc_state);
 						}
 						break;
 					default:
@@ -2479,7 +2494,7 @@ static void events_p(void *arg) {
 				// all data packets
 				debug_printf("Non-control packet received on control socket");
 			}
-			if (server->session_tx && server->session_tx->tx_state->cc_states){
+			if (server->session_tx){
 				pcc_monitor(server->session_tx->tx_state);
 			}
 		}
@@ -2555,10 +2570,8 @@ static void *tx_p(void *arg) {
             &ack_due, allowed_chunks);
         num_chunks += cur_num_chunks;
         if (tx_state->finished) {
-          if (tx_state->cc_states) {
             terminate_cc(tx_state);
             kick_cc(tx_state);
-          }
         } else {
           // only wait for the nearest ack
           if (next_ack_due) {
@@ -2580,20 +2593,21 @@ static void *tx_p(void *arg) {
         rate_limit_tx(tx_state);
 
         // update book-keeping
-        u32 path_idx = tx_state->path_index;
-        if (tx_state->cc_states != NULL) {
-          struct ccontrol_state *cc_state = &tx_state->cc_states[path_idx];
-		  // FIXME allowed_chunks below is not correct (3x)
-          atomic_fetch_add(&cc_state->mi_tx_npkts, allowed_chunks);
-          atomic_fetch_add(&cc_state->total_tx_npkts, allowed_chunks);
-          if (pcc_has_active_mi(cc_state, now)) {
-            atomic_fetch_add(&cc_state->mi_tx_npkts_monitored,
-                             allowed_chunks);
-          }
-        }
-      }
+        struct path_set *pathset = tx_state->pathset;
+        u32 path_idx = pathset->path_index;
+          struct ccontrol_state *cc_state = pathset->paths[path_idx].cc_state;
+		  if (cc_state != NULL) {
+			  // FIXME allowed_chunks below is not correct (3x)
+			  atomic_fetch_add(&cc_state->mi_tx_npkts, allowed_chunks);
+			  atomic_fetch_add(&cc_state->total_tx_npkts, allowed_chunks);
+			  if (pcc_has_active_mi(cc_state, now)) {
+				  atomic_fetch_add(&cc_state->mi_tx_npkts_monitored,
+								   allowed_chunks);
+			  }
+		  }
+	  }
 
-      iterate_paths(tx_state);
+	  iterate_paths(tx_state);
 
       if (now < next_ack_due) {
         // XXX if the session vanishes in the meantime, we might wait

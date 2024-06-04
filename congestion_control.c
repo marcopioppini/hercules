@@ -13,21 +13,15 @@
 
 #define MSS 1460
 
-struct ccontrol_state *
-init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, size_t num_paths, size_t max_paths, size_t total_num_paths)
-{
-	debug_printf("init ccontrol state");
-	struct ccontrol_state *cc_states = calloc(max_paths, sizeof(struct ccontrol_state));
-	for(size_t i = 0; i < max_paths; i++) {
-		struct ccontrol_state *cc_state = &cc_states[i];
-		cc_state->max_rate_limit = max_rate_limit;
-		cc_state->num_paths = num_paths;
-		cc_state->total_num_paths = total_num_paths;
-		pthread_spin_init(&cc_state->lock, PTHREAD_PROCESS_PRIVATE);
+struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit,
+										   u32 total_chunks, u32 num_paths) {
+	struct ccontrol_state *cc_state = calloc(1, sizeof(struct ccontrol_state));
+	cc_state->max_rate_limit = max_rate_limit;
+	cc_state->num_paths = num_paths;
+	pthread_spin_init(&cc_state->lock, PTHREAD_PROCESS_PRIVATE);
 
-		continue_ccontrol(cc_state);
-	}
-	return cc_states;
+	continue_ccontrol(cc_state);
+	return cc_state;
 }
 
 void ccontrol_start_monitoring_interval(struct ccontrol_state *cc_state)
@@ -60,7 +54,7 @@ void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt)
 		// initial rate should be per-receiver fair
 		u32 initial_rate = umin32(
 				(u32)(MSS / cc_state->rtt),
-				cc_state->max_rate_limit / (cc_state->num_paths * cc_state->total_num_paths)
+				cc_state->max_rate_limit / (cc_state->num_paths)
 		);
 		cc_state->curr_rate = initial_rate;
 		cc_state->prev_rate = initial_rate;
@@ -70,10 +64,11 @@ void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt)
 	ccontrol_start_monitoring_interval(cc_state);
 }
 
-void terminate_ccontrol(struct ccontrol_state *cc_state)
-{
-	cc_state->state = pcc_terminated;
-	cc_state->curr_rate = 0;
+void terminate_ccontrol(struct ccontrol_state *cc_state) {
+	if (cc_state != NULL) {
+		cc_state->state = pcc_terminated;
+		cc_state->curr_rate = 0;
+	}
 }
 
 void continue_ccontrol(struct ccontrol_state *cc_state)

@@ -50,10 +50,11 @@ struct hercules_path {
 	int headerlen;
 	int payloadlen;
 	int framelen;  //!< length of ethernet frame; headerlen + payloadlen
-	int ifid;
+	int ifid;	   // Interface to use for sending
 	struct hercules_path_header header;
 	atomic_bool enabled;  // e.g. when a path has been revoked and no
 						  // replacement is available, this will be set to false
+	struct ccontrol_state *cc_state;  // This path's PCC state
 };
 
 /// RECEIVER
@@ -91,13 +92,21 @@ struct receiver_state {
 	// Start/end time of the current transfer
 	u64 start_time;
 	u64 end_time;
-	u64 last_pkt_rcvd;		// Timeout detection
+	u64 last_pkt_rcvd;	// Timeout detection
 	u8 num_tracked_paths;
 	bool is_pcc_benchmark;
 	struct receiver_state_per_path path_state[256];
 };
 
 /// SENDER
+
+// Used to atomically swap in new paths
+struct path_set {
+	u32 n_paths;
+	u8 path_index;	// Path to use for sending next batch (used by tx_p)
+	struct hercules_path paths[256];
+};
+
 struct sender_state {
 	struct hercules_session *session;
 
@@ -112,15 +121,11 @@ struct sender_state {
 	u64 ack_wait_duration;
 	u32 prev_chunk_idx;
 	bool finished;
-	/** Next batch should be sent via this path */
-	u8 path_index;
 	struct bitset acked_chunks;			  //< Chunks we've received an ack for
 	atomic_uint_least64_t handshake_rtt;  // Handshake RTT in ns
 
-	u32 return_path_idx;
-	u32 num_paths;
-	struct hercules_path *paths;
-	struct ccontrol_state *cc_states;
+	u32 return_path_idx; // TODO set where?
+	struct path_set *_Atomic pathset;  // Paths currently in use
 	/** Filesize in bytes */
 	size_t filesize;
 	char filename[100];
@@ -141,8 +146,7 @@ struct sender_state {
 enum session_state {
 	SESSION_STATE_NONE,
 	SESSION_STATE_PENDING,	//< (TX) Need to send HS and repeat until TO,
-							// waiting
-							// for a reflected HS packet
+							// waiting for a reflected HS packet
 	SESSION_STATE_NEW,	//< (RX) Received a HS packet, need to send HS reply and
 						// CTS
 	SESSION_STATE_WAIT_CTS,	 //< (TX) Waiting for CTS
@@ -172,7 +176,7 @@ struct hercules_session {
 	u64 last_new_pkt_rcvd;	//< If we only receive packets containing
 							// already-seen chunks for a while something is
 							// probably wrong
-	u32 jobid;	//< The monitor's ID for this job
+	u32 jobid;				//< The monitor's ID for this job
 	u32 etherlen;
 
 	struct hercules_app_addr peer;
@@ -208,7 +212,7 @@ struct hercules_server {
 	int control_sockfd;	 // AF_PACKET socket used for control traffic
 	int max_paths;
 	int rate_limit;
-	int n_threads;		 // Number of RX/TX worker threads
+	int n_threads;					 // Number of RX/TX worker threads
 	struct rx_p_args **worker_args;	 // Args passed to RX workers
 
 	struct hercules_session *_Atomic session_tx;  // Current TX session
