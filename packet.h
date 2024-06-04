@@ -63,6 +63,42 @@ struct scionaddrhdr_ipv4 {
 	__u32 src_ip;
 };
 
+// Used for destination unreachable, packet too big, and parameter problem,
+// since all 3 have the same offset to the offending packet.
+#define SCMP_DEST_UNREACHABLE 1
+#define SCMP_PKT_TOO_BIG 2
+#define SCMP_PARAMETER_PROBLEM 4
+struct scmp_err {
+	__u32 unused;
+	__u8 offending_packet[];
+};
+
+#define SCMP_EXT_IF_DOWN 5
+struct scmp_extif_down {
+	__u64 ia;
+	__u64 iface;
+	__u8 offending_packet[];
+};
+
+#define SCMP_INT_CONN_DOWN 6
+struct scmp_internal_down {
+	__u64 ia;
+	__u64 ingress_if;
+	__u64 egress_if;
+	__u8 offending_packet[];
+};
+
+struct scmp_message {
+	__u8 type;
+	__u8 code;
+	__u16 chksum;
+	union {
+		struct scmp_err err;
+		struct scmp_extif_down ext_down;
+		struct scmp_internal_down int_down;
+	} msg;
+};
+
 // The header used by both control and data packets
 struct hercules_header {
 	__u32 chunk_idx;

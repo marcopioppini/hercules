@@ -433,14 +433,109 @@ static const char *parse_pkt_fast_path(const char *pkt, size_t length, bool chec
 	return pkt + offset;
 }
 
+// The SCMP packet contains a copy of the offending message we sent, parse it to
+// figure out which path the SCMP message is referring to.
+// Returns the offending path's id, or PCC_NO_PATH on failure.
+// XXX Not checking dst or source ia/addr/port in reflected packet
+static u8 parse_scmp_packet(const struct scmp_message *scmp, size_t length) {
+	size_t offset = 0;
+	const char *pkt = NULL;
+	debug_printf("SCMP type %d", scmp->type);
+	switch (scmp->type) {
+		case SCMP_DEST_UNREACHABLE:
+		case SCMP_PKT_TOO_BIG:
+		case SCMP_PARAMETER_PROBLEM:;
+			pkt = (const char *)scmp->msg.err.offending_packet;
+			offset += offsetof(struct scmp_message, msg.err.offending_packet);
+			break;
+		case SCMP_EXT_IF_DOWN:
+			pkt = (const char *)scmp->msg.ext_down.offending_packet;
+			offset +=
+				offsetof(struct scmp_message, msg.ext_down.offending_packet);
+			break;
+		case SCMP_INT_CONN_DOWN:
+			pkt = (const char *)scmp->msg.int_down.offending_packet;
+			offset +=
+				offsetof(struct scmp_message, msg.int_down.offending_packet);
+			break;
+		default:
+			debug_printf("Unknown or unhandled SCMP type: %d", scmp->type);
+			return PCC_NO_PATH;
+	}
+	// Parse SCION Common header
+	if (offset + sizeof(struct scionhdr) > length) {
+		debug_printf("too short for SCION header: %zu %zu", offset, length);
+		return PCC_NO_PATH;
+	}
+
+	const struct scionhdr *scionh = (const struct scionhdr *)(pkt);
+	if (scionh->version != 0u) {
+		debug_printf("unsupported SCION version: %u != 0", scionh->version);
+		return PCC_NO_PATH;
+	}
+	if (scionh->dst_type != 0u) {
+		debug_printf("unsupported destination address type: %u != 0 (IPv4)",
+					 scionh->dst_type);
+	}
+	if (scionh->src_type != 0u) {
+		debug_printf("unsupported source address type: %u != 0 (IPv4)",
+					 scionh->src_type);
+	}
+
+	__u8 next_header = scionh->next_header;
+	size_t next_offset = offset + scionh->header_len * SCION_HEADER_LINELEN;
+	if (next_header == SCION_HEADER_HBH) {
+		if (next_offset + 2 > length) {
+			debug_printf("too short for SCION HBH options header: %zu %zu",
+						 next_offset, length);
+			return PCC_NO_PATH;
+		}
+		next_header = *((__u8 *)pkt + next_offset);
+		next_offset +=
+			(*((__u8 *)pkt + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+	if (next_header == SCION_HEADER_E2E) {
+		if (next_offset + 2 > length) {
+			debug_printf("too short for SCION E2E options header: %zu %zu",
+						 next_offset, length);
+			return PCC_NO_PATH;
+		}
+		next_header = *((__u8 *)pkt + next_offset);
+		next_offset +=
+			(*((__u8 *)pkt + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+	if (next_header != IPPROTO_UDP) {
+		return PCC_NO_PATH;
+	}
+	const struct scionaddrhdr_ipv4 *scionaddrh =
+		(const struct scionaddrhdr_ipv4 *)(pkt + offset +
+										   sizeof(struct scionhdr));
+	offset = next_offset;
+
+	// Finally parse the L4-UDP header
+	if (offset + sizeof(struct udphdr) > length) {
+		debug_printf("too short for SCION/UDP header: %zu %zu", offset, length);
+		return PCC_NO_PATH;
+	}
+
+	const struct udphdr *l4udph = (const struct udphdr *)(pkt + offset);
+
+	offset += sizeof(struct udphdr);
+	const struct hercules_header *rbudp_hdr =
+		(const struct hercules_header *)(pkt + offset);
+	return rbudp_hdr->path;
+}
+
 // Parse ethernet/IP/UDP/SCION/UDP packet,
 // check that it is addressed to us,
 // check SCION-UDP checksum if set.
 // sets scionaddrh_o to SCION address header, if provided
 // return rbudp-packet (i.e. SCION/UDP packet payload)
-static const char *parse_pkt(const struct hercules_server *server, const char *pkt, size_t length, bool check,
-                             const struct scionaddrhdr_ipv4 **scionaddrh_o, const struct udphdr **udphdr_o)
-{
+static const char *parse_pkt(const struct hercules_server *server,
+							 const char *pkt, size_t length, bool check,
+							 const struct scionaddrhdr_ipv4 **scionaddrh_o,
+							 const struct udphdr **udphdr_o,
+							 u8 *scmp_offending_path_o) {
 	// Parse Ethernet frame
 	if(sizeof(struct ether_header) > length) {
 		debug_printf("too short for eth header: %zu", length);
@@ -518,8 +613,15 @@ static const char *parse_pkt(const struct hercules_server *server, const char *p
 		next_offset += (*((__u8 *)pkt + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
 	}
 	if(next_header != IPPROTO_UDP) {
-		if(next_header == L4_SCMP) {
-			debug_printf("SCION/SCMP L4: not implemented, ignoring...");
+		if (next_header == L4_SCMP) {
+			if (next_offset + sizeof(struct scmp_message) > length) {
+				debug_printf("SCMP, too short?");
+				return NULL;
+			}
+			const struct scmp_message *scmp_msg =
+				(const struct scmp_message *)(pkt + next_offset);
+			*scmp_offending_path_o =
+				parse_scmp_packet(scmp_msg, length - next_offset);
 		} else {
 			debug_printf("unknown SCION L4: %u", next_header);
 		}
@@ -2350,9 +2452,30 @@ static void events_p(void *arg) {
 				continue;
 			}
 
-			const char *rbudp_pkt =
-				parse_pkt(server, buf, len, true, &scionaddrhdr, &udphdr);
+			u8 scmp_bad_path = PCC_NO_PATH;
+			const char *rbudp_pkt = parse_pkt(
+				server, buf, len, true, &scionaddrhdr, &udphdr, &scmp_bad_path);
 			if (rbudp_pkt == NULL) {
+				if (scmp_bad_path != PCC_NO_PATH) {
+					debug_printf("Received SCMP error on path %d, disabling",
+								 scmp_bad_path);
+					// XXX We disable the path that received an SCMP error. The
+					// next time we fetch new paths from the monitor it will be
+					// re-enabled, if it's still present. It may be desirable to
+					// retry a disabled path earlier, depending on how often we
+					// update paths and on the exact SCMP error. Also, should
+					// "destination unreachable" be treated as a permanent
+					// failure and the session abandoned immediately?
+					struct hercules_session *session_tx = server->session_tx;
+					if (session_tx != NULL &&
+						session_tx->state == SESSION_STATE_RUNNING) {
+						struct path_set *pathset =
+							session_tx->tx_state->pathset;
+						if (scmp_bad_path < pathset->n_paths) {
+							pathset->paths[scmp_bad_path].enabled = false;
+						}
+					}
+				}
 				continue;
 			}
 
