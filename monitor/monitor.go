@@ -414,8 +414,10 @@ type HerculesTransfer struct {
 	nPaths int            // Maximum number of paths to use
 	pm     *PathManager
 	// The following two fields are meaningless if the job's status is 'Queued'
-	state C.enum_session_state // The state returned by the server
-	err   C.enum_session_error // The error returned by the server
+	state        C.enum_session_state // The state returned by the server
+	err          C.enum_session_error // The error returned by the server
+	time_elapsed int                  // Seconds the transfer has been running
+	chunks_acked int                  // Number of successfully transferred chunks
 }
 
 var transfersLock sync.Mutex
@@ -425,7 +427,7 @@ var nextID int = 1
 // GET params:
 // file (File to transfer)
 // dest (Destination IA+Host)
-func httpreq(w http.ResponseWriter, r *http.Request) {
+func http_submit(w http.ResponseWriter, r *http.Request) {
 	fmt.Println(r)
 	if !r.URL.Query().Has("file") || !r.URL.Query().Has("dest") {
 		io.WriteString(w, "missing parameter")
@@ -459,6 +461,7 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 	destination := findPathRule(&pathRules, destParsed)
 	pm, _ := initNewPathManager(interfaces, &destination, localAddress, uint64(mtu))
 	transfersLock.Lock()
+	jobid := nextID
 	transfers[nextID] = &HerculesTransfer{
 		id:     nextID,
 		status: Queued,
@@ -471,7 +474,28 @@ func httpreq(w http.ResponseWriter, r *http.Request) {
 	nextID += 1
 	transfersLock.Unlock()
 
-	io.WriteString(w, "OK")
+	io.WriteString(w, fmt.Sprintf("OK %d\n", jobid))
+}
+
+// GET Params:
+// id: An ID obtained by submitting a transfer
+// Returns OK status state err seconds_elapsed chucks_acked
+func http_status(w http.ResponseWriter, r *http.Request) {
+	if !r.URL.Query().Has("id") {
+		io.WriteString(w, "missing parameter")
+		return
+	}
+	id, err := strconv.Atoi(r.URL.Query().Get("id"))
+	if err != nil {
+		return
+	}
+	transfersLock.Lock()
+	info, ok := transfers[id]
+	transfersLock.Unlock()
+	if !ok {
+		return
+	}
+	io.WriteString(w, fmt.Sprintf("OK %d %d %d %d %d\n", info.status, info.state, info.err, info.time_elapsed, info.chunks_acked))
 }
 
 var localAddress *snet.UDPAddr
@@ -617,9 +641,11 @@ func main() {
 	}, src, 0)
 	fmt.Println(err)
 
-	http.HandleFunc("/", httpreq)
+	http.HandleFunc("/submit", http_submit)
+	http.HandleFunc("/status", http_status)
 	go http.ListenAndServe(":8000", nil)
 
+	// TODO remove finished sessions after a while
 	for {
 		buf := make([]byte, C.SOCKMSG_SIZE)
 		fmt.Println("read...", C.SOCKMSG_SIZE)
@@ -690,11 +716,20 @@ func main() {
 				buf = buf[4:]
 				errorcode := binary.LittleEndian.Uint32(buf[:4])
 				buf = buf[4:]
+				seconds := binary.LittleEndian.Uint64(buf[:8])
+				buf = buf[8:]
+				bytes_acked := binary.LittleEndian.Uint64(buf[:8])
+				buf = buf[8:]
 				fmt.Println("updating job", job_id, status, errorcode)
 				transfersLock.Lock()
 				job, _ := transfers[int(job_id)]
 				job.state = status
 				job.err = errorcode
+				if (job.state == C.SESSION_STATE_DONE){
+					job.status = Done
+				}
+				job.chunks_acked = int(bytes_acked) // FIXME
+				job.time_elapsed = int(seconds)
 				fmt.Println(job, job.state)
 				transfersLock.Unlock()
 				b := binary.LittleEndian.AppendUint16(nil, uint16(1))

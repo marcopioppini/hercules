@@ -95,7 +95,7 @@ bool monitor_get_new_job(int sockfd, char *name, u16 *job_id, struct hercules_ap
   return true;
 }
 
-bool monitor_update_job(int sockfd, int job_id, enum session_state state, enum session_error err){
+bool monitor_update_job(int sockfd, int job_id, enum session_state state, enum session_error err, u64 seconds_elapsed, u64 bytes_acked){
   struct sockaddr_un monitor;
   monitor.sun_family = AF_UNIX;
   strcpy(monitor.sun_path, "/var/herculesmon.sock");
@@ -105,6 +105,8 @@ bool monitor_update_job(int sockfd, int job_id, enum session_state state, enum s
   msg.payload.job_update.job_id = job_id;
   msg.payload.job_update.status = state;
   msg.payload.job_update.error = err;
+  msg.payload.job_update.seconds_elapsed = seconds_elapsed;
+  msg.payload.job_update.bytes_acked = bytes_acked;
   sendto(sockfd, &msg, sizeof(msg), 0, &monitor, sizeof(monitor));
 
   struct hercules_sockmsg_A reply;

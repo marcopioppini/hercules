@@ -25,7 +25,8 @@ bool monitor_get_new_job(int sockfd, char *name, u16 *job_id,
 
 // Inform the monitor about a transfer's (new) status.
 bool monitor_update_job(int sockfd, int job_id, enum session_state state,
-						enum session_error err);
+						enum session_error err, u64 seconds_elapsed,
+						u64 bytes_acked);
 
 // Bind the socket for the daemon. The file is deleted if already present.
 // Returns the file descriptor if successful, 0 otherwise.
@@ -35,7 +36,8 @@ int monitor_bind_daemon_socket();
 // entire packets to the monitor to get reply paths, this must be at least as
 // large as HERCULES_MAX_PKT_SIZE.
 #define SOCKMSG_MAX_PAYLOAD 5000
-_Static_assert(SOCKMSG_MAX_PAYLOAD >= HERCULES_MAX_PKTSIZE, "Socket messages too small");
+_Static_assert(SOCKMSG_MAX_PAYLOAD >= HERCULES_MAX_PKTSIZE,
+			   "Socket messages too small");
 // Maximum number of paths transferred
 #define SOCKMSG_MAX_PATHS 10
 
@@ -93,9 +95,11 @@ struct sockmsg_update_job_Q {
 	uint16_t job_id;
 	uint32_t status;  // One of enum session_state
 	uint32_t error;	  // One of enum session_error
+	uint64_t seconds_elapsed;
+	uint64_t bytes_acked;
 };
 struct sockmsg_update_job_A {
-  uint16_t ok;
+	uint16_t ok;
 };
 
 struct hercules_sockmsg_Q {

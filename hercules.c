@@ -2201,7 +2201,7 @@ static void cleanup_finished_sessions(struct hercules_server *server, u64 now) {
 	if (session_tx && session_tx->state == SESSION_STATE_DONE) {
 		if (now > session_tx->last_pkt_rcvd + session_timeout * 2) {
 			monitor_update_job(usock, session_tx->jobid, session_tx->state,
-							   session_tx->error);
+							   session_tx->error, 0, 0); // FIXME 0 0
 			struct hercules_session *current = server->session_tx;
 			atomic_store(&server->session_tx, NULL);
 			fprintf(stderr, "Cleaning up TX session...\n");
