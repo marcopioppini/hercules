@@ -17,13 +17,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
+	"time"
+
 	log "github.com/inconshreveable/log15"
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/pkg/snet/path"
 	"github.com/scionproto/scion/private/topology"
 	"go.uber.org/atomic"
-	"net"
-	"time"
 )
 
 var GlobalQuerier snet.PathQuerier
@@ -52,10 +53,14 @@ type HerculesPathHeader struct {
 }
 
 func initNewPathsToDestinationWithEmptyPath(pm *PathManager, dst *Destination) *PathsToDestination {
+	dst.hostAddr.NextHop = &net.UDPAddr{
+		IP:   dst.hostAddr.Host.IP,
+		Port: topology.EndhostPort,
+	}
 	return &PathsToDestination{
 		pm:         pm,
 		dst:        dst,
-		paths:      nil,
+		paths:      make([]PathMeta, 1),
 		modifyTime: time.Now(),
 	}
 }
@@ -91,6 +96,15 @@ func (ptd *PathsToDestination) choosePaths() bool {
 
 	if ptd.allPaths == nil {
 		return false
+	}
+
+	if ptd.allPaths[0].UnderlayNextHop() == nil {
+		ptd.allPaths[0] = path.Path{
+			Src:           ptd.pm.src.IA,
+			Dst:           ptd.dst.hostAddr.IA,
+			DataplanePath: path.Empty{},
+			NextHop:       ptd.dst.hostAddr.NextHop,
+		}
 	}
 
 	fmt.Println("all paths", ptd.allPaths)

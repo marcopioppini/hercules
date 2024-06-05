@@ -307,6 +307,9 @@ struct hercules_server *hercules_init_server(
 	}
 	server->config.local_addr = local_addr;
 	server->config.configure_queues = configure_queues;
+	server->config.xdp_mode = xdp_mode;
+	/* server->config.xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST; */
+	// FIXME with flags set, setup may fail and we don't catch it?
 	server->enable_pcc =
 		true;	// TODO this should be per-path or at least per-transfer
 
@@ -1390,6 +1393,7 @@ void send_path_handshakes(struct hercules_server *server, struct sender_state *t
 
 static void claim_tx_frames(struct hercules_server *server, struct hercules_interface *iface, u64 *addrs, size_t num_frames)
 {
+	// TODO FIXME Lock contention, significantly affects performance
 	pthread_spin_lock(&iface->umem->lock);
 	size_t reserved = frame_queue__cons_reserve(&iface->umem->available_frames, num_frames);
 	while(reserved != num_frames) {
@@ -1515,7 +1519,7 @@ produce_batch(struct hercules_server *server, struct hercules_session *session, 
 			}
 		}
 
-		unit->rcvr[num_chunks_in_unit] = rcvr_by_chunk[chk];
+		/* unit->rcvr[num_chunks_in_unit] = rcvr_by_chunk[chk]; */
 		unit->paths[num_chunks_in_unit] = path_by_rcvr[rcvr_by_chunk[chk]];
 		unit->chunk_idx[num_chunks_in_unit] = chunks[chk];
 
@@ -1761,7 +1765,7 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 			tx_state->handshake_rtt = now - parsed_pkt->timestamp;
 			// TODO where to get rate limit?
 			// below is ~in Mb/s (but really pps)
-			/* u32 rate = 2000e3; // 20 Gbps */
+			/* u32 rate = 20000e3; // 200 Gbps */
 			u32 rate = 100; // 1 Mbps
 			debug_printf("rate limit %u", rate);
 			for (u32 i = 0; i < pathset->n_paths; i++){
@@ -2316,7 +2320,7 @@ static void tx_update_paths(struct hercules_server *server) {
 					// TODO assert chunk length fits onto path
 					// The new path is different, restart CC
 					// TODO where to get rate
-					u32 rate = 100 * 20000;
+					u32 rate = 100;
 					new_pathset->paths[i].cc_state = init_ccontrol_state(
 						rate, tx_state->total_chunks, new_pathset->n_paths);
 					// Re-send a handshake to update path rtt
@@ -2359,7 +2363,7 @@ struct prints{
 static void print_session_stats(struct hercules_server *server,
 								struct prints *p) {
 	u64 now = get_nsecs();
-	if (now < p->ts + 500e6) {
+	if (now < p->ts + 1e9) {
 		return;
 	}
 	u64 tdiff = now - p->ts;
@@ -2436,10 +2440,10 @@ static void events_p(void *arg) {
 #ifdef PRINT_STATS
 		print_session_stats(server, &prints);
 #endif
-		if (now > lastpoll + 10e9){
-			tx_update_paths(server);
-			lastpoll = now;
-		}
+		/* if (now > lastpoll + 10e9){ */
+		/* 	tx_update_paths(server); */
+		/* 	lastpoll = now; */
+		/* } */
 		if (now > lastpoll + 2e9){
 			tx_update_monitor(server, now);
 			lastpoll = now;

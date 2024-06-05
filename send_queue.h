@@ -19,14 +19,13 @@
 #include "utils.h"
 
 #define CACHELINE_SIZE 64
-#define SEND_QUEUE_ENTRY_SIZE 6
+#define SEND_QUEUE_ENTRY_SIZE 5
 #define SEND_QUEUE_ENTRIES_PER_UNIT 7
 
 // With this layout, 10 chunks fit into each cache line. Assumes a cache line size of 64 bytes.
 //  sizeof(struct send_queue_unit) = 64
 struct send_queue_unit {
 	u32 chunk_idx[SEND_QUEUE_ENTRIES_PER_UNIT];
-	u8 rcvr[SEND_QUEUE_ENTRIES_PER_UNIT];
 	u8 paths[SEND_QUEUE_ENTRIES_PER_UNIT];
 	char a[CACHELINE_SIZE - SEND_QUEUE_ENTRIES_PER_UNIT * SEND_QUEUE_ENTRY_SIZE]; // force padding to 64 bytes
 };

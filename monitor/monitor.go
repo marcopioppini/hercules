@@ -21,6 +21,7 @@ import (
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/snet"
+	"github.com/scionproto/scion/pkg/snet/path"
 	"github.com/scionproto/scion/private/topology"
 	"github.com/vishvananda/netlink"
 )
@@ -155,6 +156,10 @@ func getReplyPathHeader(buf []byte, etherLen int) (*HerculesPathHeader, net.IP, 
 	udpPkt, ok := sourcePkt.Payload.(snet.UDPPayload)
 	if !ok {
 		return nil, nil, errors.New("error decoding SCION/UDP")
+	}
+
+	if (sourcePkt.Source.IA == sourcePkt.Destination.IA){
+		sourcePkt.Path = path.Empty{}
 	}
 
 	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcIP, dstIP, uint16(udpDstPort), etherLen)
