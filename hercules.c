@@ -1786,6 +1786,7 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 				pathset->paths[p].next_handshake_at = now;
 			}
 		}
+		tx_state->start_time = get_nsecs();
 		session_tx->state = SESSION_STATE_WAIT_CTS;
 		return;
 	}
@@ -2315,7 +2316,7 @@ static void tx_update_paths(struct hercules_server *server) {
 					// TODO assert chunk length fits onto path
 					// The new path is different, restart CC
 					// TODO where to get rate
-					u32 rate = 100;
+					u32 rate = 100 * 20000;
 					new_pathset->paths[i].cc_state = init_ccontrol_state(
 						rate, tx_state->total_chunks, new_pathset->n_paths);
 					// Re-send a handshake to update path rtt
@@ -2395,6 +2396,17 @@ static void print_session_stats(struct hercules_server *server,
 	}
 }
 
+static void tx_update_monitor(struct hercules_server *server, u64 now) {
+	struct hercules_session *session_tx = server->session_tx;
+	if (session_tx != NULL && session_tx->state == SESSION_STATE_RUNNING) {
+		monitor_update_job(usock, session_tx->jobid, session_tx->state, 0,
+						   ( now - session_tx->tx_state->start_time ) / (int)1e9,
+						   session_tx->tx_state->chunklen *
+							   session_tx->tx_state->acked_chunks.num_set);
+		debug_printf("elapsed %llu", (now - session_tx->tx_state->start_time)/(u64)1e9);
+	}
+}
+
 #define PRINT_STATS
 
 // Read control packets from the control socket and process them; also handles
@@ -2426,6 +2438,10 @@ static void events_p(void *arg) {
 #endif
 		if (now > lastpoll + 10e9){
 			tx_update_paths(server);
+			lastpoll = now;
+		}
+		if (now > lastpoll + 2e9){
+			tx_update_monitor(server, now);
 			lastpoll = now;
 		}
 		/* 	lastpoll = now; */
