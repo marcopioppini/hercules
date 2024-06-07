@@ -27,7 +27,7 @@ type PathPickDescriptor struct {
 
 type PathPicker struct {
 	pathSpec        *[]PathSpec
-	availablePaths  []snet.Path
+	availablePaths  []PathWithInterface
 	currentPathPick []PathPickDescriptor
 }
 
@@ -38,18 +38,14 @@ func min(a, b int) int {
 	return b
 }
 
-func makePathPicker(spec *[]PathSpec, pathSet *AppPathSet, numPaths int) *PathPicker {
+func makePathPicker(spec *[]PathSpec, pathSet []PathWithInterface, numPaths int) *PathPicker {
 	if len(*spec) == 0 {
 		defaultSpec := make([]PathSpec, numPaths)
 		spec = &defaultSpec
 	}
-	paths := make([]snet.Path, 0, len(*pathSet))
-	for _, path := range *pathSet {
-		paths = append(paths, path.path)
-	}
 	picker := &PathPicker{
 		pathSpec:       spec,
-		availablePaths: paths,
+		availablePaths: pathSet,
 	}
 	picker.reset(numPaths)
 	return picker
@@ -155,7 +151,7 @@ func (picker *PathPicker) nextPickIterate(idx int) bool {
 
 func (picker *PathPicker) matches(pathIdx, ruleIdx int) bool {
 	pathSpec := (*picker.pathSpec)[ruleIdx]
-	pathInterfaces := picker.availablePaths[pathIdx].Metadata().Interfaces
+	pathInterfaces := picker.availablePaths[pathIdx].path.Metadata().Interfaces
 	idx := 0
 	for _, iface := range pathSpec {
 		for len(pathInterfaces) > idx && !iface.match(pathInterfaces[idx]) {
@@ -184,7 +180,7 @@ func (picker *PathPicker) disjointnessScore() int {
 	interfaces := map[snet.PathInterface]int{}
 	score := 0
 	for _, pick := range picker.currentPathPick {
-		for _, path := range picker.availablePaths[pick.pathIndex].Metadata().Interfaces {
+		for _, path := range picker.availablePaths[pick.pathIndex].path.Metadata().Interfaces {
 			score -= interfaces[path]
 			interfaces[path]++
 		}
@@ -192,8 +188,8 @@ func (picker *PathPicker) disjointnessScore() int {
 	return score
 }
 
-func (picker *PathPicker) getPaths() []snet.Path {
-	paths := make([]snet.Path, 0, len(picker.currentPathPick))
+func (picker *PathPicker) getPaths() []PathWithInterface {
+	paths := make([]PathWithInterface, 0, len(picker.currentPathPick))
 	for _, pick := range picker.currentPathPick {
 		paths = append(paths, picker.availablePaths[pick.pathIndex])
 	}

@@ -16,10 +16,10 @@ package main
 
 import (
 	"fmt"
+	"net"
+
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/vishvananda/netlink"
-	"net"
-	"time"
 )
 
 type Destination struct {
@@ -29,12 +29,10 @@ type Destination struct {
 }
 
 type PathManager struct {
-	numPathSlotsPerDst int
-	interfaces         map[int]*net.Interface
-	dst                *PathsToDestination
-	src                *snet.UDPAddr
-	syncTime           time.Time
-	maxBps             uint64
+	interfaces map[int]*net.Interface
+	dst        *PathsToDestination
+	src        *snet.UDPAddr
+	mtu        int
 }
 
 type PathWithInterface struct {
@@ -44,9 +42,7 @@ type PathWithInterface struct {
 
 type AppPathSet map[snet.PathFingerprint]PathWithInterface
 
-const numPathsResolved = 20
-
-func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet.UDPAddr, maxBps uint64) (*PathManager, error) {
+func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet.UDPAddr) (*PathManager, error) {
 	ifMap := make(map[int]*net.Interface)
 	for _, iface := range interfaces {
 		ifMap[iface.Index] = iface
@@ -56,8 +52,7 @@ func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet
 		interfaces: ifMap,
 		src:        src,
 		dst:        &PathsToDestination{},
-		syncTime:   time.Unix(0, 0),
-		maxBps:     maxBps,
+		mtu:        0, // Will be set later, after the first path lookup
 	}
 
 	if src.IA == dst.hostAddr.IA {
@@ -81,13 +76,23 @@ func (pm *PathManager) choosePaths() bool {
 	return pm.dst.choosePaths()
 }
 
-func (pm *PathManager) filterPathsByActiveInterfaces(pathsAvail []snet.Path) AppPathSet {
-	pathsFiltered := make(AppPathSet)
+func (pm *PathManager) filterPathsByActiveInterfaces(pathsAvail []snet.Path) []PathWithInterface {
+	pathsFiltered := []PathWithInterface{}
 	for _, path := range pathsAvail {
 		iface, err := pm.interfaceForRoute(path.UnderlayNextHop().IP)
 		if err != nil {
 		} else {
-			pathsFiltered[snet.Fingerprint(path)] = PathWithInterface{path, iface}
+			pathsFiltered = append(pathsFiltered, PathWithInterface{path, iface})
+		}
+	}
+	return pathsFiltered
+}
+
+func (pm *PathManager) filterPathsByMTU(pathsAvail []PathWithInterface) []PathWithInterface {
+	pathsFiltered := []PathWithInterface{}
+	for _, path := range pathsAvail {
+		if path.path.Metadata().MTU >= uint16(pm.mtu){
+			pathsFiltered = append(pathsFiltered, path)
 		}
 	}
 	return pathsFiltered

@@ -18,13 +18,11 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"time"
 
 	log "github.com/inconshreveable/log15"
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/pkg/snet/path"
 	"github.com/scionproto/scion/private/topology"
-	"go.uber.org/atomic"
 )
 
 var GlobalQuerier snet.PathQuerier
@@ -32,8 +30,6 @@ var GlobalQuerier snet.PathQuerier
 type PathsToDestination struct {
 	pm             *PathManager
 	dst            *Destination
-	modifyTime     time.Time
-	ExtnUpdated    atomic.Bool
 	allPaths       []snet.Path
 	paths          []PathMeta // nil indicates that the destination is in the same AS as the sender and we can use an empty path
 	canSendLocally bool // (only if destination in same AS) indicates if we can send packets
@@ -61,7 +57,6 @@ func initNewPathsToDestinationWithEmptyPath(pm *PathManager, dst *Destination) *
 		pm:         pm,
 		dst:        dst,
 		paths:      make([]PathMeta, 1),
-		modifyTime: time.Now(),
 	}
 }
 
@@ -71,7 +66,6 @@ func initNewPathsToDestination(pm *PathManager, src *snet.UDPAddr, dst *Destinat
 		dst:        dst,
 		allPaths:   nil,
 		paths:      make([]PathMeta, dst.numPaths),
-		modifyTime: time.Unix(0, 0),
 	}, nil
 }
 
@@ -107,57 +101,44 @@ func (ptd *PathsToDestination) choosePaths() bool {
 		}
 	}
 
-	fmt.Println("all paths", ptd.allPaths)
 	availablePaths := ptd.pm.filterPathsByActiveInterfaces(ptd.allPaths)
 	if len(availablePaths) == 0 {
 		log.Error(fmt.Sprintf("no paths to destination %s", ptd.dst.hostAddr.IA.String()))
 	}
 
-	// TODO Ensure this still does the right thing when the number of paths decreases (how to test?)
-	ptd.chooseNewPaths(&availablePaths)
+	if ptd.pm.mtu != 0 {
+		// MTU fixed by a previous path lookup, we need to pick paths compatible with it
+		availablePaths = ptd.pm.filterPathsByMTU(availablePaths)
+	}
 
-	fmt.Println("chosen paths", ptd.paths)
+	// TODO Ensure this still does the right thing when the number of paths decreases (how to test?)
+	ptd.chooseNewPaths(availablePaths)
+
+	if ptd.pm.mtu == 0{
+		// No MTU set yet, we set it to the maximum that all selected paths and interfaces support
+		minMTU := HerculesMaxPktsize
+		for _, path := range ptd.paths {
+			if path.path.Metadata().MTU < uint16(minMTU){
+				minMTU = int(path.path.Metadata().MTU)
+			}
+			if path.iface.MTU < minMTU {
+				minMTU = path.iface.MTU
+			}
+		}
+		ptd.pm.mtu = minMTU
+		ptd.pm.mtu = 1200 // FIXME temp
+	}
+
 	return true
 }
 
-func (ptd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool, availablePaths *AppPathSet) bool {
-	updated := false
-	for newFingerprint := range *availablePaths {
-		for i := range ptd.paths {
-			pathMeta := &ptd.paths[i]
-			if newFingerprint == pathMeta.fingerprint {
-				if !pathMeta.enabled {
-					log.Info(fmt.Sprintf("[Destination %s] re-enabling path %d\n", ptd.dst.hostAddr.IA, i))
-					pathMeta.enabled = true
-					updated = true
-				}
-				(*previousPathAvailable)[i] = true
-				break
-			}
-		}
-	}
-	return updated
-}
-
-func (ptd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]bool) bool {
-	updated := false
-	for i, inUse := range *previousPathAvailable {
-		pathMeta := &ptd.paths[i]
-		if inUse == false && pathMeta.enabled {
-			log.Info(fmt.Sprintf("[Destination %s] disabling path %d\n", ptd.dst.hostAddr.IA, i))
-			pathMeta.enabled = false
-			updated = true
-		}
-	}
-	return updated
-}
-
-func (ptd *PathsToDestination) chooseNewPaths(availablePaths *AppPathSet) bool {
+func (ptd *PathsToDestination) chooseNewPaths(availablePaths []PathWithInterface) bool {
 	updated := false
 
 	// pick paths
 	picker := makePathPicker(ptd.dst.pathSpec, availablePaths, ptd.dst.numPaths)
-	var pathSet []snet.Path
+	fmt.Println(availablePaths)
+	var pathSet []PathWithInterface
 	disjointness := 0 // negative number denoting how many network interfaces are shared among paths (to be maximized)
 	maxRuleIdx := 0   // the highest index of a PathSpec that is used (to be minimized)
 	for i := ptd.dst.numPaths; i > 0; i-- {
@@ -186,47 +167,12 @@ func (ptd *PathsToDestination) chooseNewPaths(availablePaths *AppPathSet) bool {
 		return false
 	}
 	for i, path := range pathSet {
-		log.Info(fmt.Sprintf("\t%s", path))
-		fingerprint := snet.Fingerprint(path)
-		ptd.paths[i].path = path
-		ptd.paths[i].fingerprint = fingerprint
+		log.Info(fmt.Sprintf("\t%s", path.path))
+		ptd.paths[i].path = path.path
 		ptd.paths[i].enabled = true
 		ptd.paths[i].updated = true
-		ptd.paths[i].iface = (*availablePaths)[fingerprint].iface
+		ptd.paths[i].iface = path.iface
 		updated = true
 	}
 	return updated
-}
-
-func (ptd *PathsToDestination) preparePath(p *PathMeta) (*HerculesPathHeader, error) {
-	var err error
-	var iface *net.Interface
-	curDst := ptd.dst.hostAddr
-	fmt.Println("preparepath", curDst, iface)
-	if (*p).path == nil {
-		// in order to use a static empty path, we need to set the next hop on dst
-		fmt.Println("empty path")
-		curDst.NextHop = &net.UDPAddr{
-			IP:   ptd.dst.hostAddr.Host.IP,
-			Port: topology.EndhostPort,
-		}
-		fmt.Println("nexthop", curDst.NextHop)
-		iface, err = ptd.pm.interfaceForRoute(ptd.dst.hostAddr.Host.IP)
-		if err != nil {
-			return nil, err
-		}
-		curDst.Path = path.Empty{}
-	} else {
-		curDst.Path = (*p).path.Dataplane()
-
-		curDst.NextHop = (*p).path.UnderlayNextHop()
-		iface = p.iface
-	}
-
-	// path, err := prepareSCIONPacketHeader(ptd.pm.src, curDst, iface)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// return path, nil
-	return nil, fmt.Errorf("NOPE")
 }

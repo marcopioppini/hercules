@@ -10,7 +10,6 @@ require (
 	github.com/inconshreveable/log15 v2.16.0+incompatible
 	github.com/scionproto/scion v0.10.0
 	github.com/vishvananda/netlink v1.2.1-beta.2
-	go.uber.org/atomic v1.9.0
 )
 
 require (
@@ -40,6 +39,7 @@ require (
 	github.com/uber/jaeger-client-go v2.30.0+incompatible // indirect
 	github.com/uber/jaeger-lib v2.0.0+incompatible // indirect
 	github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae // indirect
+	go.uber.org/atomic v1.9.0 // indirect
 	go.uber.org/multierr v1.8.0 // indirect
 	go.uber.org/zap v1.24.0 // indirect
 	golang.org/x/crypto v0.12.0 // indirect

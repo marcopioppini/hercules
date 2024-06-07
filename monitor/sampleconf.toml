@@ -1,0 +1,33 @@
+# Sample config for Hercules monitor
+
+# By default, up to `DefaultNumPaths` paths will be used.
+DefaultNumPaths = 1
+
+# The number and choice of paths can be overridden on a destination-host
+# or destination-AS basis. In case both an AS and Host rule match, the Host
+# rule takes precedence.
+
+# This Host rule specifies that, for the host 17-ffaa:1:fe2,1.1.1.1,
+# - Transfers may use up to 42 paths
+# - The paths must contain either the AS-interface sequence
+#       17-f:f:f 1 > 17:f:f:a 2
+#       OR 1-f:0:0 22
+[[DestinationHosts]]
+HostAddr = "17-ffa:1:fe2,1.1.1.1"
+NumPaths = 42
+PathSpec = [
+["17-f:f:f 1", "17-f:f:a 2"],
+["1-f:0:0 22"],
+]
+
+# In this case the number of paths is set to 2, but the exact set of paths
+# is left unspecified
+[[DestinationHosts]]
+HostAddr = "18-a:b:c,2.2.2.2"
+NumPaths = 2
+
+
+# Similarly, but for an entire destination AS instead of a specific host
+[[DestinationASes]]
+IA = "17-a:b:c"
+NumPaths = 2

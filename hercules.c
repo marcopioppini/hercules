@@ -88,7 +88,7 @@ static bool rbudp_check_initial(struct hercules_control_packet *pkt, size_t len,
 
 static struct hercules_session *make_session(struct hercules_server *server);
 
-/// OK COMMON
+/// COMMON
 
 // Check the SCION UDP address matches the session's peer
 static inline bool src_matches_address(struct hercules_session *session,
@@ -158,7 +158,6 @@ static void send_eth_frame(struct hercules_server *server,
 	}
 }
 
-/* #define DEBUG_PRINT_PKTS */
 #ifdef DEBUG_PRINT_PKTS
 // recv indicates whether printed packets should be prefixed with TX or RX
 void debug_print_rbudp_pkt(const char *pkt, bool recv) {
@@ -333,7 +332,7 @@ struct hercules_server *hercules_init_server(
 	return server;
 }
 
-/// OK PACKET PARSING
+/// PACKET PARSING
 // XXX: from lib/scion/udp.c
 /*
  * Calculate UDP checksum
@@ -709,7 +708,7 @@ static bool rbudp_check_initial(struct hercules_control_packet *pkt, size_t len,
 	return true;
 }
 
-/// OK RECEIVER
+/// RECEIVER
 
 static bool rx_received_all(const struct receiver_state *rx_state)
 {
@@ -1190,7 +1189,7 @@ static void rx_send_nacks(struct hercules_server *server, struct receiver_state 
 	}
 }
 
-/// OK SENDER
+/// SENDER
 static bool tx_acked_all(const struct sender_state *tx_state) {
 	if (tx_state->acked_chunks.num_set != tx_state->total_chunks) {
 		return false;
@@ -1676,8 +1675,6 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 	return num_chunks_prepared;
 }
 
-
-
 // Initialise new sender state. Returns null in case of error.
 static struct sender_state *init_tx_state(struct hercules_session *session,
 										  size_t filesize, int chunklen,
@@ -1846,7 +1843,8 @@ static char *tx_mmap(char *fname, size_t *filesize) {
 	*filesize = fsize;
 	return mem;
 }
-/// OK PCC
+
+/// PCC
 #define NACK_TRACE_SIZE (1024*1024)
 static u32 nack_trace_count = 0;
 static struct {
@@ -1905,7 +1903,6 @@ static void pcc_trace_push(u64 time, sequence_number range_start, sequence_numbe
 	pcc_trace[idx].target_duration = target_duration;
 	pcc_trace[idx].actual_duration = actual_duration;
 }
-
 
 static bool pcc_mi_elapsed(struct ccontrol_state *cc_state)
 {
@@ -2000,7 +1997,8 @@ static inline bool pcc_has_active_mi(struct ccontrol_state *cc_state, u64 now)
 	       cc_state->state != pcc_uninitialized &&
 	       cc_state->mi_start + (u64)((cc_state->pcc_mi_duration) * 1e9) >= now;
 }
-/// workers
+
+/// WORKER THREADS
 struct tx_send_p_args {
 	struct hercules_server *server;
 	struct xsk_socket_info *xsks[];
@@ -2130,6 +2128,127 @@ static void rx_p(void *arg) {
 		}
 	}
 }
+
+/**
+ * Transmit and retransmit chunks that have not been ACKed.
+ * For each retransmit chunk, wait (at least) one round trip time for the ACK to arrive.
+ * For large files transfers, this naturally allows to start retransmitting chunks at the beginning
+ * of the file, while chunks of the previous round at the end of the file are still in flight.
+ *
+ * Transmission through different paths is batched (i.e. use the same path within a batch) to prevent the receiver from
+ * ACKing individual chunks.
+ *
+ * The estimates for the ACK-arrival time dont need to be accurate for correctness, i.e. regardless
+ * of how bad our estimate is, all chunks will be (re-)transmitted eventually.
+ *	 - if we *under-estimate* the RTT, we may retransmit chunks unnecessarily
+ *	   - waste bandwidth, waste sender disk reads & CPU time, waste receiver CPU time
+ *	   - potentially increase overall transmit time because necessary retransmit may be delayed by
+ *	     wasted resources
+ *	 - if we *over-estimate* the RTT, we wait unnecessarily
+ *		 This is only constant overhead per retransmit round, independent of number of packets or send
+ *		 rate.
+ * Thus it seems preferrable to *over-estimate* the ACK-arrival time.
+ *
+ * To avoid recording transmit time per chunk, only record start and end time of a transmit round
+ * and linearly interpolate for each receiver separately.
+ * This assumes a uniform send rate and that chunks that need to be retransmitted (i.e. losses)
+ * occur uniformly.
+ */
+static void *tx_p(void *arg) {
+  struct hercules_server *server = arg;
+  while (1) {
+    /* pthread_spin_lock(&server->biglock); */
+    pop_completion_rings(server);
+    u32 chunks[BATCH_SIZE];
+    u8 chunk_rcvr[BATCH_SIZE];
+    struct hercules_session *session_tx = atomic_load(&server->session_tx);
+    if (session_tx != NULL &&
+        atomic_load(&session_tx->state) == SESSION_STATE_RUNNING) {
+      struct sender_state *tx_state = session_tx->tx_state;
+      /* debug_printf("Start transmit round"); */
+      tx_state->prev_rate_check = get_nsecs();
+
+      pop_completion_rings(server);
+      send_path_handshakes(server, tx_state);
+      u64 next_ack_due = 0;
+
+      // in each iteration, we send packets on a single path to each receiver
+      // collect the rate limits for each active path
+      u32 allowed_chunks = compute_max_chunks_current_path(tx_state);
+
+      if (allowed_chunks ==
+          0) { // we hit the rate limits on every path; switch paths
+        iterate_paths(tx_state);
+        continue;
+      }
+
+      // TODO re-enable?
+      // sending rates might add up to more than BATCH_SIZE, shrink
+      // proportionally, if needed
+      /* shrink_sending_rates(tx_state, max_chunks_per_rcvr, total_chunks); */
+
+      const u64 now = get_nsecs();
+      u32 num_chunks = 0;
+      if (!tx_state->finished) {
+        u64 ack_due = 0;
+        // for each receiver, we prepare up to max_chunks_per_rcvr[r] chunks to
+        // send
+        u32 cur_num_chunks = prepare_rcvr_chunks(
+            tx_state, 0, &chunks[num_chunks], &chunk_rcvr[num_chunks], now,
+            &ack_due, allowed_chunks);
+        num_chunks += cur_num_chunks;
+        if (tx_state->finished) {
+            terminate_cc(tx_state);
+            kick_cc(tx_state);
+        } else {
+          // only wait for the nearest ack
+          if (next_ack_due) {
+            if (next_ack_due > ack_due) {
+              next_ack_due = ack_due;
+            }
+          } else {
+            next_ack_due = ack_due;
+          }
+        }
+      }
+
+      if (num_chunks > 0) {
+        u8 rcvr_path[1];
+        prepare_rcvr_paths(tx_state, rcvr_path);
+        produce_batch(server, session_tx, rcvr_path, chunks, chunk_rcvr,
+                      num_chunks);
+        tx_state->tx_npkts_queued += num_chunks;
+        rate_limit_tx(tx_state);
+
+        // update book-keeping
+        struct path_set *pathset = tx_state->pathset;
+        u32 path_idx = pathset->path_index;
+          struct ccontrol_state *cc_state = pathset->paths[path_idx].cc_state;
+		  if (cc_state != NULL) {
+			  // FIXME allowed_chunks below is not correct (3x)
+			  atomic_fetch_add(&cc_state->mi_tx_npkts, allowed_chunks);
+			  atomic_fetch_add(&cc_state->total_tx_npkts, allowed_chunks);
+			  if (pcc_has_active_mi(cc_state, now)) {
+				  atomic_fetch_add(&cc_state->mi_tx_npkts_monitored,
+								   allowed_chunks);
+			  }
+		  }
+	  }
+
+	  iterate_paths(tx_state);
+
+      if (now < next_ack_due) {
+        // XXX if the session vanishes in the meantime, we might wait
+        // unnecessarily
+        sleep_until(next_ack_due);
+      }
+    }
+  }
+
+  return NULL;
+}
+
+/// Event handler tasks
 
 // Check if the monitor has new transfer jobs available and, if so, start one
 static void new_tx_if_available(struct hercules_server *server) {
@@ -2640,125 +2759,6 @@ static void events_p(void *arg) {
 	}
 }
 
-/**
- * Transmit and retransmit chunks that have not been ACKed.
- * For each retransmit chunk, wait (at least) one round trip time for the ACK to arrive.
- * For large files transfers, this naturally allows to start retransmitting chunks at the beginning
- * of the file, while chunks of the previous round at the end of the file are still in flight.
- *
- * Transmission through different paths is batched (i.e. use the same path within a batch) to prevent the receiver from
- * ACKing individual chunks.
- *
- * The estimates for the ACK-arrival time dont need to be accurate for correctness, i.e. regardless
- * of how bad our estimate is, all chunks will be (re-)transmitted eventually.
- *	 - if we *under-estimate* the RTT, we may retransmit chunks unnecessarily
- *	   - waste bandwidth, waste sender disk reads & CPU time, waste receiver CPU time
- *	   - potentially increase overall transmit time because necessary retransmit may be delayed by
- *	     wasted resources
- *	 - if we *over-estimate* the RTT, we wait unnecessarily
- *		 This is only constant overhead per retransmit round, independent of number of packets or send
- *		 rate.
- * Thus it seems preferrable to *over-estimate* the ACK-arrival time.
- *
- * To avoid recording transmit time per chunk, only record start and end time of a transmit round
- * and linearly interpolate for each receiver separately.
- * This assumes a uniform send rate and that chunks that need to be retransmitted (i.e. losses)
- * occur uniformly.
- */
-static void *tx_p(void *arg) {
-  struct hercules_server *server = arg;
-  while (1) {
-    /* pthread_spin_lock(&server->biglock); */
-    pop_completion_rings(server);
-    u32 chunks[BATCH_SIZE];
-    u8 chunk_rcvr[BATCH_SIZE];
-    struct hercules_session *session_tx = atomic_load(&server->session_tx);
-    if (session_tx != NULL &&
-        atomic_load(&session_tx->state) == SESSION_STATE_RUNNING) {
-      struct sender_state *tx_state = session_tx->tx_state;
-      /* debug_printf("Start transmit round"); */
-      tx_state->prev_rate_check = get_nsecs();
-
-      pop_completion_rings(server);
-      send_path_handshakes(server, tx_state);
-      u64 next_ack_due = 0;
-
-      // in each iteration, we send packets on a single path to each receiver
-      // collect the rate limits for each active path
-      u32 allowed_chunks = compute_max_chunks_current_path(tx_state);
-
-      if (allowed_chunks ==
-          0) { // we hit the rate limits on every path; switch paths
-        iterate_paths(tx_state);
-        continue;
-      }
-
-      // TODO re-enable?
-      // sending rates might add up to more than BATCH_SIZE, shrink
-      // proportionally, if needed
-      /* shrink_sending_rates(tx_state, max_chunks_per_rcvr, total_chunks); */
-
-      const u64 now = get_nsecs();
-      u32 num_chunks = 0;
-      if (!tx_state->finished) {
-        u64 ack_due = 0;
-        // for each receiver, we prepare up to max_chunks_per_rcvr[r] chunks to
-        // send
-        u32 cur_num_chunks = prepare_rcvr_chunks(
-            tx_state, 0, &chunks[num_chunks], &chunk_rcvr[num_chunks], now,
-            &ack_due, allowed_chunks);
-        num_chunks += cur_num_chunks;
-        if (tx_state->finished) {
-            terminate_cc(tx_state);
-            kick_cc(tx_state);
-        } else {
-          // only wait for the nearest ack
-          if (next_ack_due) {
-            if (next_ack_due > ack_due) {
-              next_ack_due = ack_due;
-            }
-          } else {
-            next_ack_due = ack_due;
-          }
-        }
-      }
-
-      if (num_chunks > 0) {
-        u8 rcvr_path[1];
-        prepare_rcvr_paths(tx_state, rcvr_path);
-        produce_batch(server, session_tx, rcvr_path, chunks, chunk_rcvr,
-                      num_chunks);
-        tx_state->tx_npkts_queued += num_chunks;
-        rate_limit_tx(tx_state);
-
-        // update book-keeping
-        struct path_set *pathset = tx_state->pathset;
-        u32 path_idx = pathset->path_index;
-          struct ccontrol_state *cc_state = pathset->paths[path_idx].cc_state;
-		  if (cc_state != NULL) {
-			  // FIXME allowed_chunks below is not correct (3x)
-			  atomic_fetch_add(&cc_state->mi_tx_npkts, allowed_chunks);
-			  atomic_fetch_add(&cc_state->total_tx_npkts, allowed_chunks);
-			  if (pcc_has_active_mi(cc_state, now)) {
-				  atomic_fetch_add(&cc_state->mi_tx_npkts_monitored,
-								   allowed_chunks);
-			  }
-		  }
-	  }
-
-	  iterate_paths(tx_state);
-
-      if (now < next_ack_due) {
-        // XXX if the session vanishes in the meantime, we might wait
-        // unnecessarily
-        sleep_until(next_ack_due);
-      }
-    }
-  }
-
-  return NULL;
-}
-
 static pthread_t start_thread(struct hercules_server *server, void *(start_routine), void *arg)
 {
 	pthread_t pt;
@@ -2903,7 +2903,7 @@ void usage(){
 	exit(1);
 }
 
-// TODO what's up with multiple interfaces?
+// TODO Test multiple interfaces
 #define HERCULES_MAX_INTERFACES 1
 int main(int argc, char *argv[]) {
   // Options:
