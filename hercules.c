@@ -60,7 +60,6 @@
 
 #define L4_SCMP 202
 
-
 #define RANDOMIZE_FLOWID
 
 #define RATE_LIMIT_CHECK 1000 // check rate limit every X packets
@@ -74,10 +73,6 @@ static const u64 session_timeout = 10e9; // 10 sec
 static const u64 session_hs_retransmit_interval = 2e9; // 2 sec
 static const u64 session_stale_timeout = 30e9; // 30 sec
 #define PCC_NO_PATH UINT8_MAX // tell the receiver not to count the packet on any path
-
-// TODO move and see if we can't use this from only 1 thread so no locks
-int usock;
-pthread_spinlock_t usock_lock;
 
 // Fill packet with n bytes from data and pad with zeros to payloadlen.
 static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx,
@@ -295,6 +290,12 @@ struct hercules_server *hercules_init_server(
 	if (server == NULL) {
 		exit_with_error(NULL, ENOMEM);
 	}
+
+  server->usock = monitor_bind_daemon_socket();
+  if (server->usock == 0) {
+    fprintf(stderr, "Error binding daemon socket\n");
+	exit_with_error(NULL, EINVAL);
+  }
 	server->ifindices = ifindices;
 	server->num_ifaces = num_ifaces;
 	server->config.queue = queue;
@@ -323,8 +324,6 @@ struct hercules_server *hercules_init_server(
 		debug_printf("using queue %d on interface %s", server->ifaces[i].queue,
 					 server->ifaces[i].ifname);
 	}
-
-	pthread_spin_init(&usock_lock, PTHREAD_PROCESS_PRIVATE);
 
 	server->control_sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
 	if (server->control_sockfd == -1) {
@@ -980,8 +979,8 @@ static struct receiver_state *make_rx_state(struct hercules_session *session,
 // The packet is sent to the monior, which will return a new header with the
 // path reversed.
 static bool rx_update_reply_path(
-	struct receiver_state *rx_state, int ifid, int rx_sample_len,
-	const char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE]) {
+	struct hercules_server *server, struct receiver_state *rx_state, int ifid,
+	int rx_sample_len, const char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE]) {
 	debug_printf("Updating reply path");
 	if (!rx_state) {
 		debug_printf("ERROR: invalid rx_state");
@@ -990,11 +989,10 @@ static bool rx_update_reply_path(
 	assert(rx_sample_len > 0);
 	assert(rx_sample_len <= XSK_UMEM__DEFAULT_FRAME_SIZE);
 
-	pthread_spin_lock(&usock_lock);
 	// TODO writing to reply path needs sync?
-	int ret = monitor_get_reply_path(usock, rx_sample_buf, rx_sample_len,
-									 rx_state->etherlen, &rx_state->reply_path);
-	pthread_spin_unlock(&usock_lock);
+	int ret =
+		monitor_get_reply_path(server->usock, rx_sample_buf, rx_sample_len,
+							   rx_state->etherlen, &rx_state->reply_path);
 	if (!ret) {
 		return false;
 	}
@@ -1051,7 +1049,7 @@ static void rx_handle_initial(struct hercules_server *server,
 	debug_printf("handling initial");
 	const int headerlen = (int)(payload - buf);
 	if (initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
-		rx_update_reply_path(rx_state, ifid, headerlen + payloadlen, buf);
+		rx_update_reply_path(server, rx_state, ifid, headerlen + payloadlen, buf);
 	}
 	rx_send_rtt_ack(server, rx_state,
 					initial);  // echo back initial pkt to ACK filesize
@@ -2142,9 +2140,7 @@ static void new_tx_if_available(struct hercules_server *server) {
 	u16 mtu;
 	struct hercules_app_addr dest;
 
-	pthread_spin_lock(&usock_lock);
-	int ret = monitor_get_new_job(usock, fname, &jobid, &dest, &mtu);
-	pthread_spin_unlock(&usock_lock);
+	int ret = monitor_get_new_job(server->usock, fname, &jobid, &dest, &mtu);
 	if (!ret) {
 		return;
 	}
@@ -2181,7 +2177,7 @@ static void new_tx_if_available(struct hercules_server *server) {
 
 	int n_paths;
 	struct hercules_path *paths;
-	ret = monitor_get_paths(usock, jobid, &n_paths, &paths);
+	ret = monitor_get_paths(server->usock, jobid, &n_paths, &paths);
 	if (!ret || n_paths == 0){
 		debug_printf("error getting paths");
 		munmap(mem, filesize);
@@ -2216,7 +2212,7 @@ static void cleanup_finished_sessions(struct hercules_server *server, u64 now) {
 	struct hercules_session *session_tx = atomic_load(&server->session_tx);
 	if (session_tx && session_tx->state == SESSION_STATE_DONE) {
 		if (now > session_tx->last_pkt_rcvd + session_timeout * 2) {
-			monitor_update_job(usock, session_tx->jobid, session_tx->state,
+			monitor_update_job(server->usock, session_tx->jobid, session_tx->state,
 							   session_tx->error, 0, 0); // FIXME 0 0
 			struct hercules_session *current = server->session_tx;
 			atomic_store(&server->session_tx, NULL);
@@ -2275,7 +2271,7 @@ static void tx_update_paths(struct hercules_server *server) {
 		int n_paths;
 		struct hercules_path *paths;
 		bool ret =
-			monitor_get_paths(usock, session_tx->jobid, &n_paths, &paths);
+			monitor_get_paths(server->usock, session_tx->jobid, &n_paths, &paths);
 		if (!ret) {
 			debug_printf("error getting paths");
 			return;
@@ -2403,7 +2399,7 @@ static void print_session_stats(struct hercules_server *server,
 static void tx_update_monitor(struct hercules_server *server, u64 now) {
 	struct hercules_session *session_tx = server->session_tx;
 	if (session_tx != NULL && session_tx->state == SESSION_STATE_RUNNING) {
-		monitor_update_job(usock, session_tx->jobid, session_tx->state, 0,
+		monitor_update_job(server->usock, session_tx->jobid, session_tx->state, 0,
 						   ( now - session_tx->tx_state->start_time ) / (int)1e9,
 						   session_tx->tx_state->chunklen *
 							   session_tx->tx_state->acked_chunks.num_set);
@@ -2525,7 +2521,7 @@ static void events_p(void *arg) {
 
 				switch (cp->type) {
 					case CONTROL_PACKET_TYPE_INITIAL:;
-						struct rbudp_initial_pkt *parsed_pkt;
+						struct rbudp_initial_pkt *parsed_pkt = NULL;
 						rbudp_check_initial(cp,
 											rbudp_len - rbudp_headerlen,
 											&parsed_pkt);
@@ -3003,12 +2999,6 @@ int main(int argc, char *argv[]) {
   debug_printf("Starting Hercules using queue %d, %d rx threads, %d tx "
                "threads, xdp mode 0x%x",
                queue, rx_threads, tx_threads, xdp_mode);
-
-  usock = monitor_bind_daemon_socket();
-  if (usock == 0) {
-    fprintf(stderr, "Error binding daemon socket\n");
-    exit(1);
-  }
 
   struct hercules_server *server =
       hercules_init_server(if_idxs, n_interfaces, listen_addr, queue, xdp_mode, rx_threads, false);

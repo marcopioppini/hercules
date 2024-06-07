@@ -8,7 +8,7 @@ CFLAGS = -O3 -std=gnu11 -D_GNU_SOURCE
 # for debugging:
 CFLAGS += -g3 -DDEBUG
 # CFLAGS += -DDEBUG_PRINT_PKTS # print received/sent packets
-CFLAGS += -DPRINT_STATS
+# CFLAGS += -DPRINT_STATS
 LDFLAGS = -lbpf -Lbpf/src -lm -lelf -pthread -lz -z noexecstack
 DEPFLAGS:=-MP -MD
 

@@ -210,6 +210,7 @@ struct hercules_config {
 struct hercules_server {
 	struct hercules_config config;
 	int control_sockfd;	 // AF_PACKET socket used for control traffic
+	int usock;			 // Unix socket used for communication with the monitor
 	int max_paths;
 	int rate_limit;
 	int n_threads;					 // Number of RX/TX worker threads
