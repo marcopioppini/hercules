@@ -283,7 +283,8 @@ static void destroy_session_rx(struct hercules_session *session) {
 // there's no point in continuing.
 struct hercules_server *hercules_init_server(
 	int *ifindices, int num_ifaces, const struct hercules_app_addr local_addr,
-	int queue, int xdp_mode, int n_threads, bool configure_queues) {
+	int queue, int xdp_mode, int n_threads, bool configure_queues,
+	bool enable_pcc) {
 	struct hercules_server *server;
 	server = calloc(1, sizeof(*server) + num_ifaces * sizeof(*server->ifaces));
 	if (server == NULL) {
@@ -310,8 +311,7 @@ struct hercules_server *hercules_init_server(
 	server->config.xdp_mode = xdp_mode;
 	/* server->config.xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST; */
 	// FIXME with flags set, setup may fail and we don't catch it?
-	server->enable_pcc =
-		true;	// TODO this should be per-path or at least per-transfer
+	server->enable_pcc = enable_pcc;
 
 	for (int i = 0; i < num_ifaces; i++) {
 		server->ifaces[i] = (struct hercules_interface){
@@ -932,14 +932,11 @@ static char *rx_mmap(const char *pathname, size_t filesize) {
 		close(f);
 		return NULL;
 	}
-	// TODO why shared mapping?
 	char *mem = mmap(NULL, filesize, PROT_WRITE, MAP_SHARED, f, 0);
 	if (mem == MAP_FAILED) {
 		close(f);
 		return NULL;
 	}
-	// TODO Shouldn't we keep the file open until the transfer is finished to
-	// prevent it being messed with?
 	close(f);
 	return mem;
 }
@@ -1175,7 +1172,6 @@ static void rx_send_path_nacks(struct hercules_server *server, struct receiver_s
 		atomic_fetch_add(&rx_state->session->tx_npkts, 1);
 	}
 	libbpf_smp_wmb();
-	// FIXME spurious segfault on unlock
 	pthread_spin_unlock(&path_state->seq_rcvd.lock);
 	path_state->nack_end = nack_end;
 }
@@ -2043,8 +2039,6 @@ static void tx_send_p(void *arg) {
 		allocate_tx_frames(server, frame_addrs);
 		tx_handle_send_queue_unit(server, session_tx->tx_state, args->xsks,
 								  frame_addrs, &unit);
-		kick_tx_server(
-			server);  // FIXME should not be needed and probably inefficient
 	}
 }
 
@@ -2268,26 +2262,25 @@ static void new_tx_if_available(struct hercules_server *server) {
 			rbudp_headerlen >
 		(size_t)mtu) {
 		debug_printf("supplied MTU too small");
-		// TODO update_job with err
+		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_BAD_MTU, 0, 0);
 		return;
 	}
 	if (mtu > HERCULES_MAX_PKTSIZE){
 		debug_printf("supplied MTU too large");
-		// TODO update_job with err
+		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_BAD_MTU, 0, 0);
 		return;
 	}
 	size_t filesize;
 	char *mem = tx_mmap(fname, &filesize);
 	if (mem == NULL){
 		debug_printf("mmap failed");
-		// TODO update_job with err
+		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_MAP_FAILED, 0, 0);
 		return;
 	}
 	struct hercules_session *session = make_session(server);
 	if (session == NULL){
-		// TODO update_job with err
-		debug_printf("error creating session");
-		munmap(mem, filesize);
+		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_INIT, 0, 0);
+		munmap(mem, filesize); // FIXME when to unmap?
 		return;
 	}
 	session->state = SESSION_STATE_PENDING;
@@ -2301,7 +2294,7 @@ static void new_tx_if_available(struct hercules_server *server) {
 		debug_printf("error getting paths");
 		munmap(mem, filesize);
 		/* destroy_session(session); */ // FIXME
-										// TODO update job err
+		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_NO_PATHS, 0, 0);
 		return;
 	}
 	// TODO free paths
@@ -2331,8 +2324,12 @@ static void cleanup_finished_sessions(struct hercules_server *server, u64 now) {
 	struct hercules_session *session_tx = atomic_load(&server->session_tx);
 	if (session_tx && session_tx->state == SESSION_STATE_DONE) {
 		if (now > session_tx->last_pkt_rcvd + session_timeout * 2) {
-			monitor_update_job(server->usock, session_tx->jobid, session_tx->state,
-							   session_tx->error, 0, 0); // FIXME 0 0
+			u64 sec_elapsed = (now - session_tx->last_pkt_rcvd) / (int)1e9;
+			u64 bytes_acked = session_tx->tx_state->chunklen *
+							  session_tx->tx_state->acked_chunks.num_set;
+			monitor_update_job(server->usock, session_tx->jobid,
+							   session_tx->state, session_tx->error,
+							   sec_elapsed, bytes_acked);
 			struct hercules_session *current = server->session_tx;
 			atomic_store(&server->session_tx, NULL);
 			fprintf(stderr, "Cleaning up TX session...\n");
@@ -2915,7 +2912,7 @@ int main(int argc, char *argv[]) {
   // -q queue
   // -t TX worker threads
   // -r RX worker threads
-  unsigned int if_idxs[HERCULES_MAX_INTERFACES]; // XXX 10 should be enough
+  unsigned int if_idxs[HERCULES_MAX_INTERFACES];
   int n_interfaces = 0;
   struct hercules_app_addr listen_addr = {.ia = 0, .ip = 0, .port = 0};
   int xdp_mode = XDP_COPY;
@@ -3003,7 +3000,8 @@ int main(int argc, char *argv[]) {
                queue, rx_threads, tx_threads, xdp_mode);
 
   struct hercules_server *server =
-      hercules_init_server(if_idxs, n_interfaces, listen_addr, queue, xdp_mode, rx_threads, false);
+	  hercules_init_server(if_idxs, n_interfaces, listen_addr, queue, xdp_mode,
+						   rx_threads, false, true);
 
   hercules_main(server);
 }

@@ -86,7 +86,7 @@ struct receiver_state {
 
 	// The reply path to use for contacting the sender. This is the reversed
 	// path of the last initial packet with the SET_RETURN_PATH flag set.
-	// TODO needs atomic?
+	// TODO needs atomic? -> perf?
 	struct hercules_path reply_path;
 
 	// Start/end time of the current transfer
@@ -124,7 +124,7 @@ struct sender_state {
 	struct bitset acked_chunks;			  //< Chunks we've received an ack for
 	atomic_uint_least64_t handshake_rtt;  // Handshake RTT in ns
 
-	u32 return_path_idx; // TODO set where?
+	u32 return_path_idx;			   // TODO set where?
 	struct path_set *_Atomic pathset;  // Paths currently in use
 	/** Filesize in bytes */
 	size_t filesize;
@@ -160,8 +160,11 @@ enum session_error {
 	SESSION_ERROR_STALE,	//< Packets are being received, but none are new
 	SESSION_ERROR_PCC,		//< Something wrong with PCC
 	SESSION_ERROR_SEQNO_OVERFLOW,
-	SESSION_ERROR_NO_PATHS,	  //< Monitor returned no paths to destination
-	SESSION_ERROR_CANCELLED,  //< Transfer cancelled by monitor
+	SESSION_ERROR_NO_PATHS,	   //< Monitor returned no paths to destination
+	SESSION_ERROR_CANCELLED,   //< Transfer cancelled by monitor
+	SESSION_ERROR_BAD_MTU,	   //< Invalid MTU supplied by the monitor
+	SESSION_ERROR_MAP_FAILED,  //< Could not mmap file
+	SESSION_ERROR_INIT,		   //< Could not initialise session
 };
 
 // A session is a transfer between one sender and one receiver

@@ -182,11 +182,10 @@ func main() {
 				if selectedJob != nil {
 					fmt.Println("sending file to daemon:", selectedJob.file, selectedJob.id)
 					_, _ = headersToDestination(*selectedJob) // look up paths to fix mtu
-					// TODO Conversion between go and C strings?
 					strlen := len(selectedJob.file)
 					b = append(b, 1)
 					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.id))
-					b = binary.LittleEndian.AppendUint16(b, uint16(1200))
+					b = binary.LittleEndian.AppendUint16(b, uint16(1200)) // FIXME
 					b = binary.LittleEndian.AppendUint16(b, uint16(strlen))
 					b = append(b, []byte(selectedJob.file)...)
 				} else {

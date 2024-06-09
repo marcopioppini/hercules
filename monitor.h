@@ -76,7 +76,7 @@ struct sockmsg_new_job_A {
 	uint16_t job_id;
 	uint16_t mtu;
 	uint16_t filename_len;
-	uint8_t filename[SOCKMSG_MAX_PAYLOAD];
+	uint8_t filename[SOCKMSG_MAX_PAYLOAD]; // Filename *without* terminating 0-byte
 };
 
 // Get paths to use for a given job ID

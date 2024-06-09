@@ -31,8 +31,8 @@ bool monitor_get_reply_path(int sockfd, const char *rx_sample_buf, int rx_sample
   path->headerlen = reply.payload.reply_path.path.headerlen;
   path->header.checksum = reply.payload.reply_path.path.chksum;
   path->enabled = true;
-  path->payloadlen = 1200 - path->headerlen; // TODO set correctly
-  path->framelen = 1200;
+  path->payloadlen = etherlen - path->headerlen;
+  path->framelen = etherlen;
   path->ifid = reply.payload.reply_path.path.ifid;
   return true;
 }
