@@ -2518,11 +2518,13 @@ static void print_session_stats(struct hercules_server *server,
 static void tx_update_monitor(struct hercules_server *server, u64 now) {
 	struct hercules_session *session_tx = server->session_tx;
 	if (session_tx != NULL && session_tx->state == SESSION_STATE_RUNNING) {
-		monitor_update_job(server->usock, session_tx->jobid, session_tx->state, 0,
+		bool ret = monitor_update_job(server->usock, session_tx->jobid, session_tx->state, 0,
 						   ( now - session_tx->tx_state->start_time ) / (int)1e9,
 						   session_tx->tx_state->chunklen *
 							   session_tx->tx_state->acked_chunks.num_set);
-		debug_printf("elapsed %llu", (now - session_tx->tx_state->start_time)/(u64)1e9);
+		if (!ret) {
+			quit_session(session_tx, SESSION_ERROR_CANCELLED);
+		}
 	}
 }
 

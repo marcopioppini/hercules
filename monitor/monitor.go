@@ -15,6 +15,7 @@ import (
 
 // #include "../monitor.h"
 import "C"
+
 const HerculesMaxPktsize = C.HERCULES_MAX_PKTSIZE
 
 // Select paths and serialize headers for a given transfer
@@ -55,8 +56,10 @@ type TransferStatus int
 const (
 	Queued    TransferStatus = iota // Received by the monitor, enqueued, not yet known to the server
 	Submitted                       // The server is processing the transfer
+	Cancelled                       // The monitor has received a cancellation request
 	Done                            // The server is done with the transfer (not necessarily successfully)
 )
+
 // Note that the monitor's transfer status is distinct from the server's session state.
 // The monitor's status is used to distinguish queued jobs from ones already submitted to the server,
 // since the server has no concept of pending jobs.
@@ -136,6 +139,7 @@ func main() {
 	// Start HTTP API
 	http.HandleFunc("/submit", http_submit)
 	http.HandleFunc("/status", http_status)
+	http.HandleFunc("/cancel", http_cancel)
 	go http.ListenAndServe(":8000", nil)
 
 	// TODO remove finished sessions after a while
@@ -223,8 +227,14 @@ func main() {
 				}
 				job.chunks_acked = int(bytes_acked) // FIXME
 				job.time_elapsed = int(seconds)
+				isCancelled := job.status == Cancelled
 				transfersLock.Unlock()
-				b := binary.LittleEndian.AppendUint16(nil, uint16(1))
+				var b []byte
+				if isCancelled {
+					b = binary.LittleEndian.AppendUint16(b, uint16(0))
+				} else {
+					b = binary.LittleEndian.AppendUint16(b, uint16(1))
+				}
 				usock.WriteToUnix(b, a)
 
 			default:

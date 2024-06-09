@@ -65,3 +65,28 @@ func http_status(w http.ResponseWriter, r *http.Request) {
 	}
 	io.WriteString(w, fmt.Sprintf("OK %d %d %d %d %d\n", info.status, info.state, info.err, info.time_elapsed, info.chunks_acked))
 }
+
+// Handle cancelling a transfer
+// GET Params:
+// id: An ID obtained by submitting a transfer
+// Returns OK
+func http_cancel(w http.ResponseWriter, r *http.Request) {
+	if !r.URL.Query().Has("id") {
+		io.WriteString(w, "missing parameter")
+		return
+	}
+	id, err := strconv.Atoi(r.URL.Query().Get("id"))
+	if err != nil {
+		return
+	}
+	transfersLock.Lock()
+	info, ok := transfers[id]
+	if !ok {
+		transfersLock.Unlock()
+		return
+	}
+	info.status = Cancelled
+	transfersLock.Unlock()
+
+	io.WriteString(w, "OK\n")
+}
