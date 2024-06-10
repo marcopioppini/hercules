@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 
 	"github.com/scionproto/scion/pkg/snet"
@@ -89,4 +90,30 @@ func http_cancel(w http.ResponseWriter, r *http.Request) {
 	transfersLock.Unlock()
 
 	io.WriteString(w, "OK\n")
+}
+
+// Handle gfal's stat command
+// GET Params:
+// file: a file path
+// Returns OK exists? size
+func http_stat(w http.ResponseWriter, r *http.Request) {
+	if !r.URL.Query().Has("file") {
+		io.WriteString(w, "missing parameter")
+		return
+	}
+	file := r.URL.Query().Get("file")
+	info, err := os.Stat(file)
+	if os.IsNotExist(err){
+		io.WriteString(w, "OK 0 0\n");
+		return
+	} else if err != nil {
+		io.WriteString(w, "err\n")
+		return
+	}
+	if !info.Mode().IsRegular() {
+		io.WriteString(w, "err\n")
+		return
+	}
+
+	io.WriteString(w, fmt.Sprintf("OK 1 %d\n", info.Size()))
 }

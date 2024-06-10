@@ -140,6 +140,7 @@ func main() {
 	http.HandleFunc("/submit", http_submit)
 	http.HandleFunc("/status", http_status)
 	http.HandleFunc("/cancel", http_cancel)
+	http.HandleFunc("/stat", http_stat)
 	go http.ListenAndServe(":8000", nil)
 
 	// TODO remove finished sessions after a while
