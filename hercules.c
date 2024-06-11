@@ -836,12 +836,12 @@ static void
 submit_rx_frames(struct hercules_session *session, struct xsk_umem_info *umem, const u64 *addrs, size_t num_frames)
 {
 	u32 idx_fq = 0;
-	pthread_spin_lock(&umem->lock);
+	pthread_spin_lock(&umem->fq_lock);
 	size_t reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
 	while(reserved != num_frames) {
 		reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
 		if(session == NULL || session->state != SESSION_STATE_RUNNING) {
-			pthread_spin_unlock(&umem->lock);
+			pthread_spin_unlock(&umem->fq_lock);
 			return;
 		}
 	}
@@ -850,7 +850,7 @@ submit_rx_frames(struct hercules_session *session, struct xsk_umem_info *umem, c
 		*xsk_ring_prod__fill_addr(&umem->fq, idx_fq++) = addrs[i];
 	}
 	xsk_ring_prod__submit(&umem->fq, num_frames);
-	pthread_spin_unlock(&umem->lock);
+	pthread_spin_unlock(&umem->fq_lock);
 }
 
 // Read a batch of data packets from the XSK
@@ -1387,7 +1387,7 @@ void send_path_handshakes(struct hercules_server *server, struct sender_state *t
 static void claim_tx_frames(struct hercules_server *server, struct hercules_interface *iface, u64 *addrs, size_t num_frames)
 {
 	// TODO FIXME Lock contention, significantly affects performance
-	pthread_spin_lock(&iface->umem->lock);
+	pthread_spin_lock(&iface->umem->frames_lock);
 	size_t reserved = frame_queue__cons_reserve(&iface->umem->available_frames, num_frames);
 	while(reserved != num_frames) {
 		// When we're not getting any frames, we might need to...
@@ -1398,7 +1398,7 @@ static void claim_tx_frames(struct hercules_server *server, struct hercules_inte
 		struct hercules_session *s = atomic_load(&server->session_tx);
 		if(!s || atomic_load(&s->state) != SESSION_STATE_RUNNING) {
 			debug_printf("STOP");
-			pthread_spin_unlock(&iface->umem->lock);
+			pthread_spin_unlock(&iface->umem->frames_lock);
 			return;
 		}
 	}
@@ -1407,7 +1407,7 @@ static void claim_tx_frames(struct hercules_server *server, struct hercules_inte
 		addrs[i] = frame_queue__cons_fetch(&iface->umem->available_frames, i);
 	}
 	frame_queue__pop(&iface->umem->available_frames, num_frames);
-	pthread_spin_unlock(&iface->umem->lock);
+	pthread_spin_unlock(&iface->umem->frames_lock);
 }
 
 static char *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_idx, size_t framelen)
@@ -2862,7 +2862,11 @@ struct path_stats *make_path_stats_buffer(int num_paths) {
 void hercules_main(struct hercules_server *server) {
   debug_printf("Hercules main");
 
-  xdp_setup(server);
+  int ret = xdp_setup(server);
+  if (ret != 0){
+	  fprintf(stderr, "Error in XDP setup!\n");
+	  exit(1);
+  }
 
   // Start event receiver thread
   debug_printf("Starting event receiver thread");

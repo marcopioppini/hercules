@@ -58,7 +58,8 @@ struct xsk_umem_info *xsk_configure_umem_server(struct hercules_server *server,
 	if (ret) {
 		return NULL;
 	}
-	pthread_spin_init(&umem->lock, 0);
+	pthread_spin_init(&umem->fq_lock, 0);
+	pthread_spin_init(&umem->frames_lock, 0);
 	return umem;
 }
 

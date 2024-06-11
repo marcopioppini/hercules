@@ -236,7 +236,10 @@ struct xsk_umem_info {
 	struct xsk_ring_prod fq;
 	struct xsk_ring_cons cq;
 	struct frame_queue available_frames;
-	pthread_spinlock_t lock;
+	// TODO ok to have locks closeby?
+	pthread_spinlock_t fq_lock;	 // Lock for the fill queue (fq)
+	pthread_spinlock_t
+		frames_lock;  // Lock for the frame queue (available_frames)
 	struct xsk_umem *umem;
 	void *buffer;
 	struct hercules_interface *iface;
