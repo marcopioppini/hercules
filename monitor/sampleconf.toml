@@ -3,6 +3,16 @@
 # By default, up to `DefaultNumPaths` paths will be used.
 DefaultNumPaths = 1
 
+# Path to the monitor socket
+MonitorSocket = "var/run/herculesmon.sock"
+
+# SCION address the Hercules server should listen on
+ListenAddress = "17-ffaa:1:fe2,192.168.10.141:8000"
+
+Interfaces = [
+"eth0",
+]
+
 # The number and choice of paths can be overridden on a destination-host
 # or destination-AS basis. In case both an AS and Host rule match, the Host
 # rule takes precedence.

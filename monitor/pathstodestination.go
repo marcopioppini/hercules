@@ -85,6 +85,7 @@ func (ptd *PathsToDestination) choosePaths() bool {
 	var err error
 	ptd.allPaths, err = GlobalQuerier.Query(context.Background(), ptd.dst.hostAddr.IA)
 	if err != nil {
+		fmt.Println("Error querying paths:", err)
 		return false
 	}
 

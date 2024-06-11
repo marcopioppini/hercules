@@ -21,8 +21,8 @@ const HerculesMaxPktsize = C.HERCULES_MAX_PKTSIZE
 // Select paths and serialize headers for a given transfer
 func headersToDestination(transfer HerculesTransfer) (int, []byte) {
 	srcA := addr.Addr{
-		IA:   localAddress.IA,
-		Host: addr.MustParseHost(localAddress.Host.IP.String()),
+		IA:   listenAddress.IA,
+		Host: addr.MustParseHost(listenAddress.Host.IP.String()),
 	}
 	dstA := addr.Addr{
 		IA:   transfer.dest.IA,
@@ -82,33 +82,32 @@ var transfersLock sync.Mutex // To protect the map below
 var transfers = map[int]*HerculesTransfer{}
 var nextID int = 1 // ID to use for the next transfer
 
-var localAddress *snet.UDPAddr
-var interfaces []*net.Interface
+// These are needed by the HTTP handlers
+var listenAddress *snet.UDPAddr
+var activeInterfaces []*net.Interface
 
 var pathRules PathRules
 
 func main() {
-	var localAddr string
 	var configFile string
-	flag.StringVar(&localAddr, "l", "", "local address")
-	flag.StringVar(&configFile, "c", "herculesmon.conf", "Path to the monitor configuration file")
+	flag.StringVar(&configFile, "c", defaultConfigPath, "Path to the monitor configuration file")
 	flag.Parse()
 
 	var config MonitorConfig
 	config, pathRules = readConfig(configFile)
 	fmt.Println(config)
 
-	src, err := snet.ParseUDPAddr(localAddr)
-	if err != nil || src.Host.Port == 0 {
-		flag.Usage()
+	if config.ListenAddress.addr.Host.Port == 0 {
+		fmt.Println("No listening port specified")
 		os.Exit(1)
 	}
-	localAddress = src
-	GlobalQuerier = newPathQuerier() // TODO can the connection time out?
+	listenAddress = config.ListenAddress.addr
 
-	// TODO make socket paths congfigurable
+	GlobalQuerier = newPathQuerier() // TODO can the connection time out or break?
+
 	monitorSocket, err := net.ResolveUnixAddr("unixgram", config.MonitorSocket)
 	if err != nil {
+		fmt.Printf("Error resolving socket address: %s\n", config.MonitorSocket)
 		os.Exit(1)
 	}
 
@@ -119,18 +118,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	// TODO interfaces from config
-	ifs, _ := net.Interfaces()
-	iffs := []*net.Interface{}
-	for i, _ := range ifs {
-		iffs = append(iffs, &ifs[i])
+	activeInterfaces = []*net.Interface{}
+	for _, i := range config.Interfaces {
+		activeInterfaces = append(activeInterfaces, i.iface)
 	}
-	interfaces = iffs
 
 	// used for looking up reply path interface
-	pm, err := initNewPathManager(iffs, &Destination{
-		hostAddr: localAddress,
-	}, src)
+	pm, err := initNewPathManager(activeInterfaces, &Destination{
+		hostAddr: config.ListenAddress.addr,
+	}, config.ListenAddress.addr)
 	if err != nil {
 		fmt.Printf("Error initialising path manager: %v\n", err)
 		os.Exit(1)

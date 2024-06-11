@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 
 	"github.com/BurntSushi/toml"
@@ -20,11 +21,35 @@ type ASConfig struct {
 	NumPaths int
 	PathSpec []PathSpec
 }
+
+// This wraps snet.UDPAddr to make the config parsing work
+type UDPAddr struct {
+	addr *snet.UDPAddr
+}
+
+func (a *UDPAddr) UnmarshalText(text []byte) error {
+	var err error
+	a.addr, err = snet.ParseUDPAddr(string(text))
+	return err
+}
+
+type Interface struct {
+	iface *net.Interface
+}
+
+func (i *Interface) UnmarshalText(text []byte) error {
+	var err error
+	i.iface, err = net.InterfaceByName(string(text))
+	return err
+}
+
 type MonitorConfig struct {
 	DestinationHosts []HostConfig
 	DestinationASes  []ASConfig
 	DefaultNumPaths  int
 	MonitorSocket    string
+	ListenAddress    UDPAddr
+	Interfaces       []Interface
 }
 
 type PathRules struct {
@@ -61,6 +86,11 @@ func findPathRule(p *PathRules, dest *snet.UDPAddr) Destination {
 	}
 }
 
+const defaultConfigPath = "herculesmon.conf"
+const defaultMonitorSocket = "var/run/herculesmon.sock"
+
+// Decode the config file and fill in any unspecified values with defaults.
+// Will exit if an error occours or a required value is not specified.
 func readConfig(configFile string) (MonitorConfig, PathRules) {
 	var config MonitorConfig
 	meta, err := toml.DecodeFile(configFile, &config)
@@ -79,13 +109,22 @@ func readConfig(configFile string) (MonitorConfig, PathRules) {
 	}
 
 	if config.MonitorSocket == "" {
-		config.MonitorSocket = "/var/herculesmon.sock" // TODO should be in /var/run
+		config.MonitorSocket = defaultMonitorSocket
 	}
 
-	fmt.Println(config.MonitorSocket, config.MonitorSocket == "", config.MonitorSocket == "")
+	// This is required
+	if config.ListenAddress.addr == nil {
+		fmt.Println("Error: Listening address not specified")
+		os.Exit(1)
+	}
+
+	if len(config.Interfaces) == 0 {
+		fmt.Println("Error: No interfaces specified")
+		os.Exit(1)
+	}
 
 	pathRules := PathRules{}
-	// TODO Would be nice not to have to do this dance and specify the maps directly in the config file,
+	// It would be nice not to have to do this dance and specify the maps directly in the config file,
 	// but the toml package crashes if the keys are addr.Addr
 
 	pathRules.Hosts = map[addr.Addr]HostConfig{}

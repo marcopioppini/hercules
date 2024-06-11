@@ -28,7 +28,7 @@ func http_submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	destination := findPathRule(&pathRules, destParsed)
-	pm, _ := initNewPathManager(interfaces, &destination, localAddress)
+	pm, _ := initNewPathManager(activeInterfaces, &destination, listenAddress)
 
 	transfersLock.Lock()
 	jobid := nextID
