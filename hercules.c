@@ -1053,7 +1053,7 @@ static void rx_handle_initial(struct hercules_server *server,
 
 // Send an empty ACK, indicating to the sender that it may start sending data
 // packets.
-// XXX This is not strictly necessary, I think. Once the ACK sender thread sees
+// This is not strictly necessary. Once the ACK sender thread sees
 // the session it will start sending ACKs, which will also be empty.
 static void rx_send_cts_ack(struct hercules_server *server,
 							struct receiver_state *rx_state) {
@@ -1730,7 +1730,8 @@ static void tx_retransmit_initial(struct hercules_server *server, u64 now) {
 			session_tx->last_pkt_sent + session_hs_retransmit_interval) {
 			struct sender_state *tx_state = session_tx->tx_state;
 			struct path_set *pathset = tx_state->pathset;
-			tx_send_initial(server, &pathset->paths[tx_state->return_path_idx],
+			// We always use the first path as the return path
+			tx_send_initial(server, &pathset->paths[0],
 							tx_state->filename, tx_state->filesize,
 							tx_state->chunklen, now, 0, session_tx->etherlen, true, true);
 			session_tx->last_pkt_sent = now;
@@ -1766,7 +1767,7 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 			}
 			ccontrol_update_rtt(pathset->paths[0].cc_state,
 								tx_state->handshake_rtt);
-			// TODO assumption: return path is always idx 0
+			// Return path is always idx 0
 			fprintf(stderr,
 					"[receiver %d] [path 0] handshake_rtt: "
 					"%fs, MI: %fs\n",
@@ -2339,7 +2340,6 @@ static void cleanup_finished_sessions(struct hercules_server *server, u64 now) {
 			// until after the next session has completed. At that point, no
 			// references to the deferred session should be around, so we then
 			// free it.
-			// XXX Is this really good enough?
 			destroy_session_tx(server->deferred_tx);
 			server->deferred_tx = current;
 		}
@@ -2422,8 +2422,7 @@ static void tx_update_paths(struct hercules_server *server) {
 			} else {
 				debug_printf("Path %d changed, resetting CC", i);
 				if (i == 0) {
-					// TODO assumption (also in other places): return path is
-					// always idx 0
+					// Return path is always idx 0
 					replaced_return_path = true;
 				}
 				// TODO whether to use pcc should be decided on a per-path basis
@@ -2736,10 +2735,16 @@ static void events_p(void *arg) {
 							count_received_pkt(server->session_tx, h->path);
 							nack_trace_push(cp->payload.ack.timestamp,
 											cp->payload.ack.ack_nr);
+							struct path_set *pathset =
+								server->session_tx->tx_state->pathset;
+							if (h->path > pathset->n_paths) {
+								// The pathset was updated in the meantime and
+								// there are now fewer paths, so ignore this
+								break;
+							}
 							tx_register_nacks(
 								&cp->payload.ack,
-								// TODO h->path may be too large if pathset changed
-								server->session_tx->tx_state->pathset->paths[h->path].cc_state);
+								pathset->paths[h->path].cc_state);
 						}
 						break;
 					default:

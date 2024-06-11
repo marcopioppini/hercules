@@ -124,7 +124,6 @@ struct sender_state {
 	struct bitset acked_chunks;			  //< Chunks we've received an ack for
 	atomic_uint_least64_t handshake_rtt;  // Handshake RTT in ns
 
-	u32 return_path_idx;			   // TODO set where?
 	struct path_set *_Atomic pathset;  // Paths currently in use
 	/** Filesize in bytes */
 	size_t filesize;
