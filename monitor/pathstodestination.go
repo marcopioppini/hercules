@@ -102,15 +102,28 @@ func (ptd *PathsToDestination) choosePaths() bool {
 	ptd.chooseNewPaths(availablePaths)
 
 	if ptd.pm.payloadLen == 0 {
-		// No payloadlen set yet, we set it to the maximum that all selected paths support
+		// No payloadlen set yet, we set it to the maximum that all selected paths and interfaces support
 		maxPayloadlen := HerculesMaxPktsize
 		for _, path := range ptd.paths {
 			pathMTU := int(path.path.Metadata().MTU)
 			underlayHeaderLen, scionHeaderLen := getPathHeaderlen(path.path)
+			if pathMTU == 0 {
+				// Empty path has length 0, let's just use the interface's MTU
+				// XXX If the path's MTU is smaller than the interface's, the packet will end up too large
+				// TODO allow specifying MTU at submission time
+				pathMTU = path.iface.MTU - scionHeaderLen - underlayHeaderLen
+			}
 			pathPayloadlen := pathMTU - scionHeaderLen
 			maxPayloadlen = min(maxPayloadlen, pathPayloadlen)
 			// Cap to Hercules' max pkt size
 			maxPayloadlen = min(maxPayloadlen, HerculesMaxPktsize-scionHeaderLen-underlayHeaderLen)
+			// Check the interface's MTU is large enough
+			if maxPayloadlen + scionHeaderLen + underlayHeaderLen - 14 > path.iface.MTU {
+				// Packet exceeds the interface MTU
+				// 14 is the size of the ethernet header, which is not included in the interface's MTU
+				fmt.Printf("Interface (%v) MTU too low, decreasing payload length", path.iface.Name)
+				maxPayloadlen = path.iface.MTU - underlayHeaderLen - scionHeaderLen
+			}
 		}
 		ptd.pm.payloadLen = maxPayloadlen
 		fmt.Println("Set chunk length to", ptd.pm.payloadLen)

@@ -32,7 +32,7 @@ type PathManager struct {
 	interfaces map[int]*net.Interface
 	dst        *PathsToDestination
 	src        *snet.UDPAddr
-	payloadLen   int // The payload length to use for this transfer. Paths must be able to transfer payloads of at least this size.
+	payloadLen int // The payload length to use for this transfer. Paths must be able to transfer payloads of at least this size.
 }
 
 type PathWithInterface struct {
@@ -50,7 +50,7 @@ func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet
 		interfaces: ifMap,
 		src:        src,
 		dst:        &PathsToDestination{},
-		payloadLen:   0, // Will be set later, after the first path lookup
+		payloadLen: 0, // Will be set later, after the first path lookup
 	}
 
 	if src.IA == dst.hostAddr.IA {
@@ -89,9 +89,17 @@ func (pm *PathManager) filterPathsByMTU(pathsAvail []PathWithInterface) []PathWi
 		// The path MTU refers to the maximum length of the SCION headers and payload,
 		// but not including the lower-level (ethernet/ip/udp) headers
 		pathMTU := int(path.path.Metadata().MTU)
-		_, pathScionHeaderlen := getPathHeaderlen(path.path)
-		pathPayloadlen := pathMTU - pathScionHeaderlen
-		if pathPayloadlen >= pm.payloadLen {
+		underlayHeaderLen, scionHeaderLen := getPathHeaderlen(path.path)
+		if pathMTU == 0 {
+			// Empty path has length 0, let's just use the interface's MTU
+			pathMTU = path.iface.MTU - scionHeaderLen - underlayHeaderLen
+		}
+		pathPayloadlen := pathMTU - scionHeaderLen
+		// The interface MTU refers to the maximum length of the entire packet,
+		// excluding the ethernet header (14B)
+		ifacePayloadLen := path.iface.MTU - (scionHeaderLen + underlayHeaderLen - 14)
+
+		if pathPayloadlen >= pm.payloadLen && ifacePayloadLen >= pm.payloadLen {
 			pathsFiltered = append(pathsFiltered, path)
 		}
 	}
