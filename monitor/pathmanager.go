@@ -32,15 +32,13 @@ type PathManager struct {
 	interfaces map[int]*net.Interface
 	dst        *PathsToDestination
 	src        *snet.UDPAddr
-	mtu        int
+	payloadLen   int // The payload length to use for this transfer. Paths must be able to transfer payloads of at least this size.
 }
 
 type PathWithInterface struct {
 	path  snet.Path
 	iface *net.Interface
 }
-
-type AppPathSet map[snet.PathFingerprint]PathWithInterface
 
 func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet.UDPAddr) (*PathManager, error) {
 	ifMap := make(map[int]*net.Interface)
@@ -52,24 +50,20 @@ func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet
 		interfaces: ifMap,
 		src:        src,
 		dst:        &PathsToDestination{},
-		mtu:        0, // Will be set later, after the first path lookup
+		payloadLen:   0, // Will be set later, after the first path lookup
 	}
 
 	if src.IA == dst.hostAddr.IA {
 		pm.dst = initNewPathsToDestinationWithEmptyPath(pm, dst)
 	} else {
 		var err error
-		pm.dst, err = initNewPathsToDestination(pm, src, dst)
+		pm.dst, err = initNewPathsToDestination(pm, dst)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	return pm, nil
-}
-
-func (pm *PathManager) canSendToDest() bool {
-	return pm.dst.hasUsablePaths()
 }
 
 func (pm *PathManager) choosePaths() bool {
@@ -88,10 +82,16 @@ func (pm *PathManager) filterPathsByActiveInterfaces(pathsAvail []snet.Path) []P
 	return pathsFiltered
 }
 
+// Don't consider paths that cannot fit the required payload length
 func (pm *PathManager) filterPathsByMTU(pathsAvail []PathWithInterface) []PathWithInterface {
 	pathsFiltered := []PathWithInterface{}
 	for _, path := range pathsAvail {
-		if path.path.Metadata().MTU >= uint16(pm.mtu){
+		// The path MTU refers to the maximum length of the SCION headers and payload,
+		// but not including the lower-level (ethernet/ip/udp) headers
+		pathMTU := int(path.path.Metadata().MTU)
+		_, pathScionHeaderlen := getPathHeaderlen(path.path)
+		pathPayloadlen := pathMTU - pathScionHeaderlen
+		if pathPayloadlen >= pm.payloadLen {
 			pathsFiltered = append(pathsFiltered, path)
 		}
 	}
@@ -104,7 +104,6 @@ func (pm *PathManager) interfaceForRoute(ip net.IP) (*net.Interface, error) {
 		return nil, fmt.Errorf("could not find route for destination %s: %s", ip, err)
 	}
 
-	fmt.Println(pm.interfaces)
 	for _, route := range routes {
 		if iface, ok := pm.interfaces[route.LinkIndex]; ok {
 			fmt.Printf("sending via #%d (%s) to %s\n", route.LinkIndex, pm.interfaces[route.LinkIndex].Name, ip)

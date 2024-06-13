@@ -945,7 +945,6 @@ static char *rx_mmap(const char *pathname, size_t filesize) {
 static struct receiver_state *make_rx_state(struct hercules_session *session,
 											char *filename, size_t namelen,
 											size_t filesize, int chunklen,
-											int etherlen,
 											bool is_pcc_benchmark) {
 	struct receiver_state *rx_state;
 	rx_state = calloc(1, sizeof(*rx_state));
@@ -967,7 +966,6 @@ static struct receiver_state *make_rx_state(struct hercules_session *session,
 		free(rx_state);
 		return NULL;
 	}
-	rx_state->etherlen = etherlen;
 	return rx_state;
 }
 
@@ -976,6 +974,7 @@ static struct receiver_state *make_rx_state(struct hercules_session *session,
 // path reversed.
 static bool rx_update_reply_path(
 	struct hercules_server *server, struct receiver_state *rx_state, int ifid,
+	int etherlen,
 	int rx_sample_len, const char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE]) {
 	debug_printf("Updating reply path");
 	if (!rx_state) {
@@ -988,7 +987,7 @@ static bool rx_update_reply_path(
 	// TODO writing to reply path needs sync?
 	int ret =
 		monitor_get_reply_path(server->usock, rx_sample_buf, rx_sample_len,
-							   rx_state->etherlen, &rx_state->reply_path);
+							   etherlen, &rx_state->reply_path);
 	if (!ret) {
 		return false;
 	}
@@ -1045,7 +1044,10 @@ static void rx_handle_initial(struct hercules_server *server,
 	debug_printf("handling initial");
 	const int headerlen = (int)(payload - buf);
 	if (initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
-		rx_update_reply_path(server, rx_state, ifid, headerlen + payloadlen, buf);
+		debug_printf("initial headerlen, payloadlen: %d, %d", headerlen, payloadlen);
+		// XXX Why use both initial->chunklen (transmitted) and the size of the received packet?
+		// Are they ever not the same?
+		rx_update_reply_path(server, rx_state, ifid, initial->chunklen + headerlen, headerlen + payloadlen, buf);
 	}
 	rx_send_rtt_ack(server, rx_state,
 					initial);  // echo back initial pkt to ACK filesize
@@ -1298,7 +1300,7 @@ static void tx_register_nacks(const struct rbudp_ack_pkt *nack, struct ccontrol_
 
 
 static void
-tx_send_initial(struct hercules_server *server, const struct hercules_path *path, char *filename, size_t filesize, u32 chunklen, unsigned long timestamp, u32 path_index, u32 etherlen, bool set_return_path, bool new_transfer)
+tx_send_initial(struct hercules_server *server, const struct hercules_path *path, char *filename, size_t filesize, u32 chunklen, unsigned long timestamp, u32 path_index, bool set_return_path, bool new_transfer)
 {
 	debug_printf("Sending initial");
 	char buf[HERCULES_MAX_PKTSIZE];
@@ -1321,7 +1323,6 @@ tx_send_initial(struct hercules_server *server, const struct hercules_path *path
 					.path_index = path_index,
 					.flags = flags,
 					.name_len = strlen(filename),
-					.etherlen = etherlen,
 			},
 	};
 	assert(strlen(filename) < 100); // TODO
@@ -1375,11 +1376,10 @@ void send_path_handshakes(struct hercules_server *server, struct sender_state *t
                                            now + PATH_HANDSHAKE_TIMEOUT_NS)) {
           debug_printf("sending hs on path %d", p);
 		  // FIXME file name below?
-          tx_send_initial(server, path, "abcd", tx_state->filesize,
-                          tx_state->chunklen, get_nsecs(), p, 0,
-                          false, false);
-        }
-      }
+		  tx_send_initial(server, path, "abcd", tx_state->filesize,
+						  tx_state->chunklen, get_nsecs(), p, false, false);
+		}
+	  }
     }
   }
 }
@@ -1733,7 +1733,7 @@ static void tx_retransmit_initial(struct hercules_server *server, u64 now) {
 			// We always use the first path as the return path
 			tx_send_initial(server, &pathset->paths[0],
 							tx_state->filename, tx_state->filesize,
-							tx_state->chunklen, now, 0, session_tx->etherlen, true, true);
+							tx_state->chunklen, now, 0, true, true);
 			session_tx->last_pkt_sent = now;
 		}
 	}
@@ -2251,26 +2251,21 @@ static void new_tx_if_available(struct hercules_server *server) {
 	memset(fname, 0, 1000);
 	int count;
 	u16 jobid;
-	u16 mtu;
+	u16 payloadlen;
 	struct hercules_app_addr dest;
 
-	int ret = monitor_get_new_job(server->usock, fname, &jobid, &dest, &mtu);
+	int ret = monitor_get_new_job(server->usock, fname, &jobid, &dest, &payloadlen);
 	if (!ret) {
 		return;
 	}
 	debug_printf("new job: %s", fname);
-	if (HERCULES_MAX_HEADERLEN + sizeof(struct rbudp_initial_pkt) +
-			rbudp_headerlen >
-		(size_t)mtu) {
-		debug_printf("supplied MTU too small");
+
+	if (sizeof(struct rbudp_initial_pkt) + rbudp_headerlen > (size_t)payloadlen) {
+		debug_printf("supplied payloadlen too small");
 		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_BAD_MTU, 0, 0);
 		return;
 	}
-	if (mtu > HERCULES_MAX_PKTSIZE){
-		debug_printf("supplied MTU too large");
-		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_BAD_MTU, 0, 0);
-		return;
-	}
+
 	size_t filesize;
 	char *mem = tx_mmap(fname, &filesize);
 	if (mem == NULL){
@@ -2285,12 +2280,12 @@ static void new_tx_if_available(struct hercules_server *server) {
 		return;
 	}
 	session->state = SESSION_STATE_PENDING;
-	session->etherlen = mtu;
+	session->payloadlen = payloadlen;
 	session->jobid = jobid;
 
 	int n_paths;
 	struct hercules_path *paths;
-	ret = monitor_get_paths(server->usock, jobid, &n_paths, &paths);
+	ret = monitor_get_paths(server->usock, jobid, payloadlen, &n_paths, &paths);
 	if (!ret || n_paths == 0){
 		debug_printf("error getting paths");
 		munmap(mem, filesize);
@@ -2301,17 +2296,14 @@ static void new_tx_if_available(struct hercules_server *server) {
 	// TODO free paths
 	debug_printf("received %d paths", n_paths);
 
-	// TODO If the paths don't have the same header length this does not work:
-	// If the first path has a shorter header than the second, chunks won't fit
-	// on the second path
-	u32 chunklen = paths[0].payloadlen - rbudp_headerlen;
-	atomic_store(&server->session_tx, session);
+	int chunklen = payloadlen - rbudp_headerlen;
 	struct sender_state *tx_state = init_tx_state(
-		server->session_tx, filesize, chunklen, server->rate_limit, mem,
+		session, filesize, chunklen, server->rate_limit, mem,
 		&session->peer, paths, 1, n_paths,
 		server->max_paths);
 	strncpy(tx_state->filename, fname, 99);
-	server->session_tx->tx_state = tx_state;
+	session->tx_state = tx_state;
+	atomic_store(&server->session_tx, session);
 }
 
 // Remove and free finished sessions
@@ -2386,8 +2378,8 @@ static void tx_update_paths(struct hercules_server *server) {
 		struct path_set *old_pathset = tx_state->pathset;
 		int n_paths;
 		struct hercules_path *paths;
-		bool ret =
-			monitor_get_paths(server->usock, session_tx->jobid, &n_paths, &paths);
+		bool ret = monitor_get_paths(server->usock, session_tx->jobid,
+									 session_tx->payloadlen, &n_paths, &paths);
 		if (!ret) {
 			debug_printf("error getting paths");
 			return;
@@ -2678,9 +2670,9 @@ static void events_p(void *arg) {
 								server->session_rx = session;
 								session->state = SESSION_STATE_NEW;
 								struct receiver_state *rx_state = make_rx_state(
-									session, parsed_pkt->name, parsed_pkt->name_len,
-									parsed_pkt->filesize, parsed_pkt->chunklen,
-									parsed_pkt->etherlen, false);
+									session, parsed_pkt->name,
+									parsed_pkt->name_len, parsed_pkt->filesize,
+									parsed_pkt->chunklen, false);
 								session->rx_state = rx_state;
 								rx_handle_initial(server, rx_state, parsed_pkt,
 												  buf, addr.sll_ifindex,

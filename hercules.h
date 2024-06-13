@@ -79,8 +79,6 @@ struct receiver_state {
 	u32 total_chunks;
 	/** Memory mapped file for receive */
 	char *mem;
-	/** Packet size */
-	u32 etherlen;
 
 	struct bitset received_chunks;
 
@@ -180,7 +178,9 @@ struct hercules_session {
 							// already-seen chunks for a while something is
 							// probably wrong
 	u32 jobid;				//< The monitor's ID for this job
-	u32 etherlen;
+	u32 payloadlen;	 //< The payload length used for this transfer. Note that
+					 // the payload length includes the rbudp header while the
+					 // chunk length does not.
 
 	struct hercules_app_addr peer;
 

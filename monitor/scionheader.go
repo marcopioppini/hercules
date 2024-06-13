@@ -193,16 +193,18 @@ func getReplyPathHeader(buf []byte, etherLen int) (*HerculesPathHeader, net.IP, 
 	return &herculesPath, dstIP, nil
 }
 
-func SerializePath(from *HerculesPathHeader, ifid int, maxHeaderLen int) []byte {
+// Serialize the path header for transmission via the unix socket
+func SerializePathHeader(from *HerculesPathHeader, ifid int, maxHeaderLen int) []byte {
 	out := []byte{}
 	out = binary.LittleEndian.AppendUint16(out, from.PartialChecksum)
 	out = binary.LittleEndian.AppendUint16(out, uint16(ifid))
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(from.Header)))
 	if len(from.Header) > maxHeaderLen {
-		// Header does not fit in the C struct
+		fmt.Println("Header does not fit in the C struct!")
 		return nil
 	}
 	out = append(out, from.Header...)
+	// Pad to C struct size
 	out = append(out, bytes.Repeat([]byte{0x00}, maxHeaderLen-len(from.Header))...)
 	return out
 }
@@ -312,11 +314,14 @@ func getNeighborMAC(n *netlink.Handle, linkIndex int, ip net.IP) (net.HardwareAd
 	return nil, errors.New("missing ARP entry")
 }
 
-// TODO no reason to pass in both net.udpaddr and addr.Addr, but the latter does not include the port
-func prepareHeader(path PathMeta, etherLen int, srcUDP, dstUDP net.UDPAddr, srcAddr, dstAddr addr.Addr) HerculesPathHeader {
-	iface := path.iface
-	dstMAC, srcMAC, err := getAddrs(iface, path.path.UnderlayNextHop().IP)
-	fmt.Println(dstMAC, srcMAC, err)
+// XXX no reason to pass in both net.udpaddr and addr.Addr, but the latter does not include the port
+// Serialize the header into its on-wire format
+func prepareHeader(path PathMeta, payloadLen int, srcUDP, dstUDP net.UDPAddr, srcAddr, dstAddr addr.Addr) (HerculesPathHeader, error) {
+	dstMAC, srcMAC, err := getAddrs(path.iface, path.path.UnderlayNextHop().IP)
+
+	// We need to know the final size of packets to fill the length fields in the IP/UDP headers
+	underlayHeaderLen, scionHdrLen := getPathHeaderlen(path.path)
+	etherLen := underlayHeaderLen + scionHdrLen + payloadLen
 
 	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcUDP.IP, path.path.UnderlayNextHop().IP, uint16(path.path.UnderlayNextHop().Port), etherLen)
 	fmt.Println(underlayHeader, err)
@@ -324,7 +329,7 @@ func prepareHeader(path PathMeta, etherLen int, srcUDP, dstUDP net.UDPAddr, srcA
 	payload := snet.UDPPayload{
 		SrcPort: srcUDP.AddrPort().Port(),
 		DstPort: dstUDP.AddrPort().Port(),
-		Payload: nil,
+		Payload: make([]byte, payloadLen),
 	}
 
 	destPkt := &snet.Packet{
@@ -337,23 +342,55 @@ func prepareHeader(path PathMeta, etherLen int, srcUDP, dstUDP net.UDPAddr, srcA
 	}
 
 	if err = destPkt.Serialize(); err != nil {
-		fmt.Println("serializer err")
+		return HerculesPathHeader{}, err
 	}
-	scionHeaderLen := len(destPkt.Bytes)
-	payloadLen := etherLen - len(underlayHeader) - scionHeaderLen
-	payload.Payload = make([]byte, payloadLen)
-	destPkt.Payload = payload
 
-	if err = destPkt.Serialize(); err != nil {
-		fmt.Println("serrializer err2")
-	}
+	scionHeaderLen := len(destPkt.Bytes) - payloadLen
 	scionHeader := destPkt.Bytes[:scionHeaderLen]
 	scionChecksum := binary.BigEndian.Uint16(scionHeader[scionHeaderLen-2:])
 	headerBuf := append(underlayHeader, scionHeader...)
+
 	herculesPath := HerculesPathHeader{
 		Header:          headerBuf,
 		PartialChecksum: scionChecksum,
 	}
-	fmt.Println(herculesPath)
-	return herculesPath
+	return herculesPath, nil
+}
+
+// XXX Is there a nicer way to get the header's on-wire length than serialising it?
+// Return the path's underlay and scion header length by creating a bogus packet.
+func getPathHeaderlen(path snet.Path) (int, int) {
+	nilMAC := []byte{0, 0, 0, 0, 0, 0}
+	nilIP :=  []byte{0,0,0,0}
+	underlayHeader, err := prepareUnderlayPacketHeader(nilMAC, nilMAC, nilIP, path.UnderlayNextHop().IP, uint16(path.UnderlayNextHop().Port), 9000)
+	if err != nil {
+		return 0, 0
+	}
+
+	payload := snet.UDPPayload{
+		SrcPort: 0,
+		DstPort: 0,
+		Payload: nil,
+	}
+
+	nilAddr := addr.Addr{
+		IA:   0,
+		Host: addr.MustParseHost("0.0.0.0"),
+	}
+	destPkt := &snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Destination: nilAddr,
+			Source:      nilAddr,
+			Path:        path.Dataplane(),
+			Payload:     payload,
+		},
+	}
+
+	if err = destPkt.Serialize(); err != nil {
+		fmt.Println("serializer err", err)
+		return 0,0
+	}
+	fmt.Println("Header length: ", len(destPkt.Bytes))
+	fmt.Println("Underlay Header length: ", len(underlayHeader))
+	return len(underlayHeader), len(destPkt.Bytes)
 }

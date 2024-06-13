@@ -3,7 +3,7 @@ TARGET_SERVER := runHercules
 TARGET_MONITOR := runMonitor
 
 CC := gcc
-CFLAGS = -O3 -std=gnu11 -D_GNU_SOURCE
+CFLAGS = -O0 -std=gnu11 -D_GNU_SOURCE
 # CFLAGS += -Wall -Wextra
 # for debugging:
 CFLAGS += -g3 -DDEBUG

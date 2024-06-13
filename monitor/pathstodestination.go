@@ -28,21 +28,18 @@ import (
 var GlobalQuerier snet.PathQuerier
 
 type PathsToDestination struct {
-	pm             *PathManager
-	dst            *Destination
-	allPaths       []snet.Path
-	paths          []PathMeta // nil indicates that the destination is in the same AS as the sender and we can use an empty path
-	canSendLocally bool // (only if destination in same AS) indicates if we can send packets
+	pm    *PathManager
+	dst   *Destination
+	paths []PathMeta // Paths to use for sending
 }
 
 type PathMeta struct {
-	path        snet.Path
-	fingerprint snet.PathFingerprint
-	iface       *net.Interface
-	enabled     bool // Indicates whether this path can be used at the moment
-	updated     bool // Indicates whether this path needs to be synced to the C path
+	path    snet.Path
+	iface   *net.Interface
+	enabled bool // Indicates whether this path can be used at the moment
 }
 
+// Packet header (including lower-level headers) as used by the C part
 type HerculesPathHeader struct {
 	Header          []byte //!< C.HERCULES_MAX_HEADERLEN bytes
 	PartialChecksum uint16 //SCION L4 checksum over header with 0 payload
@@ -54,47 +51,35 @@ func initNewPathsToDestinationWithEmptyPath(pm *PathManager, dst *Destination) *
 		Port: topology.EndhostPort,
 	}
 	return &PathsToDestination{
-		pm:         pm,
-		dst:        dst,
-		paths:      make([]PathMeta, 1),
+		pm:    pm,
+		dst:   dst,
+		paths: make([]PathMeta, 1),
 	}
 }
 
-func initNewPathsToDestination(pm *PathManager, src *snet.UDPAddr, dst *Destination) (*PathsToDestination, error) {
+func initNewPathsToDestination(pm *PathManager, dst *Destination) (*PathsToDestination, error) {
 	return &PathsToDestination{
-		pm:         pm,
-		dst:        dst,
-		allPaths:   nil,
-		paths:      make([]PathMeta, dst.numPaths),
+		pm:    pm,
+		dst:   dst,
+		paths: make([]PathMeta, dst.numPaths),
 	}, nil
-}
-
-func (ptd *PathsToDestination) hasUsablePaths() bool {
-	if ptd.paths == nil {
-		return ptd.canSendLocally
-	}
-	for _, path := range ptd.paths {
-		if path.enabled {
-			return true
-		}
-	}
-	return false
 }
 
 func (ptd *PathsToDestination) choosePaths() bool {
 	var err error
-	ptd.allPaths, err = GlobalQuerier.Query(context.Background(), ptd.dst.hostAddr.IA)
+	allPaths, err := GlobalQuerier.Query(context.Background(), ptd.dst.hostAddr.IA)
 	if err != nil {
 		fmt.Println("Error querying paths:", err)
 		return false
 	}
 
-	if ptd.allPaths == nil {
+	if allPaths == nil {
 		return false
 	}
 
-	if ptd.allPaths[0].UnderlayNextHop() == nil {
-		ptd.allPaths[0] = path.Path{
+	// This is a transfer within the same AS, use empty path
+	if allPaths[0].UnderlayNextHop() == nil {
+		allPaths[0] = path.Path{
 			Src:           ptd.pm.src.IA,
 			Dst:           ptd.dst.hostAddr.IA,
 			DataplanePath: path.Empty{},
@@ -102,32 +87,33 @@ func (ptd *PathsToDestination) choosePaths() bool {
 		}
 	}
 
-	availablePaths := ptd.pm.filterPathsByActiveInterfaces(ptd.allPaths)
-	if len(availablePaths) == 0 {
-		log.Error(fmt.Sprintf("no paths to destination %s", ptd.dst.hostAddr.IA.String()))
-	}
+	// Restrict to paths that use one of the specified interfaces
+	availablePaths := ptd.pm.filterPathsByActiveInterfaces(allPaths)
 
-	if ptd.pm.mtu != 0 {
-		// MTU fixed by a previous path lookup, we need to pick paths compatible with it
+	if ptd.pm.payloadLen != 0 {
+		// Chunk length fixed by a previous path lookup, we need to pick paths compatible with it
 		availablePaths = ptd.pm.filterPathsByMTU(availablePaths)
 	}
+	if len(availablePaths) == 0 {
+		log.Error(fmt.Sprintf("no paths to destination %s", ptd.dst.hostAddr.IA.String()))
+		return false
+	}
 
-	// TODO Ensure this still does the right thing when the number of paths decreases (how to test?)
 	ptd.chooseNewPaths(availablePaths)
 
-	if ptd.pm.mtu == 0{
-		// No MTU set yet, we set it to the maximum that all selected paths and interfaces support
-		minMTU := HerculesMaxPktsize
+	if ptd.pm.payloadLen == 0 {
+		// No payloadlen set yet, we set it to the maximum that all selected paths support
+		maxPayloadlen := HerculesMaxPktsize
 		for _, path := range ptd.paths {
-			if path.path.Metadata().MTU < uint16(minMTU){
-				minMTU = int(path.path.Metadata().MTU)
-			}
-			if path.iface.MTU < minMTU {
-				minMTU = path.iface.MTU
-			}
+			pathMTU := int(path.path.Metadata().MTU)
+			underlayHeaderLen, scionHeaderLen := getPathHeaderlen(path.path)
+			pathPayloadlen := pathMTU - scionHeaderLen
+			maxPayloadlen = min(maxPayloadlen, pathPayloadlen)
+			// Cap to Hercules' max pkt size
+			maxPayloadlen = min(maxPayloadlen, HerculesMaxPktsize-scionHeaderLen-underlayHeaderLen)
 		}
-		ptd.pm.mtu = minMTU
-		ptd.pm.mtu = 1200 // FIXME temp
+		ptd.pm.payloadLen = maxPayloadlen
+		fmt.Println("Set chunk length to", ptd.pm.payloadLen)
 	}
 
 	return true
@@ -163,15 +149,19 @@ func (ptd *PathsToDestination) chooseNewPaths(availablePaths []PathWithInterface
 	}
 
 	log.Info(fmt.Sprintf("[Destination %s] using %d paths:", ptd.dst.hostAddr.IA, len(pathSet)))
-	if (len(pathSet) == 0){
+	if len(pathSet) == 0 {
 		ptd.paths = []PathMeta{}
 		return false
+	}
+	for i, _ := range ptd.paths {
+		// Ensures unused paths slots are not accidentally marked enabled if
+		// the number of paths has decreased since the last time
+		ptd.paths[i].enabled = false
 	}
 	for i, path := range pathSet {
 		log.Info(fmt.Sprintf("\t%s", path.path))
 		ptd.paths[i].path = path.path
 		ptd.paths[i].enabled = true
-		ptd.paths[i].updated = true
 		ptd.paths[i].iface = path.iface
 		updated = true
 	}

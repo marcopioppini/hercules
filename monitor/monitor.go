@@ -39,8 +39,13 @@ func headersToDestination(transfer HerculesTransfer) (int, []byte) {
 	numSelectedPaths := len(enabledPaths)
 	headers_ser := []byte{}
 	for _, p := range enabledPaths {
-		preparedHeader := prepareHeader(p, transfer.pm.mtu, *transfer.pm.src.Host, *transfer.dest.Host, srcA, dstA)
-		serializedHeader := SerializePath(&preparedHeader, p.iface.Index, C.HERCULES_MAX_HEADERLEN)
+		preparedHeader, err := prepareHeader(p, transfer.pm.payloadLen, *transfer.pm.src.Host, *transfer.dest.Host, srcA, dstA)
+		if err != nil {
+			fmt.Println("Error preparing header!", err)
+			numSelectedPaths--
+			continue
+		}
+		serializedHeader := SerializePathHeader(&preparedHeader, p.iface.Index, C.HERCULES_MAX_HEADERLEN)
 		if serializedHeader == nil {
 			fmt.Printf("Unable to serialize header for path: %v\n", p.path)
 			numSelectedPaths--
@@ -85,7 +90,6 @@ var nextID int = 1 // ID to use for the next transfer
 // These are needed by the HTTP handlers
 var listenAddress *snet.UDPAddr
 var activeInterfaces []*net.Interface
-
 var pathRules PathRules
 
 func main() {
@@ -95,12 +99,7 @@ func main() {
 
 	var config MonitorConfig
 	config, pathRules = readConfig(configFile)
-	fmt.Println(config)
 
-	if config.ListenAddress.addr.Host.Port == 0 {
-		fmt.Println("No listening port specified")
-		os.Exit(1)
-	}
 	listenAddress = config.ListenAddress.addr
 
 	GlobalQuerier = newPathQuerier() // TODO can the connection time out or break?
@@ -148,27 +147,30 @@ func main() {
 		n, a, err := usock.ReadFromUnix(buf)
 		if err != nil {
 			fmt.Println("Error reading from socket!", err)
+			os.Exit(1)
 		}
 		if n > 0 {
 			msgtype := binary.LittleEndian.Uint16(buf[:2])
 			buf = buf[2:]
 			switch msgtype {
+
 			case C.SOCKMSG_TYPE_GET_REPLY_PATH:
 				sample_len := binary.LittleEndian.Uint16(buf[:2])
 				buf = buf[2:]
 				etherlen := binary.LittleEndian.Uint16(buf[:2])
 				buf = buf[2:]
+				fmt.Println("sampel len, etherlen", sample_len, etherlen)
 				replyPath, nextHop, err := getReplyPathHeader(buf[:sample_len], int(etherlen))
 				fmt.Println(err) // TODO signal error to server?
 				iface, _ := pm.interfaceForRoute(nextHop)
-				b := SerializePath(replyPath, iface.Index, C.HERCULES_MAX_HEADERLEN)
+				b := SerializePathHeader(replyPath, iface.Index, C.HERCULES_MAX_HEADERLEN)
 				usock.WriteToUnix(b, a)
 
 			case C.SOCKMSG_TYPE_GET_NEW_JOB:
 				transfersLock.Lock()
 				var selectedJob *HerculesTransfer = nil
 				for _, job := range transfers {
-					if job.status == 0 {
+					if job.status == Queued {
 						selectedJob = job
 						job.status = Submitted
 						break
@@ -182,7 +184,7 @@ func main() {
 					strlen := len(selectedJob.file)
 					b = append(b, 1)
 					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.id))
-					b = binary.LittleEndian.AppendUint16(b, uint16(1200)) // FIXME
+					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.pm.payloadLen))
 					b = binary.LittleEndian.AppendUint16(b, uint16(strlen))
 					b = append(b, []byte(selectedJob.file)...)
 				} else {

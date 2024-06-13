@@ -118,6 +118,11 @@ func readConfig(configFile string) (MonitorConfig, PathRules) {
 		os.Exit(1)
 	}
 
+	if config.ListenAddress.addr.Host.Port == 0 {
+		fmt.Println("No listening port specified")
+		os.Exit(1)
+	}
+
 	if len(config.Interfaces) == 0 {
 		fmt.Println("Error: No interfaces specified")
 		os.Exit(1)
