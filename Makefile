@@ -7,6 +7,7 @@ CFLAGS = -O0 -std=gnu11 -D_GNU_SOURCE
 # CFLAGS += -Wall -Wextra
 # for debugging:
 # ASAN_FLAG := -fsanitize=address,leak,undefined,pointer-compare,pointer-subtract
+ASAN_FLAG := -fsanitize=address
 CFLAGS += -g3 -DDEBUG $(ASAN_FLAG)
 # CFLAGS += -DDEBUG_PRINT_PKTS # print received/sent packets
 # CFLAGS += -DPRINT_STATS

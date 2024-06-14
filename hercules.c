@@ -685,9 +685,9 @@ static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx,
 	void *rbudp_seqnr = mempcpy(rbudp_path_idx, &path_idx, sizeof(path_idx));
 	void *rbudp_payload = mempcpy(rbudp_seqnr, &seqnr, sizeof(seqnr));
 	void *start_pad = mempcpy(rbudp_payload, data, n);
-	if (sizeof(chunk_idx) + sizeof(path_idx) + n < payloadlen) {
+	if (rbudp_headerlen + n < payloadlen) {
 		memset(start_pad, 0,
-			   payloadlen - sizeof(chunk_idx) - sizeof(path_idx) - n);
+			   payloadlen - rbudp_headerlen - n);
 	}
 	debug_print_rbudp_pkt(rbudp_pkt, false);
 }
