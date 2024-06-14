@@ -38,7 +38,7 @@ int xsk_map__add_xsk(struct hercules_server *server, xskmap map, int index,
 					 struct xsk_socket_info *xsk);
 
 int load_xsk_redirect_userspace(struct hercules_server *server,
-								struct rx_p_args *args[], int num_threads);
+								struct worker_args *args[], int num_threads);
 
 int xdp_setup(struct hercules_server *server);
 

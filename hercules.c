@@ -302,7 +302,7 @@ struct hercules_server *hercules_init_server(
 	server->n_threads = n_threads;
 	server->session_rx = NULL;
 	server->session_tx = NULL;
-	server->worker_args = calloc(server->n_threads, sizeof(struct rx_p_args *));
+	server->worker_args = calloc(server->n_threads, sizeof(struct worker_args *));
 	if (server->worker_args == NULL){
 		exit_with_error(NULL, ENOMEM);
 	}
@@ -706,6 +706,14 @@ static bool rbudp_check_initial(struct hercules_control_packet *pkt, size_t len,
 	}
 	*parsed_pkt = &pkt->payload.initial;
 	return true;
+}
+
+// Load the pathset currently in use and publish its epoch so the freeing thread
+// knows when it's safe to free
+static struct path_set *pathset_read(struct sender_state *tx_state, u32 id) {
+	struct path_set *pathset = atomic_load(&tx_state->pathset);
+	atomic_store(&tx_state->epochs[id].epoch, pathset->epoch);
+	return pathset;
 }
 
 /// RECEIVER
@@ -1362,26 +1370,27 @@ static void rate_limit_tx(struct sender_state *tx_state)
 	tx_state->prev_tx_npkts_queued = tx_state->tx_npkts_queued;
 }
 
-void send_path_handshakes(struct hercules_server *server, struct sender_state *tx_state) {
-  u64 now = get_nsecs();
-
-  struct path_set *pathset = tx_state->pathset;
-  for (u32 p = 0; p < pathset->n_paths; p++) {
-    struct hercules_path *path = &pathset->paths[p];
-    if (path->enabled) {
-      u64 handshake_at = atomic_load(&path->next_handshake_at);
-      if (handshake_at < now) {
-        if (atomic_compare_exchange_strong(&path->next_handshake_at,
-                                           &handshake_at,
-                                           now + PATH_HANDSHAKE_TIMEOUT_NS)) {
-          debug_printf("sending hs on path %d", p);
-		  // FIXME file name below?
-		  tx_send_initial(server, path, "abcd", tx_state->filesize,
-						  tx_state->chunklen, get_nsecs(), p, false, false);
+void send_path_handshakes(struct hercules_server *server,
+						  struct sender_state *tx_state,
+						  struct path_set *pathset) {
+	u64 now = get_nsecs();
+	for (u32 p = 0; p < pathset->n_paths; p++) {
+		struct hercules_path *path = &pathset->paths[p];
+		if (path->enabled) {
+			u64 handshake_at = atomic_load(&path->next_handshake_at);
+			if (handshake_at < now) {
+				if (atomic_compare_exchange_strong(
+						&path->next_handshake_at, &handshake_at,
+						now + PATH_HANDSHAKE_TIMEOUT_NS)) {
+					debug_printf("sending hs on path %d", p);
+					// FIXME file name below?
+					tx_send_initial(server, path, "abcd", tx_state->filesize,
+									tx_state->chunklen, get_nsecs(), p, false,
+									false);
+				}
+			}
 		}
-	  }
-    }
-  }
+	}
 }
 
 static void claim_tx_frames(struct hercules_server *server, struct hercules_interface *iface, u64 *addrs, size_t num_frames)
@@ -1422,12 +1431,12 @@ static char *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_id
 static short flowIdCtr = 0;
 #endif
 
-static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_state, struct xsk_socket_info *xsk,
-													   int ifid, u64 frame_addrs[SEND_QUEUE_ENTRIES_PER_UNIT],
-													   struct send_queue_unit *unit)
-{
+static inline void tx_handle_send_queue_unit_for_iface(
+	struct sender_state *tx_state, struct xsk_socket_info *xsk, int ifid,
+	u64 frame_addrs[SEND_QUEUE_ENTRIES_PER_UNIT], struct send_queue_unit *unit,
+	u32 thread_id) {
 	u32 num_chunks_in_unit = 0;
-	struct path_set *pathset = tx_state->pathset;
+	struct path_set *pathset = pathset_read(tx_state, thread_id);
 	for(u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++) {
 		if(unit->paths[i] == UINT8_MAX) {
 			break;
@@ -1483,11 +1492,11 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 
 static inline void tx_handle_send_queue_unit(struct hercules_server *server, struct sender_state *tx_state, struct xsk_socket_info *xsks[],
 											 u64 frame_addrs[][SEND_QUEUE_ENTRIES_PER_UNIT],
-											 struct send_queue_unit *unit)
+											 struct send_queue_unit *unit, u32 thread_id)
 {
 
 	for(int i = 0; i < server->num_ifaces; i++) {
-		tx_handle_send_queue_unit_for_iface(tx_state, xsks[i], server->ifaces[i].ifid, frame_addrs[i], unit);
+		tx_handle_send_queue_unit_for_iface(tx_state, xsks[i], server->ifaces[i].ifid, frame_addrs[i], unit, thread_id);
 	}
 }
 
@@ -1542,12 +1551,10 @@ static inline void allocate_tx_frames(struct hercules_server *server,
 }
 
 // Compute rate limit for the path currently marked active
-static u32 compute_max_chunks_current_path(struct sender_state *tx_state) {
+static u32 compute_max_chunks_current_path(struct sender_state *tx_state, struct path_set *pathset) {
 	u32 allowed_chunks = 0;
 	u64 now = get_nsecs();
 
-	// TODO pass in pathset instead? (atomics/free)
-	struct path_set *pathset = tx_state->pathset;
 	// TODO make sure path_index is reset correctly on pathset change
 	struct hercules_path *path = &pathset->paths[pathset->path_index];
 	if (!path->enabled) {
@@ -1586,8 +1593,7 @@ static inline void prepare_rcvr_paths(struct sender_state *tx_state, u8 *rcvr_pa
 }
 
 // Mark the next available path as active
-static void iterate_paths(struct sender_state *tx_state) {
-	struct path_set *pathset = tx_state->pathset;
+static void iterate_paths(struct sender_state *tx_state, struct path_set *pathset) {
 	if (pathset->n_paths == 0) {
 		return;
 	}
@@ -1603,18 +1609,16 @@ static void iterate_paths(struct sender_state *tx_state) {
 			 pathset->path_index != prev_path_index);
 }
 
-static void terminate_cc(const struct sender_state *tx_state) {
-	struct path_set *pathset = tx_state->pathset;
+static void terminate_cc(struct path_set *pathset) {
 	for (u32 i = 0; i < pathset->n_paths; i++) {
 		terminate_ccontrol(pathset->paths[i].cc_state);
 	}
 }
 
-static void kick_cc(struct sender_state *tx_state) {
+static void kick_cc(struct sender_state *tx_state, struct path_set *pathset) {
 	if (tx_state->finished) {
 		return;
 	}
-	struct path_set *pathset = tx_state->pathset;
 	for (u32 p = 0; p < pathset->n_paths; p++) {
 		kick_ccontrol(pathset->paths[p].cc_state);
 	}
@@ -1678,7 +1682,7 @@ static struct sender_state *init_tx_state(struct hercules_session *session,
 										  const struct hercules_app_addr *dests,
 										  struct hercules_path *paths,
 										  u32 num_dests, const int num_paths,
-										  u32 max_paths_per_dest) {
+										  u32 max_paths_per_dest, u32 num_threads) {
 	u64 total_chunks = (filesize + chunklen - 1) / chunklen;
 	if (total_chunks >= UINT_MAX) {
 		fprintf(stderr,
@@ -1712,6 +1716,17 @@ static struct sender_state *init_tx_state(struct hercules_session *session,
 	memcpy(pathset->paths, paths, sizeof(*paths)*num_paths);
 	tx_state->pathset = pathset;
 	tx_state->session->peer = *dests;
+
+	// tx_p uses index 0, tx_send_p threads start at index 1
+	int err = posix_memalign((void **)&tx_state->epochs, CACHELINE_SIZE,
+							 sizeof(*tx_state->epochs)*(num_threads+1));
+	if (err != 0) {
+		free(pathset);
+		free(tx_state);
+		return NULL;
+	}
+	memset(tx_state->epochs, 0, sizeof(*tx_state->epochs) * (num_threads + 1));
+	tx_state->next_epoch = 1;
 	return tx_state;
 }
 
@@ -1996,15 +2011,11 @@ static inline bool pcc_has_active_mi(struct ccontrol_state *cc_state, u64 now)
 }
 
 /// WORKER THREADS
-struct tx_send_p_args {
-	struct hercules_server *server;
-	struct xsk_socket_info *xsks[];
-};
 
 // Read chunk ids from the send queue, fill in packets accorindgly and actually
 // send them. This is the function run by the TX worker thread(s).
 static void tx_send_p(void *arg) {
-	struct tx_send_p_args *args = arg;
+	struct worker_args *args = arg;
 	struct hercules_server *server = args->server;
 	while (1) {
 		struct hercules_session *session_tx = atomic_load(&server->session_tx);
@@ -2039,7 +2050,7 @@ static void tx_send_p(void *arg) {
 		}
 		allocate_tx_frames(server, frame_addrs);
 		tx_handle_send_queue_unit(server, session_tx->tx_state, args->xsks,
-								  frame_addrs, &unit);
+								  frame_addrs, &unit, args->id);
 	}
 }
 
@@ -2102,7 +2113,7 @@ static void rx_trickle_nacks(void *arg) {
 
 // Receive data packets on the XDP sockets. Runs in the RX worker thread(s).
 static void rx_p(void *arg) {
-	struct rx_p_args *args = arg;
+	struct worker_args *args = arg;
 	struct hercules_server *server = args->server;
 	int num_ifaces = server->num_ifaces;
 	u32 i = 0;
@@ -2160,20 +2171,21 @@ static void *tx_p(void *arg) {
     if (session_tx != NULL &&
         atomic_load(&session_tx->state) == SESSION_STATE_RUNNING) {
       struct sender_state *tx_state = session_tx->tx_state;
+	  struct path_set *pathset = pathset_read(tx_state, 0);
       /* debug_printf("Start transmit round"); */
       tx_state->prev_rate_check = get_nsecs();
 
       pop_completion_rings(server);
-      send_path_handshakes(server, tx_state);
+      send_path_handshakes(server, tx_state, pathset);
       u64 next_ack_due = 0;
 
       // in each iteration, we send packets on a single path to each receiver
       // collect the rate limits for each active path
-      u32 allowed_chunks = compute_max_chunks_current_path(tx_state);
+      u32 allowed_chunks = compute_max_chunks_current_path(tx_state, pathset);
 
       if (allowed_chunks ==
           0) { // we hit the rate limits on every path; switch paths
-        iterate_paths(tx_state);
+        iterate_paths(tx_state, pathset);
         continue;
       }
 
@@ -2193,8 +2205,8 @@ static void *tx_p(void *arg) {
             &ack_due, allowed_chunks);
         num_chunks += cur_num_chunks;
         if (tx_state->finished) {
-            terminate_cc(tx_state);
-            kick_cc(tx_state);
+            terminate_cc(pathset);
+            kick_cc(tx_state, pathset);
         } else {
           // only wait for the nearest ack
           if (next_ack_due) {
@@ -2216,7 +2228,6 @@ static void *tx_p(void *arg) {
         rate_limit_tx(tx_state);
 
         // update book-keeping
-        struct path_set *pathset = tx_state->pathset;
         u32 path_idx = pathset->path_index;
           struct ccontrol_state *cc_state = pathset->paths[path_idx].cc_state;
 		  if (cc_state != NULL) {
@@ -2230,7 +2241,7 @@ static void *tx_p(void *arg) {
 		  }
 	  }
 
-	  iterate_paths(tx_state);
+	  iterate_paths(tx_state, pathset);
 
       if (now < next_ack_due) {
         // XXX if the session vanishes in the meantime, we might wait
@@ -2300,7 +2311,7 @@ static void new_tx_if_available(struct hercules_server *server) {
 	struct sender_state *tx_state = init_tx_state(
 		session, filesize, chunklen, server->rate_limit, mem,
 		&session->peer, paths, 1, n_paths,
-		server->max_paths);
+		server->max_paths, server->n_threads);
 	strncpy(tx_state->filename, fname, 99);
 	session->tx_state = tx_state;
 	atomic_store(&server->session_tx, session);
@@ -2392,13 +2403,26 @@ static void tx_update_paths(struct hercules_server *server) {
 		}
 		struct path_set *new_pathset = calloc(1, sizeof(*new_pathset));
 		if (new_pathset == NULL) {
+			// FIXME leak?
 			return;
 		}
+		u32 new_epoch = tx_state->next_epoch;
+		new_pathset->epoch = new_epoch;
+		tx_state->next_epoch++;
 		new_pathset->n_paths = n_paths;
 		memcpy(new_pathset->paths, paths, sizeof(*paths) * n_paths);
 		u32 path_lim =
 			(old_pathset->n_paths > (u32)n_paths) ? (u32)n_paths : old_pathset->n_paths;
 		bool replaced_return_path = false;
+		struct ccontrol_state **replaced_cc =
+			calloc(old_pathset->n_paths, sizeof(*replaced_cc));
+		if (replaced_cc == NULL) {
+			// FIXME leak?
+			return;
+		}
+		for (u32 i = 0; i < old_pathset->n_paths; i++) {
+			replaced_cc[i] = old_pathset->paths[i].cc_state;
+		}
 		for (u32 i = 0; i < path_lim; i++) {
 			// Set these two values before the comparison or it would fail even
 			// if paths are the same.
@@ -2406,11 +2430,16 @@ static void tx_update_paths(struct hercules_server *server) {
 				old_pathset->paths[i].next_handshake_at;
 			new_pathset->paths[i].cc_state = old_pathset->paths[i].cc_state;
 
+			// XXX This works, but it means we restart CC even if the path has
+			// not changed (but the header has, eg. because the old one
+			// expired). We could avoid this by having the monitor tell us
+			// whether the path changed, as it used to.
 			if (memcmp(&old_pathset->paths[i], &new_pathset->paths[i],
 					   sizeof(struct hercules_path)) == 0) {
 				// Old and new path are the same, CC state carries over.
 				// Since we copied the CC state before just leave as-is.
 				debug_printf("Path %d not changed", i);
+				replaced_cc[i] = NULL;
 			} else {
 				debug_printf("Path %d changed, resetting CC", i);
 				if (i == 0) {
@@ -2440,12 +2469,20 @@ static void tx_update_paths(struct hercules_server *server) {
 		}
 		// Finally, swap in the new pathset
 		tx_state->pathset = new_pathset;
-		free(paths); // These were *copied* into the new pathset
-		// TODO when it's safe (when?), free:
-		// - the old pathset
-		// - its cc states that were not carried over
-		// - ! If we have fewer paths in the new set than in the old one don't
-		// forget to free ALL old states
+		free(paths);  // These were *copied* into the new pathset
+		for (int i = 0; i < server->n_threads + 1; i++) {
+			do {
+				// Wait until the thread has seen the new pathset
+			} while (tx_state->epochs[i].epoch != new_epoch);
+		}
+		for (u32 i = 0; i < old_pathset->n_paths; i++) {
+			// If CC was replaced, this contains the pointer to the old CC
+			// state. Otherwise it contains NULL, and we don't need to free
+			// anything.
+			free(replaced_cc[i]);
+		}
+		free(replaced_cc);
+		free(old_pathset);
 	}
 }
 
@@ -2549,8 +2586,9 @@ static void events_p(void *arg) {
 		/* 	tx_update_paths(server); */
 		/* 	lastpoll = now; */
 		/* } */
-		if (now > lastpoll + 2e9){
+		if (now > lastpoll + 3e9){
 			tx_update_monitor(server, now);
+			tx_update_paths(server);
 			lastpoll = now;
 		}
 		/* 	lastpoll = now; */

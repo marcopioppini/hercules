@@ -6,10 +6,11 @@ CC := gcc
 CFLAGS = -O0 -std=gnu11 -D_GNU_SOURCE
 # CFLAGS += -Wall -Wextra
 # for debugging:
-CFLAGS += -g3 -DDEBUG
+# ASAN_FLAG := -fsanitize=address,leak,undefined,pointer-compare,pointer-subtract
+CFLAGS += -g3 -DDEBUG $(ASAN_FLAG)
 # CFLAGS += -DDEBUG_PRINT_PKTS # print received/sent packets
 # CFLAGS += -DPRINT_STATS
-LDFLAGS = -lbpf -Lbpf/src -lm -lelf -pthread -lz -z noexecstack
+LDFLAGS = -lbpf -Lbpf/src -lm -lelf -pthread -lz -z noexecstack $(ASAN_FLAG)
 DEPFLAGS:=-MP -MD
 
 SRCS := $(wildcard *.c)

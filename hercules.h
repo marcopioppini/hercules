@@ -52,8 +52,8 @@ struct hercules_path {
 	int framelen;  //!< length of ethernet frame; headerlen + payloadlen
 	int ifid;	   // Interface to use for sending
 	struct hercules_path_header header;
-	atomic_bool enabled;  // e.g. when a path has been revoked and no
-						  // replacement is available, this will be set to false
+	atomic_bool enabled;  // Paths can be disabled, e.g. in response to
+						  // receiving SCMP errors
 	struct ccontrol_state *cc_state;  // This path's PCC state
 };
 
@@ -100,10 +100,18 @@ struct receiver_state {
 
 // Used to atomically swap in new paths
 struct path_set {
+	u64 epoch;
 	u32 n_paths;
 	u8 path_index;	// Path to use for sending next batch (used by tx_p)
 	struct hercules_path paths[256];
 };
+
+struct thread_epoch {
+	_Atomic u64 epoch;
+	u64 _[7];
+};
+_Static_assert(sizeof(struct thread_epoch) == 64,
+			   "struct thread_epoch must be cacheline-sized");
 
 struct sender_state {
 	struct hercules_session *session;
@@ -123,6 +131,10 @@ struct sender_state {
 	atomic_uint_least64_t handshake_rtt;  // Handshake RTT in ns
 
 	struct path_set *_Atomic pathset;  // Paths currently in use
+	struct thread_epoch
+		*epochs;	 // Used for threads to publish their current pathset epoch
+	u32 next_epoch;	 // Used by the thread updating the pathsets
+
 	/** Filesize in bytes */
 	size_t filesize;
 	char filename[100];
@@ -216,8 +228,8 @@ struct hercules_server {
 	int usock;			 // Unix socket used for communication with the monitor
 	int max_paths;
 	int rate_limit;
-	int n_threads;					 // Number of RX/TX worker threads
-	struct rx_p_args **worker_args;	 // Args passed to RX workers
+	int n_threads;					   // Number of RX/TX worker threads
+	struct worker_args **worker_args;  // Args passed to RX/TX workers
 
 	struct hercules_session *_Atomic session_tx;  // Current TX session
 	struct hercules_session *deferred_tx;  // Previous TX session, no longer
@@ -255,7 +267,8 @@ struct xsk_socket_info {
 typedef int xskmap;
 
 /// Thread args
-struct rx_p_args {
+struct worker_args {
+	u32 id;
 	struct hercules_server *server;
 	struct xsk_socket_info *xsks[];
 };

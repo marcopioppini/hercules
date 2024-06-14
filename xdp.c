@@ -249,7 +249,7 @@ int xsk_map__add_xsk(struct hercules_server *server, xskmap map, int index,
  * Load a BPF program redirecting IP traffic to the XSK.
  */
 int load_xsk_redirect_userspace(struct hercules_server *server,
-								struct rx_p_args *args[], int num_threads) {
+								struct worker_args *args[], int num_threads) {
 	debug_printf("Loading XDP program for redirection");
 	for (int i = 0; i < server->num_ifaces; i++) {
 		struct bpf_object *obj;
@@ -353,12 +353,13 @@ int xdp_setup(struct hercules_server *server) {
 	}
 	for (int t = 0; t < server->n_threads; t++) {
 		server->worker_args[t] =
-			malloc(sizeof(*server->worker_args) +
+			malloc(sizeof(**server->worker_args) +
 				   server->num_ifaces * sizeof(*server->worker_args[t]->xsks));
 		if (server->worker_args[t] == NULL) {
 			return ENOMEM;
 		}
 		server->worker_args[t]->server = server;
+		server->worker_args[t]->id = t+1;
 		for (int i = 0; i < server->num_ifaces; i++) {
 			server->worker_args[t]->xsks[i] = server->ifaces[i].xsks[t];
 		}
