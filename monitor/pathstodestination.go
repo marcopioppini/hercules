@@ -126,7 +126,7 @@ func (ptd *PathsToDestination) choosePaths() bool {
 			}
 		}
 		ptd.pm.payloadLen = maxPayloadlen
-		fmt.Println("Set chunk length to", ptd.pm.payloadLen)
+		fmt.Println("Set payload length to", ptd.pm.payloadLen)
 	}
 
 	return true

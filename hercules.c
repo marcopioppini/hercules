@@ -175,12 +175,11 @@ void debug_print_rbudp_pkt(const char *pkt, bool recv) {
 				printf(
 					"%s   HS: Filesize %llu, Chunklen %u, TS %llu, Path idx "
 					"%u, Flags "
-					"0x%x, MTU %d, Name length %u [%s]\n",
+					"0x%x, Name length %u [%s]\n",
 					prefix, cp->payload.initial.filesize,
 					cp->payload.initial.chunklen, cp->payload.initial.timestamp,
 					cp->payload.initial.path_index, cp->payload.initial.flags,
-					cp->payload.initial.etherlen, cp->payload.initial.name_len,
-					cp->payload.initial.name);
+					cp->payload.initial.name_len, cp->payload.initial.name);
 				break;
 			case CONTROL_PACKET_TYPE_ACK:
 				printf("%s   ACK (%d) ", prefix, cp->payload.ack.num_acks);
@@ -978,7 +977,7 @@ static struct receiver_state *make_rx_state(struct hercules_session *session,
 }
 
 // Update the reply path using the header from a received packet.
-// The packet is sent to the monior, which will return a new header with the
+// The packet is sent to the monitor, which will return a new header with the
 // path reversed.
 static bool rx_update_reply_path(
 	struct hercules_server *server, struct receiver_state *rx_state, int ifid,
@@ -1048,14 +1047,16 @@ static void rx_handle_initial(struct hercules_server *server,
 							  struct receiver_state *rx_state,
 							  struct rbudp_initial_pkt *initial,
 							  const char *buf, int ifid, const char *payload,
-							  int payloadlen) {
+							  int framelen) {
 	debug_printf("handling initial");
-	const int headerlen = (int)(payload - buf);
+	// Payload points to the rbudp payload (after the rbudp header)
+	const int headerlen = (int)(payload - buf); // Length of ALL headers (including rbudp)
 	if (initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
-		debug_printf("initial headerlen, payloadlen: %d, %d", headerlen, payloadlen);
+		debug_printf("initial headerlen, framelen: %d, %d", headerlen, framelen);
+		debug_printf("initial chunklen: %d", initial->chunklen);
 		// XXX Why use both initial->chunklen (transmitted) and the size of the received packet?
 		// Are they ever not the same?
-		rx_update_reply_path(server, rx_state, ifid, initial->chunklen + headerlen, headerlen + payloadlen, buf);
+		rx_update_reply_path(server, rx_state, ifid, initial->chunklen + headerlen, framelen, buf);
 	}
 	rx_send_rtt_ack(server, rx_state,
 					initial);  // echo back initial pkt to ACK filesize
