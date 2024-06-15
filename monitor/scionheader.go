@@ -158,7 +158,7 @@ func getReplyPathHeader(buf []byte, etherLen int) (*HerculesPathHeader, net.IP, 
 	}
 
 	payload := snet.UDPPayload{
-		SrcPort: udpPkt.DstPort,
+		SrcPort: 0, // Will be filled by server, left empty for correct checksum computation
 		DstPort: udpPkt.SrcPort,
 		Payload: nil,
 	}
@@ -327,8 +327,8 @@ func prepareHeader(path PathMeta, payloadLen int, srcUDP, dstUDP net.UDPAddr, sr
 	fmt.Println(underlayHeader, err)
 
 	payload := snet.UDPPayload{
-		SrcPort: srcUDP.AddrPort().Port(),
-		DstPort: dstUDP.AddrPort().Port(),
+		SrcPort: 0, // Will be filled by server, left empty for correct checksum computation
+		DstPort: 0,
 		Payload: make([]byte, payloadLen),
 	}
 

@@ -126,7 +126,9 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	if((void *)(l4udph + 1) > data_end) {
 		return XDP_PASS; // too short after all
 	}
-	if(l4udph->dest != addr->port) {
+	if (ntohs(l4udph->dest) < ntohs(addr->port) ||
+		ntohs(l4udph->dest) >
+			ntohs(addr->port) + HERCULES_CONCURRENT_SESSIONS) {
 		return XDP_PASS;
 	}
 	offset += sizeof(struct udphdr);
