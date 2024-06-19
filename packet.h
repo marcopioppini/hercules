@@ -187,5 +187,5 @@ struct hercules_app_addr {
 };
 typedef __u64 ia;
 #define MAX_NUM_SOCKETS 256
-
+#define HERCULES_CONCURRENT_SESSIONS 16
 #endif	// HERCULES_SCION_H

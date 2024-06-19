@@ -21,7 +21,7 @@ bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
 // If so the function returns true and the job's details are filled into the
 // arguments.
 bool monitor_get_new_job(int sockfd, char *name, u16 *job_id,
-						 struct hercules_app_addr *dest, u16 *payloadlen);
+						 u16 *dst_port, u16 *payloadlen);
 
 // Inform the monitor about a transfer's (new) status.
 bool monitor_update_job(int sockfd, int job_id, enum session_state state,
@@ -74,6 +74,7 @@ struct sockmsg_new_job_Q {};
 struct sockmsg_new_job_A {
 	uint8_t has_job;  // The other fields are only valid if this is set to 1
 	uint16_t job_id;
+	uint16_t dest_port;
 	uint16_t payloadlen;
 	uint16_t filename_len;
 	uint8_t filename[SOCKMSG_MAX_PAYLOAD]; // Filename *without* terminating 0-byte

@@ -80,7 +80,7 @@ bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
 }
 
 bool monitor_get_new_job(int sockfd, char *name, u16 *job_id,
-						 struct hercules_app_addr *dest, u16 *payloadlen) {
+						 u16 *dst_port, u16 *payloadlen) {
 	struct sockaddr_un monitor;
 	monitor.sun_family = AF_UNIX;
 	strcpy(monitor.sun_path, "/var/herculesmon.sock");
@@ -99,6 +99,7 @@ bool monitor_get_new_job(int sockfd, char *name, u16 *job_id,
 	*job_id = reply.payload.newjob.job_id;
 	debug_printf("received job id %d", reply.payload.newjob.job_id);
 	*payloadlen = reply.payload.newjob.payloadlen;
+	*dst_port = reply.payload.newjob.dest_port;
 	return true;
 }
 

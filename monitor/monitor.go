@@ -184,6 +184,7 @@ func main() {
 					strlen := len(selectedJob.file)
 					b = append(b, 1)
 					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.id))
+					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.dest.Host.Port))
 					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.pm.payloadLen))
 					b = binary.LittleEndian.AppendUint16(b, uint16(strlen))
 					b = append(b, []byte(selectedJob.file)...)

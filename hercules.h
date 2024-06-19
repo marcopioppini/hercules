@@ -98,6 +98,7 @@ struct receiver_state {
 	u8 num_tracked_paths;
 	bool is_pcc_benchmark;
 	struct receiver_state_per_path path_state[256];
+	u16 src_port;
 };
 
 /// SENDER
@@ -157,6 +158,7 @@ struct sender_state {
 	u32 index_chunks;
 	char *index;
 	size_t index_size;
+	u16 src_port;
 };
 
 /// SESSION
@@ -207,7 +209,7 @@ struct hercules_session {
 					 // the payload length includes the rbudp header while the
 					 // chunk length does not.
 
-	struct hercules_app_addr peer;
+	u16 dst_port;
 
 	// Number of sent/received packets (for stats)
 	size_t rx_npkts;
@@ -233,6 +235,9 @@ struct hercules_config {
 	int queue;
 	bool configure_queues;
 	struct hercules_app_addr local_addr;
+	u16 port_min;  // Lowest port on which to accept packets (in HOST
+				   // endianness)
+	u16 port_max;  // Highest port, host endianness
 };
 
 struct hercules_server {
@@ -244,11 +249,15 @@ struct hercules_server {
 	int n_threads;					   // Number of RX/TX worker threads
 	struct worker_args **worker_args;  // Args passed to RX/TX workers
 
-	struct hercules_session *_Atomic session_tx;  // Current TX session
-	struct hercules_session *deferred_tx;  // Previous TX session, no longer
-										   // active, waiting to be freed
-	struct hercules_session *_Atomic session_rx;  // Current RX session
-	struct hercules_session *deferred_rx;
+	struct hercules_session *_Atomic
+		sessions_tx[HERCULES_CONCURRENT_SESSIONS];	// Current TX sessions
+	struct hercules_session
+		*deferreds_tx[HERCULES_CONCURRENT_SESSIONS];  // Previous TX sessions,
+													  // no longer active,
+													  // waiting to be freed
+	struct hercules_session *_Atomic
+		sessions_rx[HERCULES_CONCURRENT_SESSIONS];	// Current RX sessions
+	struct hercules_session *deferreds_rx[HERCULES_CONCURRENT_SESSIONS];
 
 	bool enable_pcc;  // TODO make per path or session or something
 	int *ifindices;
