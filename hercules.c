@@ -36,6 +36,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fts.h>
 #include <unistd.h>
 #include <float.h>
 #include <arpa/inet.h>
@@ -75,7 +76,7 @@ static const u64 session_stale_timeout = 30e9; // 30 sec
 #define PCC_NO_PATH UINT8_MAX // tell the receiver not to count the packet on any path
 
 // Fill packet with n bytes from data and pad with zeros to payloadlen.
-static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx,
+static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx, u8 flags,
 						   sequence_number seqnr, const char *data, size_t n,
 						   size_t payloadlen);
 
@@ -158,28 +159,47 @@ static void send_eth_frame(struct hercules_server *server,
 	}
 }
 
+static inline bool session_state_is_running(enum session_state s) {
+	if (s == SESSION_STATE_RUNNING_IDX || s == SESSION_STATE_RUNNING_DATA) {
+		return true;
+	}
+	return false;
+}
+
 #ifdef DEBUG_PRINT_PKTS
 // recv indicates whether printed packets should be prefixed with TX or RX
 void debug_print_rbudp_pkt(const char *pkt, bool recv) {
 	struct hercules_header *h = (struct hercules_header *)pkt;
 	const char *prefix = (recv) ? "RX->" : "<-TX";
-	printf("%s Header: IDX %u, Path %u, Seqno %u\n", prefix, h->chunk_idx,
-		   h->path, h->seqno);
+	printf("%s Header: IDX %u, Path %u, Flags %s, Seqno %u\n", prefix,
+		   h->chunk_idx, h->path,
+		   (h->flags & PKT_FLAG_IS_INDEX) ? "IDX" : "DATA", h->seqno);
 	if (h->chunk_idx == UINT_MAX) {
 		// Control packets
-		const char *pl = pkt + 9;
+		const char *pl = pkt + rbudp_headerlen;
 		struct hercules_control_packet *cp =
 			(struct hercules_control_packet *)pl;
 		switch (cp->type) {
 			case CONTROL_PACKET_TYPE_INITIAL:
 				printf(
 					"%s   HS: Filesize %llu, Chunklen %u, TS %llu, Path idx "
-					"%u, Flags "
-					"0x%x, Name length %u [%s]\n",
+					"%u, Index size %llu, Flags %s|%s|%s|%s\n",
 					prefix, cp->payload.initial.filesize,
 					cp->payload.initial.chunklen, cp->payload.initial.timestamp,
-					cp->payload.initial.path_index, cp->payload.initial.flags,
-					cp->payload.initial.name_len, cp->payload.initial.name);
+					cp->payload.initial.path_index,
+					cp->payload.initial.index_len,
+					(cp->payload.initial.flags & HANDSHAKE_FLAG_SET_RETURN_PATH)
+						? "RP"
+						: "--",
+					(cp->payload.initial.flags & HANDSHAKE_FLAG_HS_CONFIRM)
+						? "HC"
+						: "--",
+					(cp->payload.initial.flags & HANDSHAKE_FLAG_NEW_TRANSFER)
+						? "NT"
+						: "--",
+					(cp->payload.initial.flags & HANDSHAKE_FLAG_INDEX_FOLLOWS)
+						? "IF"
+						: "--");
 				break;
 			case CONTROL_PACKET_TYPE_ACK:
 				printf("%s   ACK (%d) ", prefix, cp->payload.ack.num_acks);
@@ -678,13 +698,15 @@ static void stitch_checksum(const struct hercules_path *path, u16 precomputed_ch
 }
 
 // Fill packet with n bytes from data and pad with zeros to payloadlen.
-static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx,
+static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx, u8 flags,
 						   sequence_number seqnr, const char *data, size_t n,
 						   size_t payloadlen) {
-	void *rbudp_path_idx = mempcpy(rbudp_pkt, &chunk_idx, sizeof(chunk_idx));
-	void *rbudp_seqnr = mempcpy(rbudp_path_idx, &path_idx, sizeof(path_idx));
-	void *rbudp_payload = mempcpy(rbudp_seqnr, &seqnr, sizeof(seqnr));
-	void *start_pad = mempcpy(rbudp_payload, data, n);
+	struct hercules_header *hdr = (struct hercules_header *)rbudp_pkt;
+	hdr->chunk_idx = chunk_idx;
+	hdr->path = path_idx;
+	hdr->flags = flags;
+	hdr->seqno = seqnr;
+	void *start_pad = mempcpy(hdr->data, data, n);
 	if (rbudp_headerlen + n < payloadlen) {
 		memset(start_pad, 0,
 			   payloadlen - rbudp_headerlen - n);
@@ -717,8 +739,12 @@ static struct path_set *pathset_read(struct sender_state *tx_state, u32 id) {
 
 /// RECEIVER
 
-static bool rx_received_all(const struct receiver_state *rx_state)
-{
+static bool rx_received_all(const struct receiver_state *rx_state,
+							const bool is_index_transfer) {
+	if (is_index_transfer) {
+		return (rx_state->received_chunks_index.num_set ==
+				rx_state->index_chunks);
+	}
 	return (rx_state->received_chunks.num_set == rx_state->total_chunks);
 }
 
@@ -729,23 +755,37 @@ static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *p
 		return false;
 	}
 
-	u32 chunk_idx;
-	memcpy(&chunk_idx, pkt, sizeof(u32));
-	if(chunk_idx >= rx_state->total_chunks) {
-		if(chunk_idx == UINT_MAX) {
-			// control packet is handled elsewhere
-		} else {
-			fprintf(stderr, "ERROR: chunk_idx larger than expected: %u >= %u\n",
-			        chunk_idx, rx_state->total_chunks);
+	struct hercules_header *hdr = (struct hercules_header *)pkt;
+	bool is_index_transfer = hdr->flags & PKT_FLAG_IS_INDEX;
+
+	u32 chunk_idx = hdr->chunk_idx;
+	if (is_index_transfer) {
+		if (chunk_idx >= rx_state->index_chunks) {
+			if (chunk_idx == UINT_MAX) {
+				// control packet is handled elsewhere
+			} else {
+				fprintf(stderr,
+						"ERROR: IDX chunk_idx larger than expected: %u >= %u\n",
+						chunk_idx, rx_state->index_chunks);
+			}
+			return false;
 		}
-		return false;
+	} else {
+		if (chunk_idx >= rx_state->total_chunks) {
+			if (chunk_idx == UINT_MAX) {
+				// control packet is handled elsewhere
+			} else {
+				fprintf(stderr,
+						"ERROR: DATA chunk_idx larger than expected: %u >= %u\n",
+						chunk_idx, rx_state->total_chunks);
+			}
+			return false;
+		}
 	}
 
-	u8 path_idx;
-	mempcpy(&path_idx, &pkt[4], sizeof(u8));
+	u8 path_idx = hdr->path;
 	if(path_idx < PCC_NO_PATH) {
-		sequence_number seqnr;
-		memcpy(&seqnr, &pkt[5], sizeof(sequence_number));
+		sequence_number seqnr = hdr->seqno;
 		if(rx_state->path_state[path_idx].seq_rcvd.bitmap == NULL) {
                   // TODO compute correct number here
 			bitset__create(&rx_state->path_state[path_idx].seq_rcvd, 200 * rx_state->total_chunks);
@@ -754,7 +794,7 @@ static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *p
 		if(seqnr >= rx_state->path_state[path_idx].seq_rcvd.num) {
 			// XXX: currently we cannot track these sequence numbers, as a consequence congestion control breaks at this
 			// point, abort.
-			if(rx_state->session->state != SESSION_STATE_RUNNING) {
+			if(!session_state_is_running(rx_state->session->state)) {
 				return true;
 			} else {
 				fprintf(stderr, "sequence number overflow %d / %d\n", seqnr,
@@ -779,30 +819,47 @@ static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *p
 		// break PCC because that takes NACKs send on a per-path basis as feedback
 	} else {
 		// mark as received in received_chunks bitmap
-		prev = bitset__set_mt_safe(&rx_state->received_chunks, chunk_idx);
+		if (is_index_transfer) {
+			prev = bitset__set_mt_safe(&rx_state->received_chunks_index,
+									   chunk_idx);
+		} else {
+			prev = bitset__set_mt_safe(&rx_state->received_chunks, chunk_idx);
+		}
 	}
 	if(!prev) {
+		char *target_ptr = rx_state->mem;
 		const char *payload = pkt + rbudp_headerlen;
 		const size_t chunk_start = (size_t)chunk_idx * rx_state->chunklen;
-		const size_t len = umin64(rx_state->chunklen, rx_state->filesize - chunk_start);
-		memcpy(rx_state->mem + chunk_start, payload, len);
+		size_t len =
+			umin64(rx_state->chunklen, rx_state->filesize - chunk_start);
+		if (is_index_transfer) {
+			target_ptr = rx_state->index;
+			len = umin64(rx_state->chunklen, rx_state->index_size - chunk_start);
+		}
+		memcpy(target_ptr + chunk_start, payload, len);
 		// Update last new pkt timestamp
 		atomic_store(&rx_state->session->last_new_pkt_rcvd, get_nsecs());
 	}
 	return true;
 }
 
-static u32 fill_ack_pkt(struct receiver_state *rx_state, u32 first, struct rbudp_ack_pkt *ack, size_t max_num_acks)
+static u32 fill_ack_pkt(struct receiver_state *rx_state, u32 first, struct rbudp_ack_pkt *ack, size_t max_num_acks, bool is_index_transfer)
 {
 	size_t e = 0;
 	u32 curr = first;
+	struct bitset *set = &rx_state->received_chunks;
+	u32 num = rx_state->received_chunks.num;
+	if (is_index_transfer){
+		set = &rx_state->received_chunks_index;
+		num = rx_state->received_chunks_index.num;
+	}
 	for(; e < max_num_acks;) {
-		u32 begin = bitset__scan(&rx_state->received_chunks, curr);
-		if(begin == rx_state->received_chunks.num) {
+		u32 begin = bitset__scan(set, curr);
+		if(begin == num) {
 			curr = begin;
 			break;
 		}
-		u32 end = bitset__scan_neg(&rx_state->received_chunks, begin + 1);
+		u32 end = bitset__scan_neg(set, begin + 1);
 		curr = end + 1;
 		ack->acks[e].begin = begin;
 		ack->acks[e].end = end;
@@ -847,7 +904,7 @@ submit_rx_frames(struct hercules_session *session, struct xsk_umem_info *umem, c
 	size_t reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
 	while(reserved != num_frames) {
 		reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
-		if(session == NULL || session->state != SESSION_STATE_RUNNING) {
+		if(session == NULL || !session_state_is_running(session->state)) {
 			pthread_spin_unlock(&umem->fq_lock);
 			return;
 		}
@@ -920,37 +977,71 @@ static void rx_receive_and_drop(struct xsk_socket_info *xsk){
 }
 
 // Prepare a file and memory mapping to receive a file
-static char *rx_mmap(const char *pathname, size_t filesize) {
-	debug_printf("mmap file: %s", pathname);
-	int ret;
-	/*ret = unlink(pathname);
-	if(ret && errno != ENOENT) {
-		exit_with_error(server, errno);
-	}*/
-	int f = open(pathname, O_RDWR | O_CREAT | O_EXCL, 0664);
-	if (f == -1 && errno == EEXIST) {
-		f = open(pathname, O_RDWR | O_EXCL);
-	}
-	if (f == -1) {
-		return NULL;
-	}
-	ret = fallocate(f, 0, 0, filesize);	 // Will fail on old filesystems (ext3)
-	if (ret) {
-		close(f);
-		return NULL;
-	}
-	char *mem = mmap(NULL, filesize, PROT_WRITE, MAP_SHARED, f, 0);
+static char *rx_mmap(const char *index, size_t index_size, size_t total_filesize) {
+	debug_printf("total filesize %ld", total_filesize);
+	debug_printf("total entry size %ld", index_size);
+	char *mem = mmap(NULL, total_filesize, PROT_READ, MAP_PRIVATE | MAP_ANON, 0, 0);
 	if (mem == MAP_FAILED) {
-		close(f);
 		return NULL;
 	}
-	close(f);
+	char *next_mapping = mem;
+
+	struct dir_index_entry *p = (struct dir_index_entry *)index;
+	while (1) {
+		debug_printf("Read: %s (%d) %dB", p->path, p->type, p->filesize);
+		int ret;
+		if (p->type == INDEX_TYPE_FILE) {
+			int f = open(p->path, O_RDWR | O_CREAT | O_EXCL, 0664);
+			if (f == -1 && errno == EEXIST) {
+				f = open(p->path, O_RDWR | O_EXCL);
+			}
+			if (f == -1) {
+				return NULL;
+			}
+			ret =
+				fallocate(f, 0, 0,
+						  p->filesize);	 // Will fail on old filesystems (ext3)
+			if (ret) {
+				close(f);
+				return NULL;
+			}
+			char *filemap = mmap(next_mapping, p->filesize, PROT_WRITE,
+								 MAP_SHARED | MAP_FIXED, f, 0);
+			if (mem == MAP_FAILED) {
+				debug_printf("filemap err!");
+				return NULL;
+			}
+			next_mapping += p->filesize;
+			close(f);
+		}
+		else if (p->type == INDEX_TYPE_DIR){
+			ret = mkdir(p->path, 0664);
+			if (ret != 0) {
+				// XXX should an already existing directory be an error?
+				if (errno == EEXIST) {
+					struct stat statbuf;
+					stat(p->path, &statbuf);
+					if (!S_ISDIR(statbuf.st_mode)){
+						debug_printf("path exists but is not a directory?");
+						return NULL;
+					}
+				} else {
+					debug_printf("mkdir err");
+					return NULL;
+				}
+			}
+		}
+		p = ((char *)p) + sizeof(*p) + p->path_len;
+		if (p >= index + index_size) {
+			break;
+		}
+	}
 	return mem;
 }
 
 // Create new receiver state. Returns null in case of error.
 static struct receiver_state *make_rx_state(struct hercules_session *session,
-											char *filename, size_t namelen,
+											char *index, size_t index_size,
 											size_t filesize, int chunklen,
 											bool is_pcc_benchmark) {
 	struct receiver_state *rx_state;
@@ -967,12 +1058,38 @@ static struct receiver_state *make_rx_state(struct hercules_session *session,
 	rx_state->end_time = 0;
 	rx_state->handshake_rtt = 0;
 	rx_state->is_pcc_benchmark = is_pcc_benchmark;
-	filename[namelen+1] = 0; // HACK FIXME
-	rx_state->mem = rx_mmap(filename, filesize);
+	rx_state->mem = rx_mmap(index, index_size, filesize);
 	if (rx_state->mem == NULL) {
 		free(rx_state);
 		return NULL;
 	}
+	return rx_state;
+}
+
+// For index transfer: Create new receiver state without mapping a file. Returns
+// null in case of error.
+static struct receiver_state *make_rx_state_nomap(
+	struct hercules_session *session, size_t index_size,
+	size_t filesize, int chunklen, bool is_pcc_benchmark) {
+	struct receiver_state *rx_state;
+	rx_state = calloc(1, sizeof(*rx_state));
+	if (rx_state == NULL) {
+		return NULL;
+	}
+	rx_state->session = session;
+	rx_state->filesize = filesize;
+	rx_state->chunklen = chunklen;
+	rx_state->total_chunks = (filesize + chunklen - 1) / chunklen;
+	rx_state->index_chunks = (index_size + chunklen - 1) / chunklen;
+	bitset__create(&rx_state->received_chunks, rx_state->total_chunks);
+	bitset__create(&rx_state->received_chunks_index, rx_state->index_chunks);
+	rx_state->start_time = 0;
+	rx_state->end_time = 0;
+	rx_state->handshake_rtt = 0;
+	rx_state->is_pcc_benchmark = is_pcc_benchmark;
+	// XXX We cannot map the file(s) yet since we don't have the index,
+	// but we could already reserve the required range (to check if there's even
+	// enough memory available)
 	return rx_state;
 }
 
@@ -1033,7 +1150,7 @@ static void rx_send_rtt_ack(struct hercules_server *server,
 	/* strncpy(control_pkt.payload.initial.name, pld->name, pld->name_len); */
 	control_pkt.payload.initial.flags |= HANDSHAKE_FLAG_HS_CONFIRM;
 
-	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *)&control_pkt,
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, 0, (char *)&control_pkt,
 	               sizeof(control_pkt.type) + sizeof(control_pkt.payload.initial), path.payloadlen);
 	stitch_checksum(&path, path.header.checksum, buf);
 
@@ -1083,7 +1200,7 @@ static void rx_send_cts_ack(struct hercules_server *server,
 			.payload.ack.num_acks = 0,
 	};
 
-	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *)&control_pkt,
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, 0, (char *)&control_pkt,
 	               sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
 	stitch_checksum(&path, path.header.checksum, buf);
 	send_eth_frame(server, &path, buf);
@@ -1095,12 +1212,17 @@ static void rx_send_cts_ack(struct hercules_server *server,
 static void send_control_pkt(struct hercules_server *server,
 							 struct hercules_session *session,
 							 struct hercules_control_packet *control_pkt,
-							 struct hercules_path *path) {
+							 struct hercules_path *path,
+							 bool is_index_transfer) {
 	char buf[HERCULES_MAX_PKTSIZE];
 	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
 
+	u8 flag = 0;
+	if (is_index_transfer) {
+		flag |= PKT_FLAG_IS_INDEX;
+	}
 	fill_rbudp_pkt(
-		rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *)control_pkt,
+		rbudp_pkt, UINT_MAX, PCC_NO_PATH, flag, 0, (char *)control_pkt,
 		sizeof(control_pkt->type) + ack__len(&control_pkt->payload.ack),
 		path->payloadlen);
 	stitch_checksum(path, path->header.checksum, buf);
@@ -1110,7 +1232,7 @@ static void send_control_pkt(struct hercules_server *server,
 }
 
 // Send as many ACK packets as necessary to convey all received packet ranges
-static void rx_send_acks(struct hercules_server *server, struct receiver_state *rx_state)
+static void rx_send_acks(struct hercules_server *server, struct receiver_state *rx_state, bool is_index_transfer)
 {
 	struct hercules_path path;
 	if(!rx_get_reply_path(rx_state, &path)) {
@@ -1126,17 +1248,17 @@ static void rx_send_acks(struct hercules_server *server, struct receiver_state *
 	const size_t max_entries = ack__max_num_entries(path.payloadlen - rbudp_headerlen - sizeof(control_pkt.type));
 
 	// send an empty ACK to keep connection alive until first packet arrives
-	u32 curr = fill_ack_pkt(rx_state, 0, &control_pkt.payload.ack, max_entries);
-	send_control_pkt(server, rx_state->session, &control_pkt, &path);
+	u32 curr = fill_ack_pkt(rx_state, 0, &control_pkt.payload.ack, max_entries, is_index_transfer);
+	send_control_pkt(server, rx_state->session, &control_pkt, &path, is_index_transfer);
 	for(; curr < rx_state->total_chunks;) {
-		curr = fill_ack_pkt(rx_state, curr, &control_pkt.payload.ack, max_entries);
+		curr = fill_ack_pkt(rx_state, curr, &control_pkt.payload.ack, max_entries, is_index_transfer);
 		if(control_pkt.payload.ack.num_acks == 0) break;
-		send_control_pkt(server, rx_state->session, &control_pkt, &path);
+		send_control_pkt(server, rx_state->session, &control_pkt, &path, is_index_transfer);
 	}
 }
 
 
-static void rx_send_path_nacks(struct hercules_server *server, struct receiver_state *rx_state, struct receiver_state_per_path *path_state, u8 path_idx, u64 time, u32 nr)
+static void rx_send_path_nacks(struct hercules_server *server, struct receiver_state *rx_state, struct receiver_state_per_path *path_state, u8 path_idx, u64 time, u32 nr, bool is_index_transfer)
 {
 	struct hercules_path path;
 	if(!rx_get_reply_path(rx_state, &path)) {
@@ -1175,7 +1297,11 @@ static void rx_send_path_nacks(struct hercules_server *server, struct receiver_s
 		if(control_pkt.payload.ack.num_acks != 0) {
 			nack_end = control_pkt.payload.ack.acks[control_pkt.payload.ack.num_acks - 1].end;
 		}
-		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, path_idx, 0, (char *)&control_pkt,
+		u8 flag = 0;
+		if (is_index_transfer) {
+			flag |= PKT_FLAG_IS_INDEX;
+		}
+		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, path_idx, flag, 0, (char *)&control_pkt,
 		               sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
 		stitch_checksum(&path, path.header.checksum, buf);
 
@@ -1188,17 +1314,24 @@ static void rx_send_path_nacks(struct hercules_server *server, struct receiver_s
 }
 
 // sends the NACKs used for congestion control by the sender
-static void rx_send_nacks(struct hercules_server *server, struct receiver_state *rx_state, u64 time, u32 nr)
+static void rx_send_nacks(struct hercules_server *server, struct receiver_state *rx_state, u64 time, u32 nr, bool is_index_transfer)
 {
 	u8 num_paths = atomic_load(&rx_state->num_tracked_paths);
 	for(u8 p = 0; p < num_paths; p++) {
-		rx_send_path_nacks(server, rx_state, &rx_state->path_state[p], p, time, nr);
+		rx_send_path_nacks(server, rx_state, &rx_state->path_state[p], p, time, nr, is_index_transfer);
 	}
 }
 
 /// SENDER
 static bool tx_acked_all(const struct sender_state *tx_state) {
 	if (tx_state->acked_chunks.num_set != tx_state->total_chunks) {
+		return false;
+	}
+	return true;
+}
+
+static bool tx_acked_all_index(const struct sender_state *tx_state) {
+	if (tx_state->acked_chunks_index.num_set != tx_state->index_chunks) {
 		return false;
 	}
 	return true;
@@ -1242,6 +1375,20 @@ static void tx_register_acks(const struct rbudp_ack_pkt *ack, struct sender_stat
 		}
 		for(u32 i = begin; i < end; ++i) { // XXX: this can *obviously* be optimized
 			bitset__set(&tx_state->acked_chunks, i); // don't need thread-safety here, all updates in same thread
+		}
+	}
+}
+
+static void tx_register_acks_index(const struct rbudp_ack_pkt *ack, struct sender_state *tx_state)
+{
+	for(uint16_t e = 0; e < ack->num_acks; ++e) {
+		const u32 begin = ack->acks[e].begin;
+		const u32 end = ack->acks[e].end;
+		if(begin >= end || end > tx_state->acked_chunks_index.num) {
+			return; // Abort
+		}
+		for(u32 i = begin; i < end; ++i) { // XXX: this can *obviously* be optimized
+			bitset__set(&tx_state->acked_chunks_index, i); // don't need thread-safety here, all updates in same thread
 		}
 	}
 }
@@ -1309,7 +1456,7 @@ static void tx_register_nacks(const struct rbudp_ack_pkt *nack, struct ccontrol_
 
 
 static void
-tx_send_initial(struct hercules_server *server, const struct hercules_path *path, char *filename, size_t filesize, u32 chunklen, unsigned long timestamp, u32 path_index, bool set_return_path, bool new_transfer)
+tx_send_initial(struct hercules_server *server, const struct hercules_path *path, void *index, u64 index_size, size_t filesize, u32 chunklen, unsigned long timestamp, u32 path_index, bool set_return_path, bool new_transfer)
 {
 	debug_printf("Sending initial");
 	char buf[HERCULES_MAX_PKTSIZE];
@@ -1324,20 +1471,42 @@ tx_send_initial(struct hercules_server *server, const struct hercules_path *path
 	}
 
 	struct hercules_control_packet pld = {
-			.type = CONTROL_PACKET_TYPE_INITIAL,
-			.payload.initial = {
-					.filesize = filesize,
-					.chunklen = chunklen,
-					.timestamp = timestamp,
-					.path_index = path_index,
-					.flags = flags,
-					.name_len = strlen(filename),
+		.type = CONTROL_PACKET_TYPE_INITIAL,
+		.payload.initial =
+			{
+				.filesize = filesize,
+				.chunklen = chunklen,
+				.timestamp = timestamp,
+				.path_index = path_index,
+				.flags = flags,
+				.index_len = index_size,
 			},
 	};
-	assert(strlen(filename) < 100); // TODO
-	strncpy(pld.payload.initial.name, filename, 100);
-	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *)&pld, sizeof(pld.type) + sizeof(pld.payload.initial) + pld.payload.initial.name_len,
-	               path->payloadlen);
+	// Using sizeof(pld) would give fewer bytes than actually available due
+	// to the union in struct hercules_control_packet
+	u64 initial_pl_size = sizeof(pld.type) + sizeof(pld.payload.initial);
+
+	// Only include directory index in the very first HS packet
+	if (new_transfer) {
+		u64 index_bytes_available = path->payloadlen - initial_pl_size;
+
+		debug_printf("bytes for index: %lld, size %lld", index_bytes_available,
+					 index_size);
+		if (index_size > index_bytes_available) {
+			// Index won't fit, will be transferred separately
+			debug_printf("index too long for HS packet!");
+			pld.payload.initial.flags |= HANDSHAKE_FLAG_INDEX_FOLLOWS;
+		} else {
+			// Index is small enough to fit in the HS packet, include it
+			debug_printf("Index contained in HS packet");
+			memcpy(pld.payload.initial.index, index, index_size);
+			initial_pl_size += index_size;
+		}
+	}
+	debug_printf("aaa %x", pld.payload.initial.flags);
+
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, 0, (char *)&pld,
+				   initial_pl_size, path->payloadlen);
 	stitch_checksum(path, path->header.checksum, buf);
 
 	send_eth_frame(server, path, buf);
@@ -1385,7 +1554,7 @@ void send_path_handshakes(struct hercules_server *server,
 						now + PATH_HANDSHAKE_TIMEOUT_NS)) {
 					debug_printf("sending hs on path %d", p);
 					// FIXME file name below?
-					tx_send_initial(server, path, "abcd", tx_state->filesize,
+					tx_send_initial(server, path, NULL, 0, tx_state->filesize,
 									tx_state->chunklen, get_nsecs(), p, false,
 									false);
 				}
@@ -1406,7 +1575,7 @@ static void claim_tx_frames(struct hercules_server *server, struct hercules_inte
 		/* debug_printf("reserved %ld, wanted %ld", reserved, num_frames); */
 		// XXX FIXME
 		struct hercules_session *s = atomic_load(&server->session_tx);
-		if(!s || atomic_load(&s->state) != SESSION_STATE_RUNNING) {
+		if(!s || !session_state_is_running(atomic_load(&s->state))) {
 			debug_printf("STOP");
 			pthread_spin_unlock(&iface->umem->frames_lock);
 			return;
@@ -1435,7 +1604,7 @@ static short flowIdCtr = 0;
 static inline void tx_handle_send_queue_unit_for_iface(
 	struct sender_state *tx_state, struct xsk_socket_info *xsk, int ifid,
 	u64 frame_addrs[SEND_QUEUE_ENTRIES_PER_UNIT], struct send_queue_unit *unit,
-	u32 thread_id) {
+	u32 thread_id, bool is_index_transfer) {
 	u32 num_chunks_in_unit = 0;
 	struct path_set *pathset = pathset_read(tx_state, thread_id);
 	for(u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++) {
@@ -1465,9 +1634,26 @@ static inline void tx_handle_send_queue_unit_for_iface(
 		if(path->ifid != ifid) {
 			continue;
 		}
-		const u32 chunk_idx = unit->chunk_idx[i];
+		u32 chunk_idx = unit->chunk_idx[i];
+		if (!is_index_transfer &&
+			chunk_idx >= tx_state->total_chunks){
+			// Since we use the same send queue for both index and data
+			// transfer, we don't know which one the dequeued chunk idx refers
+			// to. This is only a problem right after the swap from index to
+			// data transfer (when there might still be items in the send queue
+			// that refer to the index transfer even though we've moved on) and
+			// there are more index than data packets.
+			// We need to send something though, since we've allocated the frame
+			// already, so we just pretend it's chunk 0.
+			debug_printf("Chunk idx too large, index leftover?");
+			chunk_idx = 0;
+		}
 		const size_t chunk_start = (size_t)chunk_idx * tx_state->chunklen;
-		const size_t len = umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
+		size_t len =
+			umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
+		if (is_index_transfer) {
+			len = umin64(tx_state->chunklen, tx_state->index_size - chunk_start);
+		}
 
 		void *pkt = prepare_frame(xsk, frame_addrs[current_frame], idx + current_frame, path->framelen);
 		frame_addrs[current_frame] = -1;
@@ -1485,7 +1671,13 @@ static inline void tx_handle_send_queue_unit_for_iface(
 			track_path = unit->paths[i];
 			seqnr = atomic_fetch_add(&path->cc_state->last_seqnr, 1);
 		}
-		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, seqnr, tx_state->mem + chunk_start, len, path->payloadlen);
+		u8 flags = 0;
+		char *payload = tx_state->mem;
+		if (is_index_transfer){
+			flags |= PKT_FLAG_IS_INDEX;
+			payload = tx_state->index;
+		}
+		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, flags, seqnr, payload + chunk_start, len, path->payloadlen);
 		stitch_checksum(path, path->header.checksum, pkt);
 	}
 	xsk_ring_prod__submit(&xsk->tx, num_chunks_in_unit);
@@ -1493,11 +1685,11 @@ static inline void tx_handle_send_queue_unit_for_iface(
 
 static inline void tx_handle_send_queue_unit(struct hercules_server *server, struct sender_state *tx_state, struct xsk_socket_info *xsks[],
 											 u64 frame_addrs[][SEND_QUEUE_ENTRIES_PER_UNIT],
-											 struct send_queue_unit *unit, u32 thread_id)
+											 struct send_queue_unit *unit, u32 thread_id, bool is_index_transfer)
 {
 
 	for(int i = 0; i < server->num_ifaces; i++) {
-		tx_handle_send_queue_unit_for_iface(tx_state, xsks[i], server->ifaces[i].ifid, frame_addrs[i], unit, thread_id);
+		tx_handle_send_queue_unit_for_iface(tx_state, xsks[i], server->ifaces[i].ifid, frame_addrs[i], unit, thread_id, is_index_transfer);
 	}
 }
 
@@ -1632,15 +1824,23 @@ static void kick_cc(struct sender_state *tx_state, struct path_set *pathset) {
 // is set to the timestamp by which that ACK should arrive. Otherwise, wait_until
 // is not modified.
 static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 *chunks, u8 *chunk_rcvr, const u64 now,
-                               u64 *wait_until, u32 num_chunks)
+                               u64 *wait_until, u32 num_chunks, bool is_index_transfer)
 {
 	u32 num_chunks_prepared = 0;
 	u32 chunk_idx = tx_state->prev_chunk_idx;
 	/* debug_printf("n chunks %d", num_chunks); */
 	for(; num_chunks_prepared < num_chunks; num_chunks_prepared++) {
 		/* debug_printf("prepared %d/%d chunks", num_chunks_prepared, num_chunks); */
-		chunk_idx = bitset__scan_neg(&tx_state->acked_chunks, chunk_idx);
-		if(chunk_idx == tx_state->total_chunks) {
+		u32 total_chunks;
+		if (is_index_transfer) {
+			chunk_idx =
+				bitset__scan_neg(&tx_state->acked_chunks_index, chunk_idx);
+			total_chunks = tx_state->index_chunks;
+		} else {
+			chunk_idx = bitset__scan_neg(&tx_state->acked_chunks, chunk_idx);
+			total_chunks = tx_state->total_chunks;
+		}
+		if (chunk_idx == total_chunks) {
 			/* debug_printf("prev %d", rcvr->prev_chunk_idx); */
 			if(tx_state->prev_chunk_idx == 0) { // this receiver has finished
 				debug_printf("receiver has finished");
@@ -1679,6 +1879,7 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 // Initialise new sender state. Returns null in case of error.
 static struct sender_state *init_tx_state(struct hercules_session *session,
 										  size_t filesize, int chunklen,
+										  size_t index_chunks, char *index,
 										  int max_rate_limit, char *mem,
 										  const struct hercules_app_addr *dests,
 										  struct hercules_path *paths,
@@ -1690,6 +1891,7 @@ static struct sender_state *init_tx_state(struct hercules_session *session,
 				"File too big, not enough chunks available (chunks needed: "
 				"%llu, chunks available: %u)\n",
 				total_chunks, UINT_MAX - 1);
+		// TODO update monitor err
 		return NULL;
 	}
 
@@ -1701,12 +1903,15 @@ static struct sender_state *init_tx_state(struct hercules_session *session,
 	tx_state->filesize = filesize;
 	tx_state->chunklen = chunklen;
 	tx_state->total_chunks = total_chunks;
+	tx_state->index_chunks = index_chunks;
 	tx_state->mem = mem;
+	tx_state->index = index;
 	tx_state->rate_limit = max_rate_limit;
 	tx_state->start_time = 0;
 	tx_state->end_time = 0;
 
 	bitset__create(&tx_state->acked_chunks, tx_state->total_chunks);
+	bitset__create(&tx_state->acked_chunks_index, index_chunks);
 	tx_state->handshake_rtt = 0;
 	struct path_set *pathset = calloc(1, sizeof(*tx_state->pathset));
 	if (pathset == NULL){
@@ -1731,6 +1936,11 @@ static struct sender_state *init_tx_state(struct hercules_session *session,
 	return tx_state;
 }
 
+static void reset_tx_state(struct sender_state *tx_state) {
+	tx_state->finished = false;
+	tx_state->prev_chunk_idx = 0;
+}
+
 static void destroy_tx_state(struct sender_state *tx_state) {
 	bitset__destroy(&tx_state->acked_chunks);
 	// TODO freeing pathset
@@ -1747,8 +1957,8 @@ static void tx_retransmit_initial(struct hercules_server *server, u64 now) {
 			struct sender_state *tx_state = session_tx->tx_state;
 			struct path_set *pathset = tx_state->pathset;
 			// We always use the first path as the return path
-			tx_send_initial(server, &pathset->paths[0],
-							tx_state->filename, tx_state->filesize,
+			tx_send_initial(server, &pathset->paths[0], tx_state->index,
+							tx_state->index_size, tx_state->filesize,
 							tx_state->chunklen, now, 0, true, true);
 			session_tx->last_pkt_sent = now;
 		}
@@ -1799,12 +2009,19 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 			}
 		}
 		tx_state->start_time = get_nsecs();
-		session_tx->state = SESSION_STATE_WAIT_CTS;
+		if (parsed_pkt->flags & HANDSHAKE_FLAG_INDEX_FOLLOWS) {
+			// Need to do index transfer first
+			// XXX relying on data echoed back by receiver instead of local
+			// state
+			session_tx->state = SESSION_STATE_RUNNING_IDX;
+		} else {
+			// Index transfer not needed, straight to data transfer
+			session_tx->state = SESSION_STATE_WAIT_CTS;
+		}
 		return;
 	}
 
-	if (session_tx != NULL &&
-		session_tx->state == SESSION_STATE_RUNNING) {
+	if (session_tx != NULL && session_state_is_running(session_tx->state)) {
 		struct sender_state *tx_state = session_tx->tx_state;
 		struct path_set *pathset = tx_state->pathset;
 		// This is a reply to some handshake we sent during an already
@@ -1835,25 +2052,116 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 
 // Map the provided file into memory for reading. Returns pointer to the mapped
 // area, or null on error.
-static char *tx_mmap(char *fname, size_t *filesize) {
-	int f = open(fname, O_RDONLY);
-	if (f == -1) {
+static char *tx_mmap(char *fname, size_t *filesize, void **index_o, u64 *index_size_o) {
+	FTS *fts = NULL;
+	FTSENT *ent = NULL;
+	debug_printf("opening");
+	char* fts_arg[2] = {fname, NULL};
+	fts = fts_open(fts_arg, FTS_PHYSICAL, NULL);	// Don't follow symlinks
+	if (fts == NULL) {
 		return NULL;
 	}
-	struct stat stat;
-	int ret = fstat(f, &stat);
-	if (ret) {
-		close(f);
+	debug_printf("fts open");
+	int index_cap = 4096;
+	void *index = malloc(index_cap);
+	if (index == NULL){
+		fts_close(fts);
 		return NULL;
 	}
-	const size_t fsize = stat.st_size;
-	char *mem = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, f, 0);
+	int index_size = 0;
+
+	int total_filesize = 0;
+
+	while ((ent = fts_read(fts)) != NULL) {
+		switch (ent->fts_info) {
+			case FTS_F:;  // Regular file
+				int entry_size =
+					sizeof(struct dir_index_entry) + ent->fts_pathlen + 1;
+				debug_printf("entry size %d", entry_size);
+				if (index_size + entry_size >= index_cap) {
+					debug_printf("need realloc");
+					index = realloc(index, index_cap + 4096);
+					if (index == NULL) {
+						fts_close(fts);
+						return NULL;
+					}
+					index_cap += 4096;
+				}
+				debug_printf("adding to index: %s (%ldB)", ent->fts_path, ent->fts_statp->st_size);
+				struct dir_index_entry *newentry =
+					(struct dir_index_entry *)(index + index_size);
+
+				newentry->filesize = ent->fts_statp->st_size;
+				newentry->type = INDEX_TYPE_FILE;
+				newentry->path_len = ent->fts_pathlen + 1;
+				debug_printf("pathlen %d", ent->fts_pathlen);
+				strncpy(newentry->path, ent->fts_path, newentry->path_len);
+				debug_printf("Readback: %s (%d) %dB", newentry->path,
+							 newentry->type, newentry->filesize);
+				index_size += entry_size;
+				total_filesize += newentry->filesize;
+				break;
+			case FTS_D:;	  // Directory
+				entry_size =
+					sizeof(struct dir_index_entry) + ent->fts_pathlen + 1;
+				if (index_size + entry_size >= index_cap) {
+					debug_printf("need realloc");
+					index = realloc(index, index_cap + 4096);
+					if (index == NULL) {
+						fts_close(fts);
+						return NULL;
+					}
+					index_cap += 4096;
+				}
+				debug_printf("adding to index: %s (%ldB)", ent->fts_path, ent->fts_statp->st_size);
+				newentry =
+					(struct dir_index_entry *)(index + index_size);
+				newentry->filesize = 0;
+				newentry->type = INDEX_TYPE_DIR;
+				newentry->path_len = ent->fts_pathlen + 1;
+				strncpy(newentry->path, ent->fts_path, newentry->path_len);
+				index_size += entry_size;
+				break;
+			default:
+				break;
+		}
+	}
+
+	fts_close(fts);
+	debug_printf("total filesize %d", total_filesize);
+	debug_printf("total entry size %d", index_size);
+	char *mem = mmap(NULL, total_filesize, PROT_READ, MAP_PRIVATE | MAP_ANON, 0, 0);
 	if (mem == MAP_FAILED) {
-		close(f);
 		return NULL;
 	}
-	close(f);
-	*filesize = fsize;
+	char *next_mapping = mem;
+
+	struct dir_index_entry *p = index;
+	while (1) {
+		debug_printf("Read: %s (%d) %dB", p->path, p->type, p->filesize);
+		if (p->type == INDEX_TYPE_FILE) {
+			int f = open(p->path, O_RDONLY);
+			if (f == -1) {
+				return NULL;
+			}
+			char *filemap = mmap(next_mapping, p->filesize, PROT_READ,
+								 MAP_PRIVATE | MAP_FIXED, f, 0);
+			if (mem == MAP_FAILED) {
+				debug_printf("filemap err!");
+				return NULL;
+			}
+			next_mapping += p->filesize;
+			close(f);
+		}
+		p = ((char *)p) + sizeof(*p) + p->path_len;
+		if (p >= index + index_size) {
+			break;
+		}
+	}
+
+	*filesize = total_filesize;
+	*index_o = index;
+	*index_size_o = index_size;
 	return mem;
 }
 
@@ -2021,10 +2329,11 @@ static void tx_send_p(void *arg) {
 	while (1) {
 		struct hercules_session *session_tx = atomic_load(&server->session_tx);
 		if (session_tx == NULL ||
-			atomic_load(&session_tx->state) != SESSION_STATE_RUNNING) {
+			!session_state_is_running(session_tx->state)) {
 			kick_tx_server(server);	 // flush any pending packets
 			continue;
 		}
+		bool is_index_transfer = (session_tx->state == SESSION_STATE_RUNNING_IDX);
 		struct send_queue_unit unit;
 		int ret = send_queue_pop(session_tx->send_queue, &unit);
 		if (!ret) {
@@ -2051,7 +2360,7 @@ static void tx_send_p(void *arg) {
 		}
 		allocate_tx_frames(server, frame_addrs);
 		tx_handle_send_queue_unit(server, session_tx->tx_state, args->xsks,
-								  frame_addrs, &unit, args->id);
+								  frame_addrs, &unit, args->id, is_index_transfer);
 	}
 }
 
@@ -2060,10 +2369,11 @@ static void rx_trickle_acks(void *arg) {
 	struct hercules_server *server = arg;
 	while (1) {
 		struct hercules_session *session_rx = atomic_load(&server->session_rx);
-		if (session_rx != NULL && session_rx->state == SESSION_STATE_RUNNING) {
+		if (session_rx != NULL && session_state_is_running(session_rx->state)) {
 			struct receiver_state *rx_state = session_rx->rx_state;
+			bool is_index_transfer = (session_rx->state == SESSION_STATE_RUNNING_IDX);
 			// XXX: data races in access to shared rx_state!
-			atomic_store(&rx_state->last_pkt_rcvd, get_nsecs());
+			atomic_store(&rx_state->last_pkt_rcvd, get_nsecs()); // FIXME what?
 			if (atomic_load(&rx_state->last_pkt_rcvd) +
 					umax64(100 * ACK_RATE_TIME_MS * 1e6,
 						   3 * rx_state->handshake_rtt) <
@@ -2071,12 +2381,17 @@ static void rx_trickle_acks(void *arg) {
 				// Transmission timed out
 				quit_session(session_rx, SESSION_ERROR_TIMEOUT);
 			}
-			rx_send_acks(server, rx_state);
-			if (rx_received_all(
-					rx_state)) {  // TODO move this check to ack receive?
-				debug_printf("Received all, done.");
-				quit_session(session_rx, SESSION_ERROR_OK);
-				rx_send_acks(server, rx_state);
+			rx_send_acks(server, rx_state, is_index_transfer);
+			if (rx_received_all(rx_state, is_index_transfer)) {
+				if (is_index_transfer) {
+					debug_printf("Received entire index");
+					rx_send_acks(server, rx_state, is_index_transfer);
+					session_rx->state = SESSION_STATE_INDEX_READY;
+				} else {
+					debug_printf("Received all, done.");
+					rx_send_acks(server, rx_state, is_index_transfer);
+					quit_session(session_rx, SESSION_ERROR_OK);
+				}
 			}
 		}
 		sleep_nsecs(ACK_RATE_TIME_MS * 1e6);
@@ -2088,14 +2403,15 @@ static void rx_trickle_nacks(void *arg) {
 	struct hercules_server *server = arg;
 	while (1) {
 		struct hercules_session *session_rx = atomic_load(&server->session_rx);
-		if (session_rx != NULL && session_rx->state == SESSION_STATE_RUNNING) {
+		if (session_rx != NULL && session_state_is_running(session_rx->state)) {
 			u32 ack_nr = 0;
+			bool is_index_transfer = (session_rx->state == SESSION_STATE_RUNNING_IDX);
 			struct receiver_state *rx_state = session_rx->rx_state;
 			// TODO remove this inner loop?
-			while (rx_state->session->state == SESSION_STATE_RUNNING &&
-				   !rx_received_all(rx_state)) {
+			while (session_state_is_running(rx_state->session->state) &&
+				   !rx_received_all(rx_state, is_index_transfer)) {
 				u64 ack_round_start = get_nsecs();
-				rx_send_nacks(server, rx_state, ack_round_start, ack_nr);
+				rx_send_nacks(server, rx_state, ack_round_start, ack_nr, is_index_transfer);
 				u64 ack_round_end = get_nsecs();
 				if (ack_round_end >
 					ack_round_start + rx_state->handshake_rtt * 1000 / 4) {
@@ -2120,7 +2436,7 @@ static void rx_p(void *arg) {
 	u32 i = 0;
 	while (1) {
 		struct hercules_session *session_rx = atomic_load(&server->session_rx);
-		if (session_rx != NULL && session_rx->state == SESSION_STATE_RUNNING) {
+		if (session_rx != NULL && session_state_is_running(session_rx->state)) {
 			rx_receive_batch(session_rx->rx_state, args->xsks[i % num_ifaces]);
 			i++;
 		}
@@ -2169,87 +2485,88 @@ static void *tx_p(void *arg) {
     u32 chunks[BATCH_SIZE];
     u8 chunk_rcvr[BATCH_SIZE];
     struct hercules_session *session_tx = atomic_load(&server->session_tx);
-    if (session_tx != NULL &&
-        atomic_load(&session_tx->state) == SESSION_STATE_RUNNING) {
-      struct sender_state *tx_state = session_tx->tx_state;
-	  struct path_set *pathset = pathset_read(tx_state, 0);
-      /* debug_printf("Start transmit round"); */
-      tx_state->prev_rate_check = get_nsecs();
+	if (session_tx != NULL &&
+		session_state_is_running(atomic_load(&session_tx->state))) {
+		bool is_index_transfer = (session_tx->state == SESSION_STATE_RUNNING_IDX);
+		struct sender_state *tx_state = session_tx->tx_state;
+		struct path_set *pathset = pathset_read(tx_state, 0);
+		/* debug_printf("Start transmit round"); */
+		tx_state->prev_rate_check = get_nsecs();
 
-      pop_completion_rings(server);
-      send_path_handshakes(server, tx_state, pathset);
-      u64 next_ack_due = 0;
+		pop_completion_rings(server);
+		send_path_handshakes(server, tx_state, pathset);
+		u64 next_ack_due = 0;
 
-      // in each iteration, we send packets on a single path to each receiver
-      // collect the rate limits for each active path
-      u32 allowed_chunks = compute_max_chunks_current_path(tx_state, pathset);
+		// in each iteration, we send packets on a single path to each receiver
+		// collect the rate limits for each active path
+		u32 allowed_chunks = compute_max_chunks_current_path(tx_state, pathset);
 
-      if (allowed_chunks ==
-          0) { // we hit the rate limits on every path; switch paths
-        iterate_paths(tx_state, pathset);
-        continue;
-      }
+		if (allowed_chunks ==
+			0) {  // we hit the rate limits on every path; switch paths
+			iterate_paths(tx_state, pathset);
+			continue;
+		}
 
-      // TODO re-enable?
-      // sending rates might add up to more than BATCH_SIZE, shrink
-      // proportionally, if needed
-      /* shrink_sending_rates(tx_state, max_chunks_per_rcvr, total_chunks); */
+		// TODO re-enable?
+		// sending rates might add up to more than BATCH_SIZE, shrink
+		// proportionally, if needed
+		/* shrink_sending_rates(tx_state, max_chunks_per_rcvr, total_chunks); */
 
-      const u64 now = get_nsecs();
-      u32 num_chunks = 0;
-      if (!tx_state->finished) {
-        u64 ack_due = 0;
-        // for each receiver, we prepare up to max_chunks_per_rcvr[r] chunks to
-        // send
-        u32 cur_num_chunks = prepare_rcvr_chunks(
-            tx_state, 0, &chunks[num_chunks], &chunk_rcvr[num_chunks], now,
-            &ack_due, allowed_chunks);
-        num_chunks += cur_num_chunks;
-        if (tx_state->finished) {
-            terminate_cc(pathset);
-            kick_cc(tx_state, pathset);
-        } else {
-          // only wait for the nearest ack
-          if (next_ack_due) {
-            if (next_ack_due > ack_due) {
-              next_ack_due = ack_due;
-            }
-          } else {
-            next_ack_due = ack_due;
-          }
-        }
-      }
+		const u64 now = get_nsecs();
+		u32 num_chunks = 0;
+		if (!tx_state->finished) {
+			u64 ack_due = 0;
+			// for each receiver, we prepare up to max_chunks_per_rcvr[r] chunks
+			// to send
+			u32 cur_num_chunks = prepare_rcvr_chunks(
+				tx_state, 0, &chunks[num_chunks], &chunk_rcvr[num_chunks], now,
+				&ack_due, allowed_chunks, is_index_transfer);
+			num_chunks += cur_num_chunks;
+			if (tx_state->finished && !is_index_transfer) {
+				terminate_cc(pathset);
+				kick_cc(tx_state, pathset);
+			} else {
+				// only wait for the nearest ack
+				if (next_ack_due) {
+					if (next_ack_due > ack_due) {
+						next_ack_due = ack_due;
+					}
+				} else {
+					next_ack_due = ack_due;
+				}
+			}
+		}
 
-      if (num_chunks > 0) {
-        u8 rcvr_path[1];
-        prepare_rcvr_paths(tx_state, rcvr_path);
-        produce_batch(server, session_tx, rcvr_path, chunks, chunk_rcvr,
-                      num_chunks);
-        tx_state->tx_npkts_queued += num_chunks;
-        rate_limit_tx(tx_state);
+		if (num_chunks > 0) {
+			u8 rcvr_path[1];
+			prepare_rcvr_paths(tx_state, rcvr_path);
+			produce_batch(server, session_tx, rcvr_path, chunks, chunk_rcvr,
+						  num_chunks);
+			tx_state->tx_npkts_queued += num_chunks;
+			rate_limit_tx(tx_state);
 
-        // update book-keeping
-        u32 path_idx = pathset->path_index;
-          struct ccontrol_state *cc_state = pathset->paths[path_idx].cc_state;
-		  if (cc_state != NULL) {
-			  // FIXME allowed_chunks below is not correct (3x)
-			  atomic_fetch_add(&cc_state->mi_tx_npkts, allowed_chunks);
-			  atomic_fetch_add(&cc_state->total_tx_npkts, allowed_chunks);
-			  if (pcc_has_active_mi(cc_state, now)) {
-				  atomic_fetch_add(&cc_state->mi_tx_npkts_monitored,
-								   allowed_chunks);
-			  }
-		  }
-	  }
+			// update book-keeping
+			u32 path_idx = pathset->path_index;
+			struct ccontrol_state *cc_state = pathset->paths[path_idx].cc_state;
+			if (cc_state != NULL) {
+				// FIXME allowed_chunks below is not correct (3x)
+				atomic_fetch_add(&cc_state->mi_tx_npkts, allowed_chunks);
+				atomic_fetch_add(&cc_state->total_tx_npkts, allowed_chunks);
+				if (pcc_has_active_mi(cc_state, now)) {
+					atomic_fetch_add(&cc_state->mi_tx_npkts_monitored,
+									 allowed_chunks);
+				}
+			}
+		}
 
-	  iterate_paths(tx_state, pathset);
+		iterate_paths(tx_state, pathset);
 
-      if (now < next_ack_due) {
-        // XXX if the session vanishes in the meantime, we might wait
-        // unnecessarily
-        sleep_until(next_ack_due);
-      }
-    }
+		if (now < next_ack_due) {
+			// XXX if the session vanishes in the meantime, we might wait
+			// unnecessarily
+			sleep_until(next_ack_due);
+		}
+	}
   }
 
   return NULL;
@@ -2279,10 +2596,24 @@ static void new_tx_if_available(struct hercules_server *server) {
 	}
 
 	size_t filesize;
-	char *mem = tx_mmap(fname, &filesize);
+	void *index;
+	u64 index_size;
+	char *mem = tx_mmap(fname, &filesize, &index, &index_size);
 	if (mem == NULL){
 		debug_printf("mmap failed");
 		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_MAP_FAILED, 0, 0);
+		return;
+	}
+	debug_printf("Index totals %llu bytes, data size %llu bytes", index_size, filesize);
+	debug_printf("Transfer index in %f packets", index_size/(double)payloadlen);
+	u64 chunklen = payloadlen - rbudp_headerlen;
+	u64 chunks_for_index = (index_size + chunklen - 1) / chunklen;
+	if (chunks_for_index >= UINT_MAX) {
+		fprintf(stderr,
+				"Index too big, not enough chunks available (chunks needed: "
+				"%llu, chunks available: %u)\n",
+				chunks_for_index, UINT_MAX - 1);
+		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_TOO_LARGE, 0, 0);
 		return;
 	}
 	struct hercules_session *session = make_session(server);
@@ -2308,12 +2639,13 @@ static void new_tx_if_available(struct hercules_server *server) {
 	// TODO free paths
 	debug_printf("received %d paths", n_paths);
 
-	int chunklen = payloadlen - rbudp_headerlen;
 	struct sender_state *tx_state = init_tx_state(
-		session, filesize, chunklen, server->rate_limit, mem,
+		session, filesize, chunklen, chunks_for_index, index, server->rate_limit, mem,
 		&session->peer, paths, 1, n_paths,
 		server->max_paths, server->n_threads);
 	strncpy(tx_state->filename, fname, 99);
+	tx_state->index = index;
+	tx_state->index_size = index_size;
 	session->tx_state = tx_state;
 	atomic_store(&server->session_tx, session);
 }
@@ -2385,7 +2717,7 @@ static void mark_timed_out_sessions(struct hercules_server *server, u64 now) {
 
 static void tx_update_paths(struct hercules_server *server) {
 	struct hercules_session *session_tx = server->session_tx;
-	if (session_tx && session_tx->state == SESSION_STATE_RUNNING) {
+	if (session_tx && session_state_is_running(session_tx->state)) {
 		struct sender_state *tx_state = session_tx->tx_state;
 		struct path_set *old_pathset = tx_state->pathset;
 		int n_paths;
@@ -2543,7 +2875,7 @@ static void print_session_stats(struct hercules_server *server,
 
 static void tx_update_monitor(struct hercules_server *server, u64 now) {
 	struct hercules_session *session_tx = server->session_tx;
-	if (session_tx != NULL && session_tx->state == SESSION_STATE_RUNNING) {
+	if (session_tx != NULL && session_state_is_running(session_tx->state)) {
 		bool ret = monitor_update_job(server->usock, session_tx->jobid, session_tx->state, 0,
 						   ( now - session_tx->tx_state->start_time ) / (int)1e9,
 						   session_tx->tx_state->chunklen *
@@ -2551,6 +2883,21 @@ static void tx_update_monitor(struct hercules_server *server, u64 now) {
 		if (!ret) {
 			quit_session(session_tx, SESSION_ERROR_CANCELLED);
 		}
+	}
+}
+
+static void rx_send_cts(struct hercules_server *server, u64 now){
+	struct hercules_session *session_rx = server->session_rx;
+	if (session_rx != NULL && session_rx->state == SESSION_STATE_INDEX_READY){
+		struct receiver_state *rx_state = session_rx->rx_state;
+		rx_state->mem =
+			rx_mmap(rx_state->index, rx_state->index_size, rx_state->filesize);
+		if (rx_state->mem == NULL){
+			quit_session(session_rx, SESSION_ERROR_MAP_FAILED);
+			return;
+		}
+		rx_send_cts_ack(server, rx_state);
+		server->session_rx->state = SESSION_STATE_RUNNING_DATA;
 	}
 }
 
@@ -2580,6 +2927,7 @@ static void events_p(void *arg) {
 		mark_timed_out_sessions(server, now);
 		cleanup_finished_sessions(server, now);
 		tx_retransmit_initial(server, now);
+		rx_send_cts(server, now);
 #ifdef PRINT_STATS
 		print_session_stats(server, &prints);
 #endif
@@ -2587,7 +2935,7 @@ static void events_p(void *arg) {
 		/* 	tx_update_paths(server); */
 		/* 	lastpoll = now; */
 		/* } */
-		if (now > lastpoll + 3e9){
+		if (now > lastpoll + 20e9){
 			tx_update_monitor(server, now);
 			tx_update_paths(server);
 			lastpoll = now;
@@ -2632,7 +2980,7 @@ static void events_p(void *arg) {
 					// failure and the session abandoned immediately?
 					struct hercules_session *session_tx = server->session_tx;
 					if (session_tx != NULL &&
-						session_tx->state == SESSION_STATE_RUNNING) {
+						session_state_is_running(session_tx->state)) {
 						struct path_set *pathset =
 							session_tx->tx_state->pathset;
 						if (scmp_bad_path < pathset->n_paths) {
@@ -2682,8 +3030,8 @@ static void events_p(void *arg) {
 						}
 						// Otherwise, we process and reflect the packet
 						if (server->session_rx != NULL &&
-							server->session_rx->state ==
-								SESSION_STATE_RUNNING) {
+							session_state_is_running(
+								server->session_rx->state)) {
 							if (!(parsed_pkt->flags &
 								  HANDSHAKE_FLAG_NEW_TRANSFER)) {
 								// This is a handshake that tries to open a new
@@ -2708,18 +3056,57 @@ static void events_p(void *arg) {
 									make_session(server);
 								server->session_rx = session;
 								session->state = SESSION_STATE_NEW;
-								struct receiver_state *rx_state = make_rx_state(
-									session, parsed_pkt->name,
-									parsed_pkt->name_len, parsed_pkt->filesize,
-									parsed_pkt->chunklen, false);
-								session->rx_state = rx_state;
-								rx_handle_initial(server, rx_state, parsed_pkt,
-												  buf, addr.sll_ifindex,
-												  rbudp_pkt + rbudp_headerlen,
-												  len);
-								rx_send_cts_ack(server, rx_state);
-								server->session_rx->state =
-									SESSION_STATE_RUNNING;
+								if (!(parsed_pkt->flags &
+									  HANDSHAKE_FLAG_INDEX_FOLLOWS)) {
+									// Entire index contained in this packet,
+									// we can go ahead and proceed with transfer
+									struct receiver_state *rx_state =
+										make_rx_state(
+											session, parsed_pkt->index,
+											parsed_pkt->index_len,
+											parsed_pkt->filesize,
+											parsed_pkt->chunklen, false);
+									if (rx_state == NULL) {
+										debug_printf(
+											"Error creating RX state!");
+										break;
+									}
+									session->rx_state = rx_state;
+									rx_handle_initial(
+										server, rx_state, parsed_pkt, buf,
+										addr.sll_ifindex,
+										rbudp_pkt + rbudp_headerlen, len);
+									rx_send_cts_ack(server, rx_state);
+									server->session_rx->state =
+										SESSION_STATE_RUNNING_DATA;
+								}
+								else {
+									// Index transferred separately
+									struct receiver_state *rx_state =
+										make_rx_state_nomap(
+											session, parsed_pkt->index_len,
+											parsed_pkt->filesize,
+											parsed_pkt->chunklen, false);
+									if (rx_state == NULL) {
+										debug_printf(
+											"Error creating RX state!");
+										break;
+									}
+									rx_state->index_size = parsed_pkt->index_len;
+									rx_state->index = calloc(1, parsed_pkt->index_len);
+									if (rx_state->index == NULL){
+										debug_printf("Error allocating index");
+										break;
+									}
+									session->rx_state = rx_state;
+									rx_handle_initial(
+										server, rx_state, parsed_pkt, buf,
+										addr.sll_ifindex,
+										rbudp_pkt + rbudp_headerlen, len);
+									server->session_rx->state =
+										SESSION_STATE_RUNNING_IDX;
+
+								}
 							}
 						}
 						break;
@@ -2735,21 +3122,31 @@ static void events_p(void *arg) {
 							if (cp->payload.ack.num_acks == 0) {
 								debug_printf("CTS received");
 								atomic_store(&server->session_tx->state,
-											 SESSION_STATE_RUNNING);
+											 SESSION_STATE_RUNNING_DATA);
 							}
 						}
 						if (server->session_tx != NULL &&
-							server->session_tx->state ==
-								SESSION_STATE_RUNNING) {
-							tx_register_acks(
-								&cp->payload.ack,
-								server->session_tx->tx_state);
+							server->session_tx->state == SESSION_STATE_RUNNING_DATA) {
+							tx_register_acks(&cp->payload.ack,
+											 server->session_tx->tx_state);
 							count_received_pkt(server->session_tx, h->path);
 							atomic_store(&server->session_tx->last_pkt_rcvd, get_nsecs());
 							if (tx_acked_all(server->session_tx->tx_state)) {
 								debug_printf("TX done, received all acks");
 								quit_session(server->session_tx,
 											 SESSION_ERROR_OK);
+							}
+						}
+						if (server->session_tx != NULL &&
+							server->session_tx->state == SESSION_STATE_RUNNING_IDX) {
+							tx_register_acks_index(&cp->payload.ack,
+											 server->session_tx->tx_state);
+							count_received_pkt(server->session_tx, h->path);
+							atomic_store(&server->session_tx->last_pkt_rcvd, get_nsecs());
+							if (tx_acked_all_index(server->session_tx->tx_state)) {
+								debug_printf("Index transfer done, received all acks");
+								reset_tx_state(server->session_tx->tx_state);
+								server->session_tx->state = SESSION_STATE_WAIT_CTS;
 							}
 						}
 						break;
@@ -2761,8 +3158,8 @@ static void events_p(void *arg) {
 							break;
 						}
 						if (server->session_tx != NULL &&
-							server->session_tx->state ==
-								SESSION_STATE_RUNNING) {
+							session_state_is_running(
+								server->session_tx->state)) {
 							count_received_pkt(server->session_tx, h->path);
 							nack_trace_push(cp->payload.ack.timestamp,
 											cp->payload.ack.ack_nr);

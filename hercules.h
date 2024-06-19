@@ -72,15 +72,19 @@ struct receiver_state {
 	atomic_uint_least64_t handshake_rtt;
 	/** Filesize in bytes */
 	size_t filesize;
+	size_t index_size;
 	/** Size of file data (in byte) per packet */
 	u32 chunklen;
 	/** Number of packets that will make up the entire file. Equal to
 	 * `ceil(filesize/chunklen)` */
 	u32 total_chunks;
+	u32 index_chunks;
 	/** Memory mapped file for receive */
 	char *mem;
+	char *index;
 
 	struct bitset received_chunks;
+	struct bitset received_chunks_index;
 
 	// The reply path to use for contacting the sender. This is the reversed
 	// path of the last initial packet with the SET_RETURN_PATH flag set.
@@ -128,6 +132,7 @@ struct sender_state {
 	u32 prev_chunk_idx;
 	bool finished;
 	struct bitset acked_chunks;			  //< Chunks we've received an ack for
+	struct bitset acked_chunks_index;			  //< Chunks we've received an ack for
 	atomic_uint_least64_t handshake_rtt;  // Handshake RTT in ns
 
 	struct path_set *_Atomic pathset;  // Paths currently in use
@@ -148,6 +153,10 @@ struct sender_state {
 	// Start/end time of the current transfer
 	u64 start_time;
 	u64 end_time;
+
+	u32 index_chunks;
+	char *index;
+	size_t index_size;
 };
 
 /// SESSION
@@ -158,9 +167,12 @@ enum session_state {
 							// waiting for a reflected HS packet
 	SESSION_STATE_NEW,	//< (RX) Received a HS packet, need to send HS reply and
 						// CTS
-	SESSION_STATE_WAIT_CTS,	 //< (TX) Waiting for CTS
-	SESSION_STATE_RUNNING,	 //< Transfer in progress
-	SESSION_STATE_DONE,		 //< Transfer done (or cancelled with error)
+	SESSION_STATE_WAIT_CTS,		 //< (TX) Waiting for CTS
+	SESSION_STATE_INDEX_READY,	 //< (RX) Index transfer complete, map files and
+								 //send CTS
+	SESSION_STATE_RUNNING_DATA,	 //< Data transfer in progress
+	SESSION_STATE_RUNNING_IDX,	 //< Directory index transfer in progress
+	SESSION_STATE_DONE,			 //< Transfer done (or cancelled with error)
 };
 
 enum session_error {
@@ -173,6 +185,7 @@ enum session_error {
 	SESSION_ERROR_CANCELLED,   //< Transfer cancelled by monitor
 	SESSION_ERROR_BAD_MTU,	   //< Invalid MTU supplied by the monitor
 	SESSION_ERROR_MAP_FAILED,  //< Could not mmap file
+	SESSION_ERROR_TOO_LARGE,   //< File or index size too large
 	SESSION_ERROR_INIT,		   //< Could not initialise session
 };
 

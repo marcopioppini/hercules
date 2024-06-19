@@ -114,6 +114,10 @@ static inline void bitset__reset(struct bitset *s)
 static inline u32 bitset__scan(struct bitset *s, u32 pos)
 {
 	// TODO: profile the entire application and rewrite this function to use bitscan ops
+	if (s->num == 1 && pos == 0) {
+		// Needed for the edge case where the bitset has only 1 entry
+		return !bitset__check(s, 0);
+	}
 	for(u32 i = pos; i < s->max_set; ++i) {
 		if(bitset__check(s, i)) {
 			return i;

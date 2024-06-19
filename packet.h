@@ -103,7 +103,24 @@ struct scmp_message {
 struct hercules_header {
 	__u32 chunk_idx;
 	__u8 path;
+	__u8 flags;
 	__u32 seqno;
+	__u8 data[];
+};
+// The flags field is zero for regular data and (N)ACK packets
+// The flags field has the lowest bit set for packets referring to the transfer
+// of a directory index
+// The flags field is zero for initial packets, since those don't refer to
+// either in particular
+#define PKT_FLAG_IS_INDEX (0x1u << 0)
+
+#define INDEX_TYPE_FILE 0
+#define INDEX_TYPE_DIR 1
+struct dir_index_entry {
+	__u32 filesize;
+	__u8 type;
+	__u32 path_len;
+	__u8 path[];
 };
 
 // Structure of first RBUDP packet sent by sender.
@@ -114,8 +131,8 @@ struct rbudp_initial_pkt {
 	__u64 timestamp;
 	__u8 path_index;
 	__u8 flags;
-	__u32 name_len;
-	__u8 name[];
+	__u32 index_len;
+	__u8 index[];
 };
 
 // Indicates to the receiver this path should be used for (N)ACKs
@@ -124,6 +141,9 @@ struct rbudp_initial_pkt {
 #define HANDSHAKE_FLAG_HS_CONFIRM (0x1u << 1)
 // Indicates that the packet is trying to start a new transfer
 #define HANDSHAKE_FLAG_NEW_TRANSFER (0x1u << 2)
+// We're transferring a directory and the index is larger than the space
+// available in the handshake packet
+#define HANDSHAKE_FLAG_INDEX_FOLLOWS (0x1u << 3)
 
 // Structure of ACK RBUDP packets sent by the receiver.
 // Integers all transmitted in little endian (host endianness).
