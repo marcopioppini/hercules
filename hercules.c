@@ -1670,6 +1670,9 @@ static char *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_id
 #ifdef RANDOMIZE_FLOWID
 static short flowIdCtr = 0;
 #endif
+#ifdef RANDOMIZE_UNDERLAY_SRC
+static short src_port_ctr = 0;
+#endif
 
 static inline void tx_handle_send_queue_unit_for_iface(
 	struct sender_state *tx_state, struct xsk_socket_info *xsk, int ifid,
@@ -1731,23 +1734,32 @@ static inline void tx_handle_send_queue_unit_for_iface(
 		void *rbudp_pkt = mempcpy(pkt, path->header.header, path->headerlen);
 
 #ifdef RANDOMIZE_FLOWID
-                short *flowId = (short *)&((char *)pkt)[44]; // ethernet hdr (14), ip hdr (20), udp hdr (8), offset of flowId in scion hdr
-                // XXX ^ ignores first 4 bits of flowId
-                *flowId = atomic_fetch_add(&flowIdCtr, 1);
+		short *flowId = (short *)&(
+			(char *)pkt)[44];  // ethernet hdr (14), ip hdr (20), udp hdr (8),
+							   // offset of flowId in scion hdr
+		// XXX ^ ignores first 4 bits of flowId
+		*flowId = atomic_fetch_add(&flowIdCtr, 1);
 #endif
-		u8 track_path = PCC_NO_PATH; // put path_idx iff PCC is enabled
+#ifdef RANDOMIZE_UNDERLAY_SRC
+		short *src_port =
+			(short *)&((char *)pkt)[34];  // Ethernet (14) + IP (20), src port
+										  // is first 2 bytes of udp header
+		*src_port = atomic_fetch_add(&src_port_ctr, 1);
+#endif
+		u8 track_path = PCC_NO_PATH;  // put path_idx iff PCC is enabled
 		sequence_number seqnr = 0;
-		if(path->cc_state != NULL) {
+		if (path->cc_state != NULL) {
 			track_path = unit->paths[i];
 			seqnr = atomic_fetch_add(&path->cc_state->last_seqnr, 1);
 		}
 		u8 flags = 0;
 		char *payload = tx_state->mem;
-		if (is_index_transfer){
+		if (is_index_transfer) {
 			flags |= PKT_FLAG_IS_INDEX;
 			payload = tx_state->index;
 		}
-		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, flags, seqnr, payload + chunk_start, len, path->payloadlen);
+		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, flags, seqnr,
+					   payload + chunk_start, len, path->payloadlen);
 		stitch_dst_port(path, dst_port, pkt);
 		stitch_src_port(path, tx_state->src_port, pkt);
 		stitch_checksum_with_dst(path, path->header.checksum, pkt);

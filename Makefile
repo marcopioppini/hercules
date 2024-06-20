@@ -11,6 +11,7 @@ ASAN_FLAG := -fsanitize=address
 CFLAGS += -g3 -DDEBUG $(ASAN_FLAG)
 # CFLAGS += -DDEBUG_PRINT_PKTS # print received/sent packets
 # CFLAGS += -DPRINT_STATS
+# CFLAGS += -DRANDOMIZE_UNDERLAY_SRC # Enabling this breaks SCMP packet parsing
 LDFLAGS = -lbpf -Lbpf/src -lm -lelf -pthread -lz -z noexecstack $(ASAN_FLAG)
 DEPFLAGS:=-MP -MD
 
