@@ -70,11 +70,12 @@ const (
 // since the server has no concept of pending jobs.
 
 type HerculesTransfer struct {
-	id     int            // ID identifying this transfer
-	status TransferStatus // Status as seen by the monitor
-	file   string         // Name of the file to transfer
-	dest   snet.UDPAddr   // Destination
-	pm     *PathManager
+	id       int            // ID identifying this transfer
+	status   TransferStatus // Status as seen by the monitor
+	file     string         // Name of the file to transfer on the source host
+	destFile string         // Name of the file to transfer at destination host
+	dest     snet.UDPAddr   // Destination
+	pm       *PathManager
 	// The following two fields are meaningless if the job's status is 'Queued'
 	// They are updated when the server sends messages of type 'update_job'
 	state        C.enum_session_state // The state returned by the server
@@ -179,15 +180,18 @@ func main() {
 				transfersLock.Unlock()
 				var b []byte
 				if selectedJob != nil {
-					fmt.Println("sending file to daemon:", selectedJob.file, selectedJob.id)
+					fmt.Println("sending file to daemon:", selectedJob.file, selectedJob.destFile, selectedJob.id)
 					_, _ = headersToDestination(*selectedJob) // look up paths to fix mtu
-					strlen := len(selectedJob.file)
+					strlen_src := len(selectedJob.file)
+					strlen_dst := len(selectedJob.destFile)
 					b = append(b, 1)
 					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.id))
 					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.dest.Host.Port))
 					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.pm.payloadLen))
-					b = binary.LittleEndian.AppendUint16(b, uint16(strlen))
+					b = binary.LittleEndian.AppendUint16(b, uint16(strlen_src))
+					b = binary.LittleEndian.AppendUint16(b, uint16(strlen_dst))
 					b = append(b, []byte(selectedJob.file)...)
+					b = append(b, []byte(selectedJob.destFile)...)
 				} else {
 					// no new jobs
 					b = append(b, 0)

@@ -15,13 +15,14 @@ import (
 // file (File to transfer)
 // dest (Destination IA+Host)
 func http_submit(w http.ResponseWriter, r *http.Request) {
-	if !r.URL.Query().Has("file") || !r.URL.Query().Has("dest") {
+	if !r.URL.Query().Has("file") || !r.URL.Query().Has("destfile") || !r.URL.Query().Has("dest") {
 		io.WriteString(w, "missing parameter")
 		return
 	}
 	file := r.URL.Query().Get("file")
+	destfile := r.URL.Query().Get("destfile")
 	dest := r.URL.Query().Get("dest")
-	fmt.Println(file, dest)
+	fmt.Println(file, destfile, dest)
 	destParsed, err := snet.ParseUDPAddr(dest)
 	if err != nil {
 		io.WriteString(w, "parse err")
@@ -33,11 +34,12 @@ func http_submit(w http.ResponseWriter, r *http.Request) {
 	transfersLock.Lock()
 	jobid := nextID
 	transfers[nextID] = &HerculesTransfer{
-		id:     nextID,
-		status: Queued,
-		file:   file,
-		dest:   *destParsed,
-		pm:     pm,
+		id:       nextID,
+		status:   Queued,
+		file:     file,
+		destFile: destfile,
+		dest:     *destParsed,
+		pm:       pm,
 	}
 	nextID += 1
 	transfersLock.Unlock()
@@ -103,8 +105,8 @@ func http_stat(w http.ResponseWriter, r *http.Request) {
 	}
 	file := r.URL.Query().Get("file")
 	info, err := os.Stat(file)
-	if os.IsNotExist(err){
-		io.WriteString(w, "OK 0 0\n");
+	if os.IsNotExist(err) {
+		io.WriteString(w, "OK 0 0\n")
 		return
 	} else if err != nil {
 		io.WriteString(w, "err\n")

@@ -20,7 +20,7 @@ bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
 // Check if the monitor has a new job available.
 // If so the function returns true and the job's details are filled into the
 // arguments.
-bool monitor_get_new_job(int sockfd, char *name, u16 *job_id,
+bool monitor_get_new_job(int sockfd, char *name, char *destname, u16 *job_id,
 						 u16 *dst_port, u16 *payloadlen);
 
 // Inform the monitor about a transfer's (new) status.
@@ -77,7 +77,8 @@ struct sockmsg_new_job_A {
 	uint16_t dest_port;
 	uint16_t payloadlen;
 	uint16_t filename_len;
-	uint8_t filename[SOCKMSG_MAX_PAYLOAD]; // Filename *without* terminating 0-byte
+	uint16_t destname_len;
+	uint8_t names[SOCKMSG_MAX_PAYLOAD]; // Filenames *without* terminating 0-byte
 };
 
 // Get paths to use for a given job ID

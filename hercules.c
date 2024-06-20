@@ -2123,9 +2123,15 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 	debug_printf("Dropping HS confirm packet, was not expecting one");
 }
 
+static void replace_dir(char *entry, char *src, char *dst) {
+	int oldlen = strlen(src);
+	int entry_size = strlen(entry) - oldlen + 1;
+
+}
+
 // Map the provided file into memory for reading. Returns pointer to the mapped
 // area, or null on error.
-static char *tx_mmap(char *fname, size_t *filesize, void **index_o, u64 *index_size_o) {
+static char *tx_mmap(char *fname, char *dstname, size_t *filesize, void **index_o, u64 *index_size_o) {
 	FTS *fts = NULL;
 	FTSENT *ent = NULL;
 	debug_printf("opening");
@@ -2227,6 +2233,32 @@ static char *tx_mmap(char *fname, size_t *filesize, void **index_o, u64 *index_s
 	struct dir_index_entry *p = index;
 	while (1) {
 		debug_printf("Read: %s (%d) %dB", p->path, p->type, p->filesize);
+		int src_path_len = strlen(p->path);
+		int src_root_len = strlen(fname);
+		int dst_root_len = strlen(dstname);
+		int dst_path_len = src_path_len - src_root_len + dst_root_len;
+		debug_printf("src path %d, root %d. dst path %d, root %d", src_path_len, src_root_len, dst_path_len, dst_root_len);
+		int entry_size = sizeof(struct dir_index_entry) + dst_path_len + 1;
+		if (dst_index_size + entry_size >= dst_index_cap) {
+			debug_printf("need realloc");
+			dst_index = realloc(dst_index, dst_index_cap + 4096);
+			if (dst_index == NULL) {
+				fts_close(fts);
+				return NULL;
+			}
+			dst_index_cap += 4096;
+		}
+		struct dir_index_entry *newentry = (struct dir_index_entry *)(dst_index + dst_index_size);
+		debug_printf("entry size %d, index size %d", entry_size, dst_index_size);
+		newentry->filesize = p->filesize;
+		newentry->type = p->type;
+		newentry->path_len = dst_path_len + 1;
+		strncpy(newentry->path, dstname, dst_root_len);
+		strncpy(&newentry->path[dst_root_len], &p->path[src_root_len],
+				dst_path_len - dst_root_len + 1);
+		debug_printf("Set dst path %s", newentry->path);
+		dst_index_size += entry_size;
+
 		if (p->type == INDEX_TYPE_FILE) {
 			int f = open(p->path, O_RDONLY);
 			if (f == -1) {
@@ -2250,10 +2282,11 @@ static char *tx_mmap(char *fname, size_t *filesize, void **index_o, u64 *index_s
 			break;
 		}
 	}
+	free(index);
 
 	*filesize = total_filesize;
-	*index_o = index;
-	*index_size_o = index_size;
+	*index_o = dst_index;
+	*index_size_o = dst_index_size;
 	return mem;
 }
 
@@ -2696,16 +2729,18 @@ static void new_tx_if_available(struct hercules_server *server) {
 	// slot it will still be free when we assign to it later on
 	char fname[1000];
 	memset(fname, 0, 1000);
+	char destname[1000];
+	memset(destname, 0, 1000);
 	int count;
 	u16 jobid;
 	u16 payloadlen;
 	u16 dst_port;
 
-	int ret = monitor_get_new_job(server->usock, fname, &jobid, &dst_port, &payloadlen);
+	int ret = monitor_get_new_job(server->usock, fname, destname, &jobid, &dst_port, &payloadlen);
 	if (!ret) {
 		return;
 	}
-	debug_printf("new job: %s", fname);
+	debug_printf("new job: %s -> %s", fname, destname);
 	debug_printf("using tx slot %d", session_slot);
 
 	if (sizeof(struct rbudp_initial_pkt) + rbudp_headerlen > (size_t)payloadlen) {
@@ -2717,7 +2752,7 @@ static void new_tx_if_available(struct hercules_server *server) {
 	size_t filesize;
 	void *index;
 	u64 index_size;
-	char *mem = tx_mmap(fname, &filesize, &index, &index_size);
+	char *mem = tx_mmap(fname, destname, &filesize, &index, &index_size);
 	if (mem == NULL){
 		debug_printf("mmap failed");
 		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_MAP_FAILED, 0, 0);

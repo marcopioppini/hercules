@@ -79,7 +79,7 @@ bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
 	return true;
 }
 
-bool monitor_get_new_job(int sockfd, char *name, u16 *job_id,
+bool monitor_get_new_job(int sockfd, char *name, char *destname, u16 *job_id,
 						 u16 *dst_port, u16 *payloadlen) {
 	struct sockaddr_un monitor;
 	monitor.sun_family = AF_UNIX;
@@ -94,8 +94,9 @@ bool monitor_get_new_job(int sockfd, char *name, u16 *job_id,
 		return false;
 	}
 	// XXX name needs to be allocated large enough by caller
-	strncpy(name, reply.payload.newjob.filename,
+	strncpy(name, reply.payload.newjob.names,
 			reply.payload.newjob.filename_len);
+	strncpy(destname, reply.payload.newjob.names + reply.payload.newjob.filename_len, reply.payload.newjob.destname_len);
 	*job_id = reply.payload.newjob.job_id;
 	debug_printf("received job id %d", reply.payload.newjob.job_id);
 	*payloadlen = reply.payload.newjob.payloadlen;
