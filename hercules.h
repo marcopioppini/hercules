@@ -133,7 +133,7 @@ struct sender_state {
 	u32 prev_chunk_idx;
 	bool finished;
 	struct bitset acked_chunks;			  //< Chunks we've received an ack for
-	struct bitset acked_chunks_index;			  //< Chunks we've received an ack for
+	struct bitset acked_chunks_index;	  //< Chunks we've received an ack for
 	atomic_uint_least64_t handshake_rtt;  // Handshake RTT in ns
 
 	struct path_set *_Atomic pathset;  // Paths currently in use
@@ -171,13 +171,14 @@ enum session_state {
 						// CTS
 	SESSION_STATE_WAIT_CTS,		 //< (TX) Waiting for CTS
 	SESSION_STATE_INDEX_READY,	 //< (RX) Index transfer complete, map files and
-								 //send CTS
+								 // send CTS
 	SESSION_STATE_RUNNING_DATA,	 //< Data transfer in progress
 	SESSION_STATE_RUNNING_IDX,	 //< Directory index transfer in progress
 	SESSION_STATE_DONE,			 //< Transfer done (or cancelled with error)
 };
 
 enum session_error {
+	SESSION_ERROR_NONE,		// Error not set yet
 	SESSION_ERROR_OK,		//< No error, transfer completed successfully
 	SESSION_ERROR_TIMEOUT,	//< Session timed out
 	SESSION_ERROR_STALE,	//< Packets are being received, but none are new

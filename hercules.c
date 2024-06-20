@@ -124,10 +124,12 @@ static inline struct hercules_interface *get_interface_by_id(struct hercules_ser
 }
 
 // Mark the session as done and store why it was stopped.
+// This may be called by any thread.
+// Actually setting the session state to DONE should be done
+// by the events_p thread.
 static inline void quit_session(struct hercules_session *s,
 								enum session_error err) {
 	s->error = err;
-	s->state = SESSION_STATE_DONE;
 }
 
 static u32 ack__max_num_entries(u32 len)
@@ -265,6 +267,7 @@ static struct hercules_session *make_session(struct hercules_server *server) {
 		return NULL;
 	}
 	s->state = SESSION_STATE_NONE;
+	s->error = SESSION_ERROR_NONE;
 	int err = posix_memalign((void **)&s->send_queue, CACHELINE_SIZE,
 							 sizeof(*s->send_queue));
 	if (err != 0) {
@@ -3088,6 +3091,25 @@ static void rx_send_cts(struct hercules_server *server, u64 now){
 	}
 }
 
+static void stop_finished_sessions(struct hercules_server *server, u64 now) {
+	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
+		struct hercules_session *session_tx = server->sessions_tx[s];
+		if (session_tx != NULL && session_tx->state != SESSION_STATE_DONE &&
+			session_tx->error != SESSION_ERROR_NONE) {
+			debug_printf("Stopping TX %d", s);
+			session_tx->state = SESSION_STATE_DONE;
+		}
+	}
+	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
+		struct hercules_session *session_rx = server->sessions_rx[s];
+		if (session_rx != NULL && session_rx->state != SESSION_STATE_DONE &&
+			session_rx->error != SESSION_ERROR_NONE) {
+			debug_printf("Stopping RX %d", s);
+			session_rx->state = SESSION_STATE_DONE;
+		}
+	}
+}
+
 #define PRINT_STATS
 
 // Read control packets from the control socket and process them; also handles
@@ -3111,6 +3133,7 @@ static void events_p(void *arg) {
 		// FIXME don't loop over all sessions, one at a time
 		new_tx_if_available(server);
 		mark_timed_out_sessions(server, now);
+		stop_finished_sessions(server, now);
 		cleanup_finished_sessions(server, now);
 		tx_retransmit_initial(server, now);
 		rx_send_cts(server, now);
