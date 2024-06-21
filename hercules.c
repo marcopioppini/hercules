@@ -1215,9 +1215,9 @@ static void rx_send_rtt_ack(struct hercules_server *server,
 	};
 	control_pkt.payload.initial.flags |= HANDSHAKE_FLAG_HS_CONFIRM;
 
+	stitch_src_port(&path, server->config.port_min + rx_slot + 1, buf);
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, 0, (char *)&control_pkt,
 	               sizeof(control_pkt.type) + sizeof(control_pkt.payload.initial), path.payloadlen);
-	stitch_src_port(&path, server->config.port_min + rx_slot + 1, buf);
 	stitch_checksum(&path, path.header.checksum, buf);
 
 	send_eth_frame(server, &path, buf);
@@ -1266,9 +1266,9 @@ static void rx_send_cts_ack(struct hercules_server *server,
 			.payload.ack.num_acks = 0,
 	};
 
+	stitch_src_port(&path, rx_state->src_port, buf);
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, 0, (char *)&control_pkt,
 	               sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
-	stitch_src_port(&path, rx_state->src_port, buf);
 	stitch_checksum(&path, path.header.checksum, buf);
 	send_eth_frame(server, &path, buf);
 	atomic_fetch_add(&rx_state->session->tx_npkts, 1);
@@ -1370,9 +1370,9 @@ static void rx_send_path_nacks(struct hercules_server *server, struct receiver_s
 		if (is_index_transfer) {
 			flag |= PKT_FLAG_IS_INDEX;
 		}
+		stitch_src_port(&path, rx_state->src_port, buf);
 		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, path_idx, flag, 0, (char *)&control_pkt,
 		               sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
-		stitch_src_port(&path, rx_state->src_port, buf);
 		stitch_checksum(&path, path.header.checksum, buf);
 
 		send_eth_frame(server, &path, buf);
@@ -1755,10 +1755,10 @@ static inline void tx_handle_send_queue_unit_for_iface(
 			flags |= PKT_FLAG_IS_INDEX;
 			payload = tx_state->index;
 		}
-		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, flags, seqnr,
-					   payload + chunk_start, len, path->payloadlen);
 		stitch_dst_port(path, dst_port, pkt);
 		stitch_src_port(path, tx_state->src_port, pkt);
+		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, flags, seqnr,
+					   payload + chunk_start, len, path->payloadlen);
 		stitch_checksum_with_dst(path, path->header.checksum, pkt);
 	}
 	xsk_ring_prod__submit(&xsk->tx, num_chunks_in_unit);
