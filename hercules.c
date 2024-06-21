@@ -75,6 +75,12 @@ static const u64 session_hs_retransmit_interval = 2e9; // 2 sec
 static const u64 session_stale_timeout = 30e9; // 30 sec
 #define PCC_NO_PATH UINT8_MAX // tell the receiver not to count the packet on any path
 
+#define FREE_NULL(p) \
+	do {             \
+		free(p);     \
+		p = NULL;    \
+	} while (0);
+
 // Fill packet with n bytes from data and pad with zeros to payloadlen.
 static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx, u8 flags,
 						   sequence_number seqnr, const char *data, size_t n,
@@ -294,16 +300,22 @@ static void destroy_session_tx(struct hercules_session *session) {
 
 	int ret = munmap(session->tx_state->mem, session->tx_state->filesize);
 	assert(ret == 0);  // No reason this should ever fail
+	session->tx_state->mem = NULL;
 
 	bitset__destroy(&session->tx_state->acked_chunks);
-	// TODO when can we free pathset?
-	/* free(session->tx_state->paths); */
-	/* bitset__destroy(&session->tx_state->cc_states->mi_nacked); */
-	/* free(session->tx_state->cc_states); */
-	free(session->tx_state);
+	bitset__destroy(&session->tx_state->acked_chunks_index);
+	struct path_set *pathset = session->tx_state->pathset;
+	for (u32 i = 0; i < pathset->n_paths; i++){
+		destroy_ccontrol_state(pathset->paths[i].cc_state, 0);
+		pathset->paths[i].cc_state = NULL;
+	}
+	FREE_NULL(session->tx_state->pathset);
+	FREE_NULL(session->tx_state->index);
+
+	FREE_NULL(session->tx_state);
 
 	destroy_send_queue(session->send_queue);
-	free(session->send_queue);
+	FREE_NULL(session->send_queue);
 	free(session);
 }
 
@@ -316,12 +328,15 @@ static void destroy_session_rx(struct hercules_session *session) {
 
 	int ret = munmap(session->rx_state->mem, session->rx_state->filesize);
 	assert(ret == 0);  // No reason this should ever fail
+	session->rx_state->mem = NULL;
 
 	bitset__destroy(&session->rx_state->received_chunks);
-	free(session->rx_state);
+	bitset__destroy(&session->rx_state->received_chunks_index);
+	FREE_NULL(session->rx_state->index);
+	FREE_NULL(session->rx_state);
 
 	destroy_send_queue(session->send_queue);
-	free(session->send_queue);
+	FREE_NULL(session->send_queue);
 	free(session);
 }
 
@@ -2022,13 +2037,6 @@ static void reset_tx_state(struct sender_state *tx_state) {
 	tx_state->prev_chunk_idx = 0;
 }
 
-static void destroy_tx_state(struct sender_state *tx_state) {
-	bitset__destroy(&tx_state->acked_chunks);
-	// TODO freeing pathset
-	/* free(tx_state->paths); */
-	free(tx_state);
-}
-
 // (Re)send HS if needed
 static void tx_retransmit_initial(struct hercules_server *server, int s, u64 now) {
 	struct hercules_session *session_tx = server->sessions_tx[s];
@@ -2800,13 +2808,13 @@ static void new_tx_if_available(struct hercules_server *server) {
 		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE, SESSION_ERROR_NO_PATHS, 0, 0);
 		return;
 	}
-	// TODO free paths
 	debug_printf("received %d paths", n_paths);
 
 	u16 src_port = server->config.port_min + session_slot + 1;
 	struct sender_state *tx_state = init_tx_state(
 		session, filesize, chunklen, chunks_for_index, index, server->rate_limit, mem, paths, 1, n_paths,
 		server->max_paths, server->n_threads, src_port);
+	free(paths);
 	strncpy(tx_state->filename, fname, 99);
 	tx_state->index = index;
 	tx_state->index_size = index_size;
