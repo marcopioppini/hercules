@@ -30,7 +30,10 @@ bool monitor_update_job(int sockfd, int job_id, enum session_state state,
 
 // Bind the socket for the daemon. The file is deleted if already present.
 // Returns the file descriptor if successful, 0 otherwise.
-int monitor_bind_daemon_socket();
+int monitor_bind_daemon_socket(char *server, char *monitor);
+
+#define HERCULES_DEFAULT_MONITOR_SOCKET "/var/run/herculesmon.sock"
+#define HERCULES_DEFAULT_DAEMON_SOCKET "/var/hercules.sock"
 
 // Maximum size of variable-length fields in socket messages. Since we pass
 // entire packets to the monitor to get reply paths, this must be at least as

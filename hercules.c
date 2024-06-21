@@ -48,6 +48,7 @@
 #include "bpf/src/xsk.h"
 #include "linux/filter.h" // actually linux/tools/include/linux/filter.h
 
+#include "tomlc99/toml.h"
 #include "frame_queue.h"
 #include "bitset.h"
 #include "libscion_checksum.h"
@@ -350,43 +351,39 @@ static void destroy_session_rx(struct hercules_session *session) {
 
 // Initialise the Hercules server. If this runs into trouble we just exit as
 // there's no point in continuing.
-struct hercules_server *hercules_init_server(
-	int *ifindices, int num_ifaces, const struct hercules_app_addr local_addr,
-	int queue, int xdp_mode, int n_threads, bool configure_queues,
-	bool enable_pcc) {
+struct hercules_server *hercules_init_server( struct hercules_config config,
+	int *ifindices, int num_ifaces, bool enable_pcc) {
 	struct hercules_server *server;
 	server = calloc(1, sizeof(*server) + num_ifaces * sizeof(*server->ifaces));
 	if (server == NULL) {
 		exit_with_error(NULL, ENOMEM);
 	}
 
-  server->usock = monitor_bind_daemon_socket();
+  server->usock = monitor_bind_daemon_socket(config.server_socket, config.monitor_socket);
   if (server->usock == 0) {
     fprintf(stderr, "Error binding daemon socket\n");
 	exit_with_error(NULL, EINVAL);
   }
-	server->ifindices = ifindices;
-	server->num_ifaces = num_ifaces;
-	server->config.queue = queue;
-	server->n_threads = n_threads;
-	memset(server->sessions_rx, 0, sizeof(server->sessions_rx[0])*HERCULES_CONCURRENT_SESSIONS);
-	memset(server->sessions_tx, 0, sizeof(server->sessions_tx[0])*HERCULES_CONCURRENT_SESSIONS);
-	server->worker_args = calloc(server->n_threads, sizeof(struct worker_args *));
-	if (server->worker_args == NULL){
-		exit_with_error(NULL, ENOMEM);
+  server->config = config;
+  server->ifindices = ifindices;
+  server->num_ifaces = num_ifaces;
+  server->n_threads = config.num_threads;
+  memset(server->sessions_rx, 0,
+		 sizeof(server->sessions_rx[0]) * HERCULES_CONCURRENT_SESSIONS);
+  memset(server->sessions_tx, 0,
+		 sizeof(server->sessions_tx[0]) * HERCULES_CONCURRENT_SESSIONS);
+  server->worker_args = calloc(server->n_threads, sizeof(struct worker_args *));
+  if (server->worker_args == NULL) {
+	  exit_with_error(NULL, ENOMEM);
 	}
-	server->config.local_addr = local_addr;
-	server->config.port_min = ntohs(local_addr.port);
+	server->config.port_min = ntohs(config.local_addr.port);
 	server->config.port_max = server->config.port_min + HERCULES_CONCURRENT_SESSIONS;
-	server->config.configure_queues = configure_queues;
-	server->config.xdp_mode = xdp_mode;
-	/* server->config.xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST; */
-	// FIXME with flags set, setup may fail and we don't catch it?
+	server->config.xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
 	server->enable_pcc = enable_pcc;
 
 	for (int i = 0; i < num_ifaces; i++) {
 		server->ifaces[i] = (struct hercules_interface){
-			.queue = queue,
+			.queue = config.queue,
 			.ifid = ifindices[i],
 			.ethtool_rule = -1,
 		};
@@ -3575,128 +3572,202 @@ void hercules_main(struct hercules_server *server) {
 }
 
 void usage(){
-	fprintf(stderr, "usage: ?? TODO\n");
+	fprintf(stderr, "usage: hercules-server [-c config.toml]\n");
 	exit(1);
 }
 
 // TODO Test multiple interfaces
 #define HERCULES_MAX_INTERFACES 1
 int main(int argc, char *argv[]) {
-  // Options:
-  // -i interface
-  // -l listen address
-  // -z XDP zerocopy mode
-  // -q queue
-  // -t TX worker threads
-  // -r RX worker threads
-  unsigned int if_idxs[HERCULES_MAX_INTERFACES];
-  int n_interfaces = 0;
-  struct hercules_app_addr listen_addr = {.ia = 0, .ip = 0, .port = 0};
-  int xdp_mode = XDP_COPY;
-  int queue = 0;
-  int tx_threads = 1;
-  int rx_threads = 1;
-  int opt;
-  while ((opt = getopt(argc, argv, "i:l:q:t:r:z")) != -1) {
-    switch (opt) {
-    case 'i':
-      debug_printf("Using interface %s", optarg);
-      if (n_interfaces >= HERCULES_MAX_INTERFACES) {
-        fprintf(stderr, "Too many interfaces specified\n");
-        exit(1);
-      }
-      if_idxs[n_interfaces] = if_nametoindex(optarg);
-      if (if_idxs[n_interfaces] == 0) {
-        fprintf(stderr, "No such interface: %s\n", optarg);
-        exit(1);
-      }
-      n_interfaces++;
-      break;
-    case 'l':;
-      // Expect something of the form: 17-ffaa:1:fe2,192.168.50.2:123
-      u64 ia;
-      u16 *ia_ptr = (u16 *)&ia;
-      char ip_str[100];
-      u32 ip;
-      u16 port;
-      int ret = sscanf(optarg, "%hu-%hx:%hx:%hx,%99[^:]:%hu", ia_ptr + 3,
-                       ia_ptr + 2, ia_ptr + 1, ia_ptr + 0, ip_str, &port);
-      if (ret != 6) {
-        fprintf(stderr, "Error parsing listen address\n");
-        exit(1);
-      }
-      listen_addr.ia = htobe64(ia);
-      listen_addr.port = htons(port);
-      ret = inet_pton(AF_INET, ip_str, &listen_addr.ip);
-      if (ret != 1) {
-        fprintf(stderr, "Error parsing listen address\n");
-        exit(1);
-      }
-      break;
-    case 'q':
-      queue = strtol(optarg, NULL, 10);
-      if (errno == EINVAL || errno == ERANGE) {
-        fprintf(stderr, "Error parsing queue\n");
-        exit(1);
-      }
-      break;
-    case 't':
-      tx_threads = strtol(optarg, NULL, 10);
-      if (errno == EINVAL || errno == ERANGE) {
-        fprintf(stderr, "Error parsing number of tx threads\n");
-        exit(1);
-      }
-      break;
-    case 'r':
-      rx_threads = strtol(optarg, NULL, 10);
-      if (errno == EINVAL || errno == ERANGE) {
-        fprintf(stderr, "Error parsing number of rx threads\n");
-        exit(1);
-      }
-      break;
-    case 'z':
-      xdp_mode = XDP_ZEROCOPY;
-      break;
-    default:
-      usage();
-    }
-  }
-  if (n_interfaces == 0 || listen_addr.ip == 0) {
-    fprintf(stderr, "Missing required argument\n");
-    exit(1);
-  }
-  if (rx_threads != tx_threads) {
-    // XXX This is not required, but if they are different we need to take care
-    // to allocate the right number of sockets, or have XDP sockets that are
-    // each used only for one of TX/RX
-    fprintf(stderr, "TX/RX threads must match\n");
-    exit(1);
-  }
-  debug_printf("Starting Hercules using queue %d, %d rx threads, %d tx "
-               "threads, xdp mode 0x%x",
-               queue, rx_threads, tx_threads, xdp_mode);
+	unsigned int if_idxs[HERCULES_MAX_INTERFACES];
+	int n_interfaces = 0;
+	char *config_path = NULL;
+	struct hercules_config config;
+	memset(&config, 0, sizeof(config));
+	// Set defaults
+	config.monitor_socket = HERCULES_DEFAULT_MONITOR_SOCKET;
+	config.server_socket = HERCULES_DEFAULT_DAEMON_SOCKET;
+	config.queue = 0;
+	config.configure_queues = true;
+	config.num_threads = 1;
+	config.xdp_mode = XDP_COPY;
 
-  bool enable_pcc = true;
-  struct hercules_server *server =
-	  hercules_init_server(if_idxs, n_interfaces, listen_addr, queue, xdp_mode,
-						   rx_threads, false, enable_pcc);
+	// Parse command line args (there is only one)
+	int opt;
+	while ((opt = getopt(argc, argv, "c:")) != -1) {
+		switch (opt) {
+			case 'c':
+				config_path = optarg;
+				break;
+			default:
+				usage();
+		}
+	}
 
-  // Register a handler for SIGINT/SIGTERM for clean shutdown
-  struct sigaction act = {0};
-  act.sa_handler = hercules_stop;
-  act.sa_flags = SA_RESETHAND;
-  int ret = sigaction(SIGINT, &act, NULL);
-  if (ret == -1){
-	  fprintf(stderr, "Error registering signal handler\n");
-	  exit(1);
-  }
-  ret = sigaction(SIGTERM, &act, NULL);
-  if (ret == -1){
-	  fprintf(stderr, "Error registering signal handler\n");
-	  exit(1);
-  }
+	// Open and parse config file
+	FILE *config_file;
+	char errbuf[200];
+	if (config_path != NULL) {
+		config_file = fopen(config_path, "r");
+		debug_printf("Using config file %s", config_path);
+	} else {
+		config_file = fopen(HERCULES_DEFAULT_CONFIG_PATH, "r");
+		debug_printf("Using default config file %s",
+					 HERCULES_DEFAULT_CONFIG_PATH);
+	}
+	if (!config_file) {
+		fprintf(stderr, "Cannot open config file!\n");
+		exit(1);
+	}
 
-  hercules_main(server);
+	toml_table_t *conf = toml_parse_file(config_file, errbuf, sizeof(errbuf));
+	fclose(config_file);
+	if (!conf) {
+		fprintf(stderr, "Error parsing config file: %s", errbuf);
+		exit(1);
+	}
+
+	// Socket paths
+	toml_datum_t monitor_socket = toml_string_in(conf, "MonitorSocket");
+	if (monitor_socket.ok) {
+		config.monitor_socket = monitor_socket.u.s;
+	} else {
+		if (toml_key_exists(conf, "MonitorSocket")) {
+			fprintf(stderr, "Error parsing MonitorSocket\n");
+			exit(1);
+		}
+	}
+	toml_datum_t server_socket = toml_string_in(conf, "ServerSocket");
+	if (server_socket.ok) {
+		config.server_socket = server_socket.u.s;
+	} else {
+		if (toml_key_exists(conf, "ServerSocket")) {
+			fprintf(stderr, "Error parsing ServerSocket\n");
+			exit(1);
+		}
+	}
+
+	// Listening address
+	toml_datum_t listen_addr = toml_string_in(conf, "ListenAddress");
+	if (!listen_addr.ok) {
+		fprintf(stderr, "Missing required ListenAddress in config file?\n");
+		exit(1);
+	}
+	// Expect something of the form: 17-ffaa:1:fe2,192.168.50.2:123
+	u64 ia;
+	u16 *ia_ptr = (u16 *)&ia;
+	char ip_str[100];
+	u32 ip;
+	u16 port;
+	int ret = sscanf(listen_addr.u.s, "%hu-%hx:%hx:%hx,%99[^:]:%hu", ia_ptr + 3,
+					 ia_ptr + 2, ia_ptr + 1, ia_ptr + 0, ip_str, &port);
+	if (ret != 6) {
+		fprintf(stderr, "Error parsing listen address\n");
+		exit(1);
+	}
+	config.local_addr.ia = htobe64(ia);
+	config.local_addr.port = htons(port);
+	ret = inet_pton(AF_INET, ip_str, &config.local_addr.ip);
+	if (ret != 1) {
+		fprintf(stderr, "Error parsing listen address\n");
+		exit(1);
+	}
+
+	// NIC Queue
+	toml_datum_t queue = toml_int_in(conf, "Queue");
+	if (queue.ok) {
+		config.queue = queue.u.i;
+	} else {
+		if (toml_key_exists(conf, "Queue")) {
+			fprintf(stderr, "Error parsing Queue\n");
+			exit(1);
+		}
+	}
+	// Automatic queue configuration
+	toml_datum_t configure_queues = toml_bool_in(conf, "ConfigureQueues");
+	if (configure_queues.ok) {
+		config.configure_queues = (configure_queues.u.b);
+	} else {
+		if (toml_key_exists(conf, "ConfigureQueues")) {
+			fprintf(stderr, "Error parsing ConfigureQueues\n");
+			exit(1);
+		}
+	}
+
+	// XDP Zerocopy
+	toml_datum_t zerocopy_enabled = toml_bool_in(conf, "XDPZeroCopy");
+	if (zerocopy_enabled.ok) {
+		config.xdp_mode = (zerocopy_enabled.u.b) ? XDP_ZEROCOPY : XDP_COPY;
+	} else {
+		if (toml_key_exists(conf, "XDPZeroCopy")) {
+			fprintf(stderr, "Error parsing XDPZeroCopy\n");
+			exit(1);
+		}
+	}
+
+	// Worker threads
+	toml_datum_t nthreads = toml_int_in(conf, "NumThreads");
+	if (nthreads.ok) {
+		config.num_threads = nthreads.u.i;
+	} else {
+		if (toml_key_exists(conf, "NumThreads")) {
+			fprintf(stderr, "Error parsing NumThreads\n");
+			exit(1);
+		}
+	}
+
+	// Interfaces
+	toml_array_t *interfaces = toml_array_in(conf, "Interfaces");
+	if (!interfaces || toml_array_nelem(interfaces) == 0) {
+		fprintf(stderr, "Missing required Interfaces in config file?\n");
+		exit(1);
+	}
+
+	for (int i = 0; i < toml_array_nelem(interfaces); i++) {
+		toml_datum_t this_if = toml_string_at(interfaces, i);
+		if (!this_if.ok){
+			fprintf(stderr, "Error parsing interfaces?\n");
+			exit(1);
+		}
+		debug_printf("Using interface %s", this_if.u.s);
+		if (n_interfaces >= HERCULES_MAX_INTERFACES) {
+			fprintf(stderr, "Too many interfaces specified\n");
+			exit(1);
+		}
+		if_idxs[n_interfaces] = if_nametoindex(this_if.u.s);
+		if (if_idxs[n_interfaces] == 0) {
+			fprintf(stderr, "No such interface: %s\n", this_if.u.s);
+			exit(1);
+		}
+		n_interfaces++;
+	}
+
+	debug_printf(
+		"Starting Hercules using queue %d, queue config %d, %d worker threads, "
+		"xdp mode 0x%x",
+		config.queue, config.configure_queues, config.num_threads,
+		config.xdp_mode);
+
+	bool enable_pcc = true;
+	struct hercules_server *server =
+		hercules_init_server(config, if_idxs, n_interfaces, enable_pcc);
+
+	// Register a handler for SIGINT/SIGTERM for clean shutdown
+	struct sigaction act = {0};
+	act.sa_handler = hercules_stop;
+	act.sa_flags = SA_RESETHAND;
+	ret = sigaction(SIGINT, &act, NULL);
+	if (ret == -1) {
+		fprintf(stderr, "Error registering signal handler\n");
+		exit(1);
+	}
+	ret = sigaction(SIGTERM, &act, NULL);
+	if (ret == -1) {
+		fprintf(stderr, "Error registering signal handler\n");
+		exit(1);
+	}
+
+	hercules_main(server);
 }
 
 /// Local Variables:

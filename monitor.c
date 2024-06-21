@@ -13,17 +13,12 @@
 bool monitor_get_reply_path(int sockfd, const char *rx_sample_buf,
 							int rx_sample_len, int etherlen,
 							struct hercules_path *path) {
-	struct sockaddr_un monitor;
-	monitor.sun_family = AF_UNIX;
-	strcpy(monitor.sun_path, "/var/herculesmon.sock");
-
 	struct hercules_sockmsg_Q msg;
 	msg.msgtype = SOCKMSG_TYPE_GET_REPLY_PATH;
 	msg.payload.reply_path.etherlen = etherlen;
 	msg.payload.reply_path.sample_len = rx_sample_len;
 	memcpy(msg.payload.reply_path.sample, rx_sample_buf, rx_sample_len);
-	sendto(sockfd, &msg, sizeof(msg), 0, &monitor,
-		   sizeof(monitor));  // TODO return val
+	send(sockfd, &msg, sizeof(msg), 0);  // TODO return val
 
 	struct hercules_sockmsg_A reply;
 	int n = recv(sockfd, &reply, sizeof(reply), 0);
@@ -46,14 +41,10 @@ bool monitor_get_reply_path(int sockfd, const char *rx_sample_buf,
 // to compute the paths payload and frame lengths.
 bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
 					   struct hercules_path **paths) {
-	struct sockaddr_un monitor;
-	monitor.sun_family = AF_UNIX;
-	strcpy(monitor.sun_path, "/var/herculesmon.sock");
-
 	struct hercules_sockmsg_Q msg;
 	msg.msgtype = SOCKMSG_TYPE_GET_PATHS;
 	msg.payload.paths.job_id = job_id;
-	sendto(sockfd, &msg, sizeof(msg), 0, &monitor, sizeof(monitor));
+	send(sockfd, &msg, sizeof(msg), 0);
 
 	struct hercules_sockmsg_A reply;
 	int n = recv(sockfd, &reply, sizeof(reply), 0);
@@ -81,12 +72,8 @@ bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
 
 bool monitor_get_new_job(int sockfd, char *name, char *destname, u16 *job_id,
 						 u16 *dst_port, u16 *payloadlen) {
-	struct sockaddr_un monitor;
-	monitor.sun_family = AF_UNIX;
-	strcpy(monitor.sun_path, "/var/herculesmon.sock");
-
 	struct hercules_sockmsg_Q msg = {.msgtype = SOCKMSG_TYPE_GET_NEW_JOB};
-	sendto(sockfd, &msg, sizeof(msg), 0, &monitor, sizeof(monitor));
+	send(sockfd, &msg, sizeof(msg), 0);
 
 	struct hercules_sockmsg_A reply;
 	int n = recv(sockfd, &reply, sizeof(reply), 0);
@@ -107,10 +94,6 @@ bool monitor_get_new_job(int sockfd, char *name, char *destname, u16 *job_id,
 bool monitor_update_job(int sockfd, int job_id, enum session_state state,
 						enum session_error err, u64 seconds_elapsed,
 						u64 bytes_acked) {
-	struct sockaddr_un monitor;
-	monitor.sun_family = AF_UNIX;
-	strcpy(monitor.sun_path, "/var/herculesmon.sock");
-
 	struct hercules_sockmsg_Q msg;
 	msg.msgtype = SOCKMSG_TYPE_UPDATE_JOB;
 	msg.payload.job_update.job_id = job_id;
@@ -118,7 +101,7 @@ bool monitor_update_job(int sockfd, int job_id, enum session_state state,
 	msg.payload.job_update.error = err;
 	msg.payload.job_update.seconds_elapsed = seconds_elapsed;
 	msg.payload.job_update.bytes_acked = bytes_acked;
-	sendto(sockfd, &msg, sizeof(msg), 0, &monitor, sizeof(monitor));
+	send(sockfd, &msg, sizeof(msg), 0);
 
 	struct hercules_sockmsg_A reply;
 	int n = recv(sockfd, &reply, sizeof(reply), 0);
@@ -128,18 +111,25 @@ bool monitor_update_job(int sockfd, int job_id, enum session_state state,
 	return true;
 }
 
-#define HERCULES_DAEMON_SOCKET_PATH "/var/hercules.sock"
-int monitor_bind_daemon_socket() {
+int monitor_bind_daemon_socket(char *server, char *monitor) {
 	int usock = socket(AF_UNIX, SOCK_DGRAM, 0);
 	if (usock <= 0) {
 		return 0;
 	}
 	struct sockaddr_un name;
 	name.sun_family = AF_UNIX;
-	strcpy(name.sun_path, HERCULES_DAEMON_SOCKET_PATH);
-	unlink(HERCULES_DAEMON_SOCKET_PATH);
+	strcpy(name.sun_path, server);
+	unlink(server);
 	int ret = bind(usock, &name, sizeof(name));
 	if (ret) {
+		return 0;
+	}
+
+	struct sockaddr_un monitor_sock;
+	monitor_sock.sun_family = AF_UNIX;
+	strcpy(monitor_sock.sun_path, monitor);
+	ret = connect(usock, &monitor_sock, sizeof(monitor_sock));
+	if (ret){
 		return 0;
 	}
 	return usock;

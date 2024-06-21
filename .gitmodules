@@ -2,3 +2,7 @@
 	path = bpf
 	url = https://github.com/libbpf/libbpf/
 	ignore = untracked
+[submodule "tomlc99"]
+	path = tomlc99
+	url = https://github.com/cktan/tomlc99.git
+	ignore = untracked

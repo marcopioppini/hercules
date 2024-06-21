@@ -3,15 +3,35 @@
 # By default, up to `DefaultNumPaths` paths will be used.
 DefaultNumPaths = 1
 
-# Path to the monitor socket
+# Path to the monitor's unix socket
 MonitorSocket = "var/run/herculesmon.sock"
+#
+# Path to the server's unix socket
+ServerSocket = "var/run/hercules.sock"
 
 # SCION address the Hercules server should listen on
 ListenAddress = "17-ffaa:1:fe2,192.168.10.141:8000"
 
+# Network interfaces to use for Hercules
 Interfaces = [
 "eth0",
 ]
+
+# If the NIC/drivers support XDP in zerocopy mode, enabling it
+# will improve performance.
+XDPZeroCopy = true
+
+# Specify the NIC RX queue on which to receive packets
+Queue = 0
+
+# For Hercules to receive traffic, packets must be redirected to the queue specified above.
+# Hercules will try to configure this automatically, but this behaviour can be overridden,
+# e.g. if you wish to set custom rules or automatic configuration fails.
+# If you set this to false, you must manually ensure packets end up in the right queue.
+ConfigureQueues = false
+
+# The number of RX/TX worker threads to use
+NumThreads = 2
 
 # The number and choice of paths can be overridden on a destination-host
 # or destination-AS basis. In case both an AS and Host rule match, the Host

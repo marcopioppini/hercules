@@ -12,7 +12,7 @@ CFLAGS += -g3 -DDEBUG $(ASAN_FLAG)
 # CFLAGS += -DDEBUG_PRINT_PKTS # print received/sent packets
 # CFLAGS += -DPRINT_STATS
 # CFLAGS += -DRANDOMIZE_UNDERLAY_SRC # Enabling this breaks SCMP packet parsing
-LDFLAGS = -lbpf -Lbpf/src -lm -lelf -pthread -lz -z noexecstack $(ASAN_FLAG)
+LDFLAGS = -lbpf -Lbpf/src -Ltomlc99 -lm -lelf -pthread -lz -ltoml -z noexecstack $(ASAN_FLAG)
 DEPFLAGS:=-MP -MD
 
 SRCS := $(wildcard *.c)
@@ -31,7 +31,7 @@ all: $(TARGET_MONITOR) $(TARGET_SERVER)
 $(TARGET_MONITOR): $(MONITORFILES) $(wildcard *.h)
 	cd monitor && go build -o "../$@" -ldflags "-X main.startupVersion=${VERSION}"
 
-$(TARGET_SERVER): $(OBJS) bpf_prgm/redirect_userspace.o bpf/src/libbpf.a builder
+$(TARGET_SERVER): $(OBJS) bpf_prgm/redirect_userspace.o bpf/src/libbpf.a tomlc99/libtoml.a builder
 	@# update modification dates in assembly, so that the new version gets loaded
 	@sed -i -e "s/\(load bpf_prgm_pass\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/pass.c | head -c 32)/g" bpf_prgms.s
 	@sed -i -e "s/\(load bpf_prgm_redirect_userspace\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/redirect_userspace.c | head -c 32)/g" bpf_prgms.s
@@ -61,6 +61,15 @@ bpf/src/libbpf.a: builder
 		docker exec -w /`basename $(PWD)`/bpf/src hercules-builder $(MAKE) all OBJDIR=.; \
 		mkdir -p build; \
 		docker exec -w /`basename $(PWD)`/bpf/src hercules-builder $(MAKE) install_headers DESTDIR=build OBJDIR=.; \
+	fi
+
+tomlc99/libtoml.a: builder
+	@if [ ! -d tomlc99 ]; then \
+		echo "Error: Need libtoml submodule"; \
+		echo "May need to run git submodule update --init"; \
+		exit 1; \
+	else \
+		docker exec -w /`basename $(PWD)`/tomlc99 hercules-builder $(MAKE) all; \
 	fi
 
 

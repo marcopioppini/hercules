@@ -366,15 +366,14 @@ int xdp_setup(struct hercules_server *server) {
 	}
 
 	load_xsk_redirect_userspace(server, server->worker_args, server->n_threads);
-	// TODO this is not set anywhere, so it will never run
+
 	if (server->config.configure_queues) {
-		configure_rx_queues(server);
+		int ret = configure_rx_queues(server);
+		if (ret != 0) {
+			return ret;
+		}
 	}
-	// TODO when/where is this needed?
-	// same for rx_state
-	/* 	libbpf_smp_rmb(); */
-	/* 	session->tx_state = tx_state; */
-	/* 	libbpf_smp_wmb(); */
+
 	debug_printf("XSK stuff complete");
 	return 0;
 }

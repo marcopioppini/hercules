@@ -26,6 +26,7 @@
 #include "frame_queue.h"
 #include "packet.h"
 
+#define HERCULES_DEFAULT_CONFIG_PATH "hercules.conf"
 #define HERCULES_MAX_HEADERLEN 256
 // NOTE: The maximum packet size is limited by the size of a single XDP frame
 // (page size - metadata overhead). This is around 3500, but the exact value
@@ -233,10 +234,13 @@ struct hercules_interface {
 
 // Config determined at program start
 struct hercules_config {
+	char *monitor_socket;
+	char *server_socket;
 	u32 xdp_flags;
 	int xdp_mode;
 	int queue;
 	bool configure_queues;
+	int num_threads;
 	struct hercules_app_addr local_addr;
 	u16 port_min;  // Lowest port on which to accept packets (in HOST
 				   // endianness)
