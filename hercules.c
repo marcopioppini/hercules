@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -74,6 +75,7 @@ static const u64 session_timeout = 10e9; // 10 sec
 static const u64 session_hs_retransmit_interval = 2e9; // 2 sec
 static const u64 session_stale_timeout = 30e9; // 30 sec
 #define PCC_NO_PATH UINT8_MAX // tell the receiver not to count the packet on any path
+_Atomic bool wants_shutdown = false;
 
 #define FREE_NULL(p) \
 	do {             \
@@ -96,6 +98,12 @@ static bool rbudp_check_initial(struct hercules_control_packet *pkt, size_t len,
 static struct hercules_session *make_session(struct hercules_server *server);
 
 /// COMMON
+
+// Signal handler
+void hercules_stop(int signo) {
+	(void) signo;
+	wants_shutdown = true;
+}
 
 // Check the SCION UDP address matches the session's peer
 static inline bool src_matches_address(struct hercules_session *session,
@@ -2471,7 +2479,7 @@ static void tx_send_p(void *arg) {
 	struct worker_args *args = arg;
 	struct hercules_server *server = args->server;
 	int cur_session = 0;
-	while (1) {
+	while (!wants_shutdown) {
 		cur_session = ( cur_session + 1 ) % HERCULES_CONCURRENT_SESSIONS;
 		struct hercules_session *session_tx = server->sessions_tx[cur_session];
 		if (session_tx == NULL ||
@@ -2515,7 +2523,7 @@ static void tx_send_p(void *arg) {
 static void rx_trickle_acks(void *arg) {
 	struct hercules_server *server = arg;
 	int cur_session = 0;
-	while (1) {
+	while (!wants_shutdown) {
 		cur_session = ( cur_session + 1 ) % HERCULES_CONCURRENT_SESSIONS;
 		struct hercules_session *session_rx = server->sessions_rx[cur_session];
 		if (session_rx != NULL && session_state_is_running(session_rx->state)) {
@@ -2551,7 +2559,7 @@ static void rx_trickle_acks(void *arg) {
 static void rx_trickle_nacks(void *arg) {
 	struct hercules_server *server = arg;
 	int cur_session = 0;
-	while (1) {
+	while (!wants_shutdown) {
 		cur_session = (cur_session + 1) % HERCULES_CONCURRENT_SESSIONS;
 		struct hercules_session *session_rx = server->sessions_rx[cur_session];
 		if (session_rx != NULL && session_state_is_running(session_rx->state)) {
@@ -2587,7 +2595,7 @@ static void rx_p(void *arg) {
 	struct hercules_server *server = args->server;
 	int num_ifaces = server->num_ifaces;
 	u32 i = 0;
-	while (1) {
+	while (!wants_shutdown) {
 		rx_receive_batch(server, args->xsks[i % num_ifaces]);
 		i++;
 	}
@@ -2621,7 +2629,7 @@ static void rx_p(void *arg) {
 static void *tx_p(void *arg) {
   struct hercules_server *server = arg;
   int cur_session = 0;
-  while (1) {
+  while (!wants_shutdown) {
     /* pthread_spin_lock(&server->biglock); */
 	cur_session = (cur_session +1) % HERCULES_CONCURRENT_SESSIONS;
     pop_completion_rings(server);
@@ -2968,7 +2976,7 @@ static void tx_update_paths(struct hercules_server *server, int s) {
 			}
 			if (replaced_return_path) {
 				// If we changed the return path we re-send the handshake on
-				// all paths to update RTT
+				// all paths to update RTT.
 				debug_printf(
 					"Re-sending HS on path %d because return path changed", i);
 				new_pathset->paths[i].next_handshake_at = 0;
@@ -3128,7 +3136,7 @@ static void events_p(void *arg) {
 	memset(tx, 0, sizeof(tx));
 	memset(rx, 0, sizeof(rx));
 	int current_slot = 0;
-	while (1) {	 // event handler thread loop
+	while (!wants_shutdown) {	 // event handler thread loop
 		u64 now = get_nsecs();
 		current_slot = (current_slot + 1) % HERCULES_CONCURRENT_SESSIONS;
 		/* if (now > lastpoll + 1e9){ */
@@ -3158,9 +3166,9 @@ static void events_p(void *arg) {
 		/* 	lastpoll = now; */
 		/* } */
 
-		// XXX This is a bit of a hack: We want to handle received packets more
-		// frequently than we poll the monitor or check for expired sessions, so
-		// try to receive 100 times (non-blocking) before doing anything else.
+		// We want to handle received packets more frequently than we poll the
+		// monitor or check for expired sessions, so try to receive 1000 times
+		// (non-blocking) before doing anything else.
 		for (int i = 0; i < 1000; i++) {
 			ssize_t len = recvfrom(server->control_sockfd, buf, sizeof(buf),
 								   MSG_DONTWAIT, (struct sockaddr *)&addr,
@@ -3525,10 +3533,6 @@ void hercules_main(struct hercules_server *server) {
 	  exit(1);
   }
 
-  // Start event receiver thread
-  debug_printf("Starting event receiver thread");
-  pthread_t events = start_thread(NULL, events_p, server);
-
   // Start the NACK sender thread
   debug_printf("starting NACK trickle thread");
   pthread_t trickle_nacks = start_thread(NULL, rx_trickle_nacks, server);
@@ -3556,11 +3560,18 @@ void hercules_main(struct hercules_server *server) {
   debug_printf("starting thread tx_p");
   pthread_t tx_p_thread = start_thread(NULL, tx_p, server);
 
-  while (1) {
-    // XXX STOP HERE
-    // FIXME make this thread do something
-  }
+  events_p(server);
+
+  join_thread(server, trickle_acks);
+  join_thread(server, trickle_nacks);
   join_thread(server, tx_p_thread);
+  for (int i = 0; i < server->n_threads; i++){
+	  join_thread(server, rx_workers[i]);
+	  join_thread(server, tx_workers[i]);
+  }
+
+  xdp_teardown(server);
+  exit(0);
 }
 
 void usage(){
@@ -3669,6 +3680,21 @@ int main(int argc, char *argv[]) {
   struct hercules_server *server =
 	  hercules_init_server(if_idxs, n_interfaces, listen_addr, queue, xdp_mode,
 						   rx_threads, false, enable_pcc);
+
+  // Register a handler for SIGINT/SIGTERM for clean shutdown
+  struct sigaction act = {0};
+  act.sa_handler = hercules_stop;
+  act.sa_flags = SA_RESETHAND;
+  int ret = sigaction(SIGINT, &act, NULL);
+  if (ret == -1){
+	  fprintf(stderr, "Error registering signal handler\n");
+	  exit(1);
+  }
+  ret = sigaction(SIGTERM, &act, NULL);
+  if (ret == -1){
+	  fprintf(stderr, "Error registering signal handler\n");
+	  exit(1);
+  }
 
   hercules_main(server);
 }

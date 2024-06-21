@@ -42,4 +42,7 @@ int load_xsk_redirect_userspace(struct hercules_server *server,
 
 int xdp_setup(struct hercules_server *server);
 
+// Remove xdp program from interface and ethtool rules
+void xdp_teardown(struct hercules_server *server);
+
 #endif	// HERCULES_XDP_H_

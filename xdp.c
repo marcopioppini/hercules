@@ -378,3 +378,8 @@ int xdp_setup(struct hercules_server *server) {
 	debug_printf("XSK stuff complete");
 	return 0;
 }
+
+void xdp_teardown(struct hercules_server *server){
+	remove_xdp_program(server);
+	unconfigure_rx_queues(server);
+}
