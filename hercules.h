@@ -95,6 +95,8 @@ struct receiver_state {
 	u64 start_time;
 	u64 end_time;
 	u64 last_pkt_rcvd;	// Timeout detection
+	u32 ack_nr;
+	u64 next_nack_round_start;
 	u8 num_tracked_paths;
 	bool is_pcc_benchmark;
 	struct receiver_state_per_path path_state[256];

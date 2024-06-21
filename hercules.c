@@ -1633,19 +1633,16 @@ void send_path_handshakes(struct hercules_server *server,
 	}
 }
 
-static void claim_tx_frames(struct hercules_server *server, struct hercules_interface *iface, u64 *addrs, size_t num_frames)
+static void claim_tx_frames(struct hercules_server *server, struct hercules_session *session, struct hercules_interface *iface, u64 *addrs, size_t num_frames)
 {
-	// TODO FIXME Lock contention, significantly affects performance
 	pthread_spin_lock(&iface->umem->frames_lock);
 	size_t reserved = frame_queue__cons_reserve(&iface->umem->available_frames, num_frames);
 	while(reserved != num_frames) {
 		// When we're not getting any frames, we might need to...
 		kick_all_tx(server, iface);
 		reserved = frame_queue__cons_reserve(&iface->umem->available_frames, num_frames);
-		/* debug_printf("reserved %ld, wanted %ld", reserved, num_frames); */
 		// XXX FIXME
-		struct hercules_session *s = server->sessions_tx[0]; // FIXME idx 0
-		if(!s || !session_state_is_running(atomic_load(&s->state))) {
+		if(!session || !session_state_is_running(atomic_load(&session->state))) {
 			debug_printf("STOP");
 			pthread_spin_unlock(&iface->umem->frames_lock);
 			return;
@@ -1814,6 +1811,7 @@ produce_batch(struct hercules_server *server, struct hercules_session *session, 
 }
 
 static inline void allocate_tx_frames(struct hercules_server *server,
+									  struct hercules_session *session,
 									  u64 frame_addrs[][SEND_QUEUE_ENTRIES_PER_UNIT])
 {
 	for(int i = 0; i < server->num_ifaces; i++) {
@@ -1823,7 +1821,7 @@ static inline void allocate_tx_frames(struct hercules_server *server,
 				break;
 			}
 		}
-		claim_tx_frames(server, &server->ifaces[i], frame_addrs[i], num_frames);
+		claim_tx_frames(server, session, &server->ifaces[i], frame_addrs[i], num_frames);
 	}
 }
 
@@ -2032,20 +2030,18 @@ static void destroy_tx_state(struct sender_state *tx_state) {
 }
 
 // (Re)send HS if needed
-static void tx_retransmit_initial(struct hercules_server *server, u64 now) {
-	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
-		struct hercules_session *session_tx = server->sessions_tx[s];
-		if (session_tx && session_tx->state == SESSION_STATE_PENDING) {
-			if (now >
-				session_tx->last_pkt_sent + session_hs_retransmit_interval) {
-				struct sender_state *tx_state = session_tx->tx_state;
-				struct path_set *pathset = tx_state->pathset;
-				// We always use the first path as the return path
-				tx_send_initial(server, &pathset->paths[0], tx_state->index, tx_state->index_size, s,
-								session_tx->dst_port, tx_state->filesize, tx_state->chunklen, now, 0,
-								true, true);
-				session_tx->last_pkt_sent = now;
-			}
+static void tx_retransmit_initial(struct hercules_server *server, int s, u64 now) {
+	struct hercules_session *session_tx = server->sessions_tx[s];
+	if (session_tx && session_tx->state == SESSION_STATE_PENDING) {
+		if (now > session_tx->last_pkt_sent + session_hs_retransmit_interval) {
+			struct sender_state *tx_state = session_tx->tx_state;
+			struct path_set *pathset = tx_state->pathset;
+			// We always use the first path as the return path
+			tx_send_initial(server, &pathset->paths[0], tx_state->index,
+							tx_state->index_size, s, session_tx->dst_port,
+							tx_state->filesize, tx_state->chunklen, now, 0,
+							true, true);
+			session_tx->last_pkt_sent = now;
 		}
 	}
 }
@@ -2479,10 +2475,6 @@ static void tx_send_p(void *arg) {
 		struct send_queue_unit unit;
 		int ret = send_queue_pop(session_tx->send_queue, &unit);
 		if (!ret) {
-			pathset_read(
-				session_tx->tx_state,
-				args->id);	// Necessary to prevent prevent pathset updater from
-							// getting stuck in an infinite loop;
 			kick_tx_server(server);
 			continue;
 		}
@@ -2504,7 +2496,7 @@ static void tx_send_p(void *arg) {
 				frame_addrs[0][i] = 0;
 			}
 		}
-		allocate_tx_frames(server, frame_addrs);
+		allocate_tx_frames(server, session_tx, frame_addrs);
 		tx_handle_send_queue_unit(server, session_tx->tx_state, args->xsks,
 								  frame_addrs, &unit, args->id, session_tx->dst_port, is_index_transfer);
 		atomic_fetch_add(&session_tx->tx_npkts, num_chunks_in_unit); // FIXME should this be here?
@@ -2552,29 +2544,31 @@ static void rx_trickle_nacks(void *arg) {
 	struct hercules_server *server = arg;
 	int cur_session = 0;
 	while (1) {
-		cur_session = ( cur_session + 1 ) % HERCULES_CONCURRENT_SESSIONS;
+		cur_session = (cur_session + 1) % HERCULES_CONCURRENT_SESSIONS;
 		struct hercules_session *session_rx = server->sessions_rx[cur_session];
 		if (session_rx != NULL && session_state_is_running(session_rx->state)) {
-			u32 ack_nr = 0;
-			bool is_index_transfer = (session_rx->state == SESSION_STATE_RUNNING_IDX);
+			bool is_index_transfer =
+				(session_rx->state == SESSION_STATE_RUNNING_IDX);
 			struct receiver_state *rx_state = session_rx->rx_state;
-			// TODO remove this inner loop?
-			while (session_state_is_running(rx_state->session->state) &&
-				   !rx_received_all(rx_state, is_index_transfer)) {
-				u64 ack_round_start = get_nsecs();
-				rx_send_nacks(server, rx_state, ack_round_start, ack_nr, is_index_transfer);
-				u64 ack_round_end = get_nsecs();
-				if (ack_round_end >
-					ack_round_start + rx_state->handshake_rtt * 1000 / 4) {
-					/* fprintf(stderr, "NACK send too slow (took %lld of %ld)\n", */
-					/* 		ack_round_end - ack_round_start, */
-					/* 		rx_state->handshake_rtt * 1000 / 4); */
-				} else {
-					sleep_until(ack_round_start +
-								rx_state->handshake_rtt * 1000 / 4);
-				}
-				ack_nr++;
+			u32 ack_nr = rx_state->ack_nr;
+			u64 now = get_nsecs();
+			if (now < rx_state->next_nack_round_start) {
+				continue;
 			}
+			u64 ack_round_start = now;
+			rx_send_nacks(server, rx_state, ack_round_start, ack_nr,
+						  is_index_transfer);
+			u64 ack_round_end = get_nsecs();
+			if (ack_round_end >
+				ack_round_start + rx_state->handshake_rtt * 1000 / 4) {
+				/* fprintf(stderr, "NACK send too slow (took %lld of %ld)\n", */
+				/* 		ack_round_end - ack_round_start, */
+				/* 		rx_state->handshake_rtt * 1000 / 4); */
+			} else {
+				rx_state->next_nack_round_start =
+					ack_round_start + rx_state->handshake_rtt * 1000 / 4;
+			}
+			rx_state->ack_nr++;
 		}
 	}
 }
@@ -2821,189 +2815,174 @@ static void new_tx_if_available(struct hercules_server *server) {
 }
 
 // Remove and free finished sessions
-static void cleanup_finished_sessions(struct hercules_server *server, u64 now) {
-	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
-		// Wait for twice the session timeout before removing the finished
-		// session (and thus before accepting new sessions). This ensures the
-		// other party has also quit or timed out its session and won't send
-		// packets that would then be mixed into future sessions.
-		// XXX This depends on both endpoints sharing the same timeout value,
-		// which is not negotiated but defined at the top of this file.
-		struct hercules_session *session_tx = atomic_load(&server->sessions_tx[s]);
-		if (session_tx && session_tx->state == SESSION_STATE_DONE) {
-			if (now > session_tx->last_pkt_rcvd + session_timeout * 2) {
-				u64 sec_elapsed = (now - session_tx->last_pkt_rcvd) / (int)1e9;
-				u64 bytes_acked = session_tx->tx_state->chunklen *
-								  session_tx->tx_state->acked_chunks.num_set;
-				monitor_update_job(server->usock, session_tx->jobid,
-								   session_tx->state, session_tx->error,
-								   sec_elapsed, bytes_acked);
-				struct hercules_session *current = session_tx;
-				atomic_store(&server->sessions_tx[s], NULL);
-				fprintf(stderr, "Cleaning up TX session %d...\n", s);
-				// At this point we don't know if some other thread still has a
-				// pointer to the session that it might dereference, so we
-				// cannot safely free it. So, we record the pointer and defer
-				// freeing it until after the next session has completed. At
-				// that point, no references to the deferred session should be
-				// around, so we then free it.
-				destroy_session_tx(server->deferreds_tx[s]);
-				server->deferreds_tx[s] = current;
-			}
+static void cleanup_finished_sessions(struct hercules_server *server, int s, u64 now) {
+	// Wait for twice the session timeout before removing the finished
+	// session (and thus before accepting new sessions). This ensures the
+	// other party has also quit or timed out its session and won't send
+	// packets that would then be mixed into future sessions.
+	// XXX This depends on both endpoints sharing the same timeout value,
+	// which is not negotiated but defined at the top of this file.
+	struct hercules_session *session_tx = atomic_load(&server->sessions_tx[s]);
+	if (session_tx && session_tx->state == SESSION_STATE_DONE) {
+		if (now > session_tx->last_pkt_rcvd + session_timeout * 2) {
+			u64 sec_elapsed = (now - session_tx->last_pkt_rcvd) / (int)1e9;
+			u64 bytes_acked = session_tx->tx_state->chunklen *
+							  session_tx->tx_state->acked_chunks.num_set;
+			monitor_update_job(server->usock, session_tx->jobid,
+							   session_tx->state, session_tx->error,
+							   sec_elapsed, bytes_acked);
+			struct hercules_session *current = session_tx;
+			atomic_store(&server->sessions_tx[s], NULL);
+			fprintf(stderr, "Cleaning up TX session %d...\n", s);
+			// At this point we don't know if some other thread still has a
+			// pointer to the session that it might dereference, so we
+			// cannot safely free it. So, we record the pointer and defer
+			// freeing it until after the next session has completed. At
+			// that point, no references to the deferred session should be
+			// around, so we then free it.
+			destroy_session_tx(server->deferreds_tx[s]);
+			server->deferreds_tx[s] = current;
 		}
-		struct hercules_session *session_rx = atomic_load(&server->sessions_rx[s]);
-		if (session_rx && session_rx->state == SESSION_STATE_DONE) {
-			if (now > session_rx->last_pkt_rcvd + session_timeout * 2) {
-				struct hercules_session *current = session_rx;
-				atomic_store(&server->sessions_rx[s], NULL);
-				fprintf(stderr, "Cleaning up RX session %d...\n", s);
-				// See the note above on deferred freeing
-				destroy_session_rx(server->deferreds_rx[s]);
-				server->deferreds_rx[s] = current;
-			}
+	}
+	struct hercules_session *session_rx = atomic_load(&server->sessions_rx[s]);
+	if (session_rx && session_rx->state == SESSION_STATE_DONE) {
+		if (now > session_rx->last_pkt_rcvd + session_timeout * 2) {
+			struct hercules_session *current = session_rx;
+			atomic_store(&server->sessions_rx[s], NULL);
+			fprintf(stderr, "Cleaning up RX session %d...\n", s);
+			// See the note above on deferred freeing
+			destroy_session_rx(server->deferreds_rx[s]);
+			server->deferreds_rx[s] = current;
 		}
 	}
 }
 
 // Time out if no packets received for a while
-static void mark_timed_out_sessions(struct hercules_server *server, u64 now) {
-	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
-		struct hercules_session *session_tx = server->sessions_tx[s];
-		if (session_tx && session_tx->state != SESSION_STATE_DONE) {
-			if (now > session_tx->last_pkt_rcvd + session_timeout) {
-				quit_session(session_tx, SESSION_ERROR_TIMEOUT);
-				debug_printf("Session (TX %2d) timed out!", s);
-			}
+static void mark_timed_out_sessions(struct hercules_server *server, int s, u64 now) {
+	struct hercules_session *session_tx = server->sessions_tx[s];
+	if (session_tx && session_tx->state != SESSION_STATE_DONE) {
+		if (now > session_tx->last_pkt_rcvd + session_timeout) {
+			quit_session(session_tx, SESSION_ERROR_TIMEOUT);
+			debug_printf("Session (TX %2d) timed out!", s);
 		}
-		struct hercules_session *session_rx = server->sessions_rx[s];
-		if (session_rx && session_rx->state != SESSION_STATE_DONE) {
-			if (now > session_rx->last_pkt_rcvd + session_timeout) {
-				quit_session(session_rx, SESSION_ERROR_TIMEOUT);
-				debug_printf("Session (RX %2d) timed out!", s);
-			} else if (now >
-					   session_rx->last_new_pkt_rcvd + session_stale_timeout) {
-				quit_session(session_rx, SESSION_ERROR_STALE);
-				debug_printf("Session (RX %2d) stale!", s);
-			}
+	}
+	struct hercules_session *session_rx = server->sessions_rx[s];
+	if (session_rx && session_rx->state != SESSION_STATE_DONE) {
+		if (now > session_rx->last_pkt_rcvd + session_timeout) {
+			quit_session(session_rx, SESSION_ERROR_TIMEOUT);
+			debug_printf("Session (RX %2d) timed out!", s);
+		} else if (now >
+				   session_rx->last_new_pkt_rcvd + session_stale_timeout) {
+			quit_session(session_rx, SESSION_ERROR_STALE);
+			debug_printf("Session (RX %2d) stale!", s);
 		}
 	}
 }
 
-static void tx_update_paths(struct hercules_server *server) {
-	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
-		struct hercules_session *session_tx = server->sessions_tx[s];
+static void tx_update_paths(struct hercules_server *server, int s) {
+	struct hercules_session *session_tx = server->sessions_tx[s];
 	if (session_tx && session_state_is_running(session_tx->state)) {
-			debug_printf("Updating paths for TX %d", s);
-			struct sender_state *tx_state = session_tx->tx_state;
-			struct path_set *old_pathset = tx_state->pathset;
-			int n_paths;
-			struct hercules_path *paths;
-			bool ret =
-				monitor_get_paths(server->usock, session_tx->jobid,
-								  session_tx->payloadlen, &n_paths, &paths);
-			if (!ret) {
-				debug_printf("error getting paths");
-				return;
-			}
-			debug_printf("received %d paths", n_paths);
-			if (n_paths == 0) {
-				free(paths);
-				quit_session(session_tx, SESSION_ERROR_NO_PATHS);
-				return;
-			}
-			struct path_set *new_pathset = calloc(1, sizeof(*new_pathset));
-			if (new_pathset == NULL) {
-				// FIXME leak?
-				return;
-			}
-			u32 new_epoch = tx_state->next_epoch;
-			new_pathset->epoch = new_epoch;
-			tx_state->next_epoch++;
-			new_pathset->n_paths = n_paths;
-			memcpy(new_pathset->paths, paths, sizeof(*paths) * n_paths);
-			u32 path_lim = (old_pathset->n_paths > (u32)n_paths)
-							   ? (u32)n_paths
-							   : old_pathset->n_paths;
-			bool replaced_return_path = false;
-			struct ccontrol_state **replaced_cc =
-				calloc(old_pathset->n_paths, sizeof(*replaced_cc));
-			if (replaced_cc == NULL) {
-				// FIXME leak?
-				return;
-			}
-			for (u32 i = 0; i < old_pathset->n_paths; i++) {
-				replaced_cc[i] = old_pathset->paths[i].cc_state;
-			}
-			for (u32 i = 0; i < path_lim; i++) {
-				// Set these two values before the comparison or it would fail
-				// even if paths are the same.
-				new_pathset->paths[i].next_handshake_at =
-					old_pathset->paths[i].next_handshake_at;
-				new_pathset->paths[i].cc_state = old_pathset->paths[i].cc_state;
+		debug_printf("Updating paths for TX %d", s);
+		struct sender_state *tx_state = session_tx->tx_state;
+		struct path_set *old_pathset = tx_state->pathset;
+		int n_paths;
+		struct hercules_path *paths;
+		bool ret = monitor_get_paths(server->usock, session_tx->jobid,
+									 session_tx->payloadlen, &n_paths, &paths);
+		if (!ret) {
+			debug_printf("error getting paths");
+			return;
+		}
+		debug_printf("received %d paths", n_paths);
+		if (n_paths == 0) {
+			free(paths);
+			quit_session(session_tx, SESSION_ERROR_NO_PATHS);
+			return;
+		}
+		struct path_set *new_pathset = calloc(1, sizeof(*new_pathset));
+		if (new_pathset == NULL) {
+			// FIXME leak?
+			return;
+		}
+		u32 new_epoch = tx_state->next_epoch;
+		new_pathset->epoch = new_epoch;
+		tx_state->next_epoch++;
+		new_pathset->n_paths = n_paths;
+		memcpy(new_pathset->paths, paths, sizeof(*paths) * n_paths);
+		u32 path_lim = (old_pathset->n_paths > (u32)n_paths)
+						   ? (u32)n_paths
+						   : old_pathset->n_paths;
+		bool replaced_return_path = false;
+		struct ccontrol_state **replaced_cc =
+			calloc(old_pathset->n_paths, sizeof(*replaced_cc));
+		if (replaced_cc == NULL) {
+			// FIXME leak?
+			return;
+		}
+		for (u32 i = 0; i < old_pathset->n_paths; i++) {
+			replaced_cc[i] = old_pathset->paths[i].cc_state;
+		}
+		for (u32 i = 0; i < path_lim; i++) {
+			// Set these two values before the comparison or it would fail
+			// even if paths are the same.
+			new_pathset->paths[i].next_handshake_at =
+				old_pathset->paths[i].next_handshake_at;
+			new_pathset->paths[i].cc_state = old_pathset->paths[i].cc_state;
 
-				// XXX This works, but it means we restart CC even if the path
-				// has not changed (but the header has, eg. because the old one
-				// expired). We could avoid this by having the monitor tell us
-				// whether the path changed, as it used to.
-				if (memcmp(&old_pathset->paths[i], &new_pathset->paths[i],
-						   sizeof(struct hercules_path)) == 0) {
-					// Old and new path are the same, CC state carries over.
-					// Since we copied the CC state before just leave as-is.
-					debug_printf("Path %d not changed", i);
-					replaced_cc[i] = NULL;
-				} else {
-					debug_printf("Path %d changed, resetting CC", i);
-					if (i == 0) {
-						// Return path is always idx 0
-						replaced_return_path = true;
-					}
-					// TODO whether to use pcc should be decided on a per-path
-					// basis by the monitor
-					if (server->enable_pcc) {
-						// TODO assert chunk length fits onto path
-						// The new path is different, restart CC
-						// TODO where to get rate
-						u32 rate = 100;
-						new_pathset->paths[i].cc_state = init_ccontrol_state(
-							rate, tx_state->total_chunks, new_pathset->n_paths);
-						// Re-send a handshake to update path rtt
-						new_pathset->paths[i].next_handshake_at = 0;
-					}
+			// XXX This works, but it means we restart CC even if the path
+			// has not changed (but the header has, eg. because the old one
+			// expired). We could avoid this by having the monitor tell us
+			// whether the path changed, as it used to.
+			if (memcmp(&old_pathset->paths[i], &new_pathset->paths[i],
+					   sizeof(struct hercules_path)) == 0) {
+				// Old and new path are the same, CC state carries over.
+				// Since we copied the CC state before just leave as-is.
+				debug_printf("Path %d not changed", i);
+				replaced_cc[i] = NULL;
+			} else {
+				debug_printf("Path %d changed, resetting CC", i);
+				if (i == 0) {
+					// Return path is always idx 0
+					replaced_return_path = true;
 				}
-				if (replaced_return_path) {
-					// If we changed the return path we re-send the handshake on
-					// all paths to update RTT
-					debug_printf(
-						"Re-sending HS on path %d because return path changed",
-						i);
+				// TODO whether to use pcc should be decided on a per-path
+				// basis by the monitor
+				if (server->enable_pcc) {
+					// TODO assert chunk length fits onto path
+					// The new path is different, restart CC
+					// TODO where to get rate
+					u32 rate = 100;
+					new_pathset->paths[i].cc_state = init_ccontrol_state(
+						rate, tx_state->total_chunks, new_pathset->n_paths);
+					// Re-send a handshake to update path rtt
 					new_pathset->paths[i].next_handshake_at = 0;
 				}
 			}
-			// Finally, swap in the new pathset
-			tx_state->pathset = new_pathset;
-			free(paths);  // These were *copied* into the new pathset
-			for (int i = 0; i < server->n_threads + 1; i++) {
-				int attempts = 0;
-				do {
-					attempts++;
-					if (attempts > 1000000){
-						debug_printf("something wrong with pathset swap loop");
-						debug_printf("waiting on %d, epoch still %lld", i, tx_state->epochs[i].epoch);
-						attempts = 0;
-					}
-					// Wait until the thread has seen the new pathset
-				} while (tx_state->epochs[i].epoch != new_epoch);
+			if (replaced_return_path) {
+				// If we changed the return path we re-send the handshake on
+				// all paths to update RTT
+				debug_printf(
+					"Re-sending HS on path %d because return path changed", i);
+				new_pathset->paths[i].next_handshake_at = 0;
 			}
-			for (u32 i = 0; i < old_pathset->n_paths; i++) {
-				// If CC was replaced, this contains the pointer to the old CC
-				// state. Otherwise it contains NULL, and we don't need to free
-				// anything.
-				free(replaced_cc[i]);
-			}
-			free(replaced_cc);
-			free(old_pathset);
-			debug_printf("done with update");
 		}
+		// Finally, swap in the new pathset
+		tx_state->pathset = new_pathset;
+		free(paths);  // These were *copied* into the new pathset
+		for (int i = 0; i < server->n_threads + 1; i++) {
+			do {
+				// Wait until the thread has seen the new pathset
+			} while (tx_state->epochs[i].epoch != new_epoch);
+		}
+		for (u32 i = 0; i < old_pathset->n_paths; i++) {
+			// If CC was replaced, this contains the pointer to the old CC
+			// state. Otherwise it contains NULL, and we don't need to free
+			// anything.
+			free(replaced_cc[i]);
+		}
+		free(replaced_cc);
+		free(old_pathset);
+		debug_printf("done with update");
 	}
 }
 
@@ -3021,104 +3000,103 @@ struct prints{
 	u64 ts;
 };
 
-static void print_session_stats(struct hercules_server *server,
-								struct prints *p) {
-	u64 now = get_nsecs();
-	if (now < p->ts + 1e9) {
-		return;
-	}
-	u64 tdiff = now - p->ts;
-	p->ts = now;
-
+static void print_session_stats(struct hercules_server *server, u64 now,
+								struct prints *tx, struct prints *rx) {
+	fprintf(stderr, "\n");
+	double send_rate_total = 0;
+	double recv_rate_total = 0;
 	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
 		struct hercules_session *session_tx = server->sessions_tx[s];
 		if (session_tx && session_tx->state != SESSION_STATE_DONE) {
+			struct prints *p = &tx[s];
 			u32 sent_now = session_tx->tx_npkts;
 			u32 acked_count = session_tx->tx_state->acked_chunks.num_set;
 			u32 total = session_tx->tx_state->acked_chunks.num;
+			u64 tdiff = now - p->ts;
+			p->ts = now;
 			double send_rate_pps =
 				(sent_now - p->tx_sent) / ((double)tdiff / 1e9);
 			p->tx_sent = sent_now;
-			double send_rate = 8 * send_rate_pps *
-							   session_tx->tx_state->chunklen / 1e6;
+			double send_rate =
+				8 * send_rate_pps * session_tx->tx_state->chunklen / 1e6;
+			double progress_percent = acked_count / (double)total * 100;
+			send_rate_total += send_rate;
 			fprintf(stderr,
-					"(TX %2d) Chunks: %u/%u, rx: %ld, tx:%ld, rate %.2f Mbps\n",
-					s,
-					acked_count, total, session_tx->rx_npkts,
-					session_tx->tx_npkts, send_rate);
+					"(TX %2d) [%4.1f] Chunks: %9u/%9u, rx: %9ld, tx:%9ld, rate "
+					"%8.2f "
+					"Mbps\n",
+					s, progress_percent, acked_count, total,
+					session_tx->rx_npkts, session_tx->tx_npkts, send_rate);
 		}
 
 		struct hercules_session *session_rx = server->sessions_rx[s];
 		if (session_rx && session_rx->state != SESSION_STATE_DONE) {
-			u32 begin =
-				bitset__scan_neg(&session_rx->rx_state->received_chunks, 0);
+			struct prints *p = &rx[s];
 			u32 rec_count = session_rx->rx_state->received_chunks.num_set;
 			u32 total = session_rx->rx_state->received_chunks.num;
 			u32 rcvd_now = session_rx->rx_npkts;
+			u64 tdiff = now - p->ts;
+			p->ts = now;
 			double recv_rate_pps =
 				(rcvd_now - p->rx_received) / ((double)tdiff / 1e9);
 			p->rx_received = rcvd_now;
-			double recv_rate = 8 * recv_rate_pps *
-							   session_rx->rx_state->chunklen / 1e6;
+			double recv_rate =
+				8 * recv_rate_pps * session_rx->rx_state->chunklen / 1e6;
+			recv_rate_total += recv_rate;
+			double progress_percent = rec_count / (double)total * 100;
 			fprintf(stderr,
-					"(RX %2d) Chunks: %u/%u, rx: %ld, tx:%ld, rate %.2f Mbps\n",
-					s,
-					rec_count, total, session_rx->rx_npkts,
+					"(RX %2d) [%4.1f%%] Chunks: %9u/%9u, rx: %9ld, tx:%9ld, "
+					"rate %8.2f "
+					"Mbps\n",
+					s, progress_percent, rec_count, total, session_rx->rx_npkts,
 					session_rx->tx_npkts, recv_rate);
 		}
 	}
+	fprintf(stderr, "TX Total Rate: %.2f Mbps\n", send_rate_total);
+	fprintf(stderr, "RX Total Rate: %.2f Mbps\n", recv_rate_total);
 }
 
-static void tx_update_monitor(struct hercules_server *server, u64 now) {
-	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
-		struct hercules_session *session_tx = server->sessions_tx[s];
+static void tx_update_monitor(struct hercules_server *server, int s, u64 now) {
+	struct hercules_session *session_tx = server->sessions_tx[s];
 	if (session_tx != NULL && session_state_is_running(session_tx->state)) {
-			bool ret = monitor_update_job(
-				server->usock, session_tx->jobid, session_tx->state, 0,
-				(now - session_tx->tx_state->start_time) / (int)1e9,
-				session_tx->tx_state->chunklen *
-					session_tx->tx_state->acked_chunks.num_set);
-			if (!ret) {
-				quit_session(session_tx, SESSION_ERROR_CANCELLED);
-			}
+		bool ret = monitor_update_job(
+			server->usock, session_tx->jobid, session_tx->state, 0,
+			(now - session_tx->tx_state->start_time) / (int)1e9,
+			session_tx->tx_state->chunklen *
+				session_tx->tx_state->acked_chunks.num_set);
+		if (!ret) {
+			quit_session(session_tx, SESSION_ERROR_CANCELLED);
 		}
 	}
 }
 
-static void rx_send_cts(struct hercules_server *server, u64 now){
-	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
-		struct hercules_session *session_rx = server->sessions_rx[s];
-		if (session_rx != NULL &&
-			session_rx->state == SESSION_STATE_INDEX_READY) {
-			struct receiver_state *rx_state = session_rx->rx_state;
-			rx_state->mem = rx_mmap(rx_state->index, rx_state->index_size,
-									rx_state->filesize);
-			if (rx_state->mem == NULL) {
-				quit_session(session_rx, SESSION_ERROR_MAP_FAILED);
-				return;
-			}
-			rx_send_cts_ack(server, rx_state);
-			session_rx->state = SESSION_STATE_RUNNING_DATA;
+static void rx_send_cts(struct hercules_server *server, int s, u64 now) {
+	struct hercules_session *session_rx = server->sessions_rx[s];
+	if (session_rx != NULL && session_rx->state == SESSION_STATE_INDEX_READY) {
+		struct receiver_state *rx_state = session_rx->rx_state;
+		rx_state->mem =
+			rx_mmap(rx_state->index, rx_state->index_size, rx_state->filesize);
+		if (rx_state->mem == NULL) {
+			quit_session(session_rx, SESSION_ERROR_MAP_FAILED);
+			return;
 		}
+		rx_send_cts_ack(server, rx_state);
+		session_rx->state = SESSION_STATE_RUNNING_DATA;
 	}
 }
 
-static void stop_finished_sessions(struct hercules_server *server, u64 now) {
-	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
-		struct hercules_session *session_tx = server->sessions_tx[s];
-		if (session_tx != NULL && session_tx->state != SESSION_STATE_DONE &&
-			session_tx->error != SESSION_ERROR_NONE) {
-			debug_printf("Stopping TX %d", s);
-			session_tx->state = SESSION_STATE_DONE;
-		}
+static void stop_finished_sessions(struct hercules_server *server, int slot, u64 now) {
+	struct hercules_session *session_tx = server->sessions_tx[slot];
+	if (session_tx != NULL && session_tx->state != SESSION_STATE_DONE &&
+		session_tx->error != SESSION_ERROR_NONE) {
+		debug_printf("Stopping TX %d", slot);
+		session_tx->state = SESSION_STATE_DONE;
 	}
-	for (int s = 0; s < HERCULES_CONCURRENT_SESSIONS; s++) {
-		struct hercules_session *session_rx = server->sessions_rx[s];
-		if (session_rx != NULL && session_rx->state != SESSION_STATE_DONE &&
-			session_rx->error != SESSION_ERROR_NONE) {
-			debug_printf("Stopping RX %d", s);
-			session_rx->state = SESSION_STATE_DONE;
-		}
+	struct hercules_session *session_rx = server->sessions_rx[slot];
+	if (session_rx != NULL && session_rx->state != SESSION_STATE_DONE &&
+		session_rx->error != SESSION_ERROR_NONE) {
+		debug_printf("Stopping RX %d", slot);
+		session_rx->state = SESSION_STATE_DONE;
 	}
 }
 
@@ -3137,37 +3115,45 @@ static void events_p(void *arg) {
 	const struct udphdr *udphdr;
 
 	u64 lastpoll = 0;
-	struct prints prints = {.rx_received=0, .ts=0, .tx_sent=0};
+	struct prints tx[HERCULES_CONCURRENT_SESSIONS];
+	struct prints rx[HERCULES_CONCURRENT_SESSIONS];
+	memset(tx, 0, sizeof(tx));
+	memset(rx, 0, sizeof(rx));
+	int current_slot = 0;
 	while (1) {	 // event handler thread loop
 		u64 now = get_nsecs();
+		current_slot = (current_slot + 1) % HERCULES_CONCURRENT_SESSIONS;
 		/* if (now > lastpoll + 1e9){ */
 		// XXX run the following every n seconds or every n socket reads?
 		// FIXME don't loop over all sessions, one at a time
 		new_tx_if_available(server);
-		mark_timed_out_sessions(server, now);
-		stop_finished_sessions(server, now);
-		cleanup_finished_sessions(server, now);
-		tx_retransmit_initial(server, now);
-		rx_send_cts(server, now);
+		mark_timed_out_sessions(server, current_slot, now);
+		stop_finished_sessions(server, current_slot, now);
+		cleanup_finished_sessions(server, current_slot, now);
+		tx_retransmit_initial(server, current_slot, now);
+		rx_send_cts(server, current_slot, now);
 #ifdef PRINT_STATS
-		print_session_stats(server, &prints);
+		if (now > lastpoll + 1e9) {
+			print_session_stats(server, now, tx, rx);
+			lastpoll = now;
+		}
 #endif
 		/* if (now > lastpoll + 10e9){ */
 		/* 	tx_update_paths(server); */
 		/* 	lastpoll = now; */
 		/* } */
-		if (now > lastpoll + 20e9){
-			tx_update_monitor(server, now);
-			tx_update_paths(server);
-			lastpoll = now;
-		}
+		/* if (now > lastpoll + 20e9){ */
+		/* 	tx_update_monitor(server, current_slot, now); */
+		/* 	tx_update_paths(server, current_slot); */
+		/* 	lastpoll = now; */
+		/* } */
 		/* 	lastpoll = now; */
 		/* } */
 
 		// XXX This is a bit of a hack: We want to handle received packets more
 		// frequently than we poll the monitor or check for expired sessions, so
 		// try to receive 100 times (non-blocking) before doing anything else.
-		for (int i = 0; i < 100; i++) {
+		for (int i = 0; i < 1000; i++) {
 			ssize_t len = recvfrom(server->control_sockfd, buf, sizeof(buf),
 								   MSG_DONTWAIT, (struct sockaddr *)&addr,
 								   &addr_size);	 // XXX set timeout
@@ -3671,7 +3657,7 @@ int main(int argc, char *argv[]) {
                "threads, xdp mode 0x%x",
                queue, rx_threads, tx_threads, xdp_mode);
 
-  bool enable_pcc = false;
+  bool enable_pcc = true;
   struct hercules_server *server =
 	  hercules_init_server(if_idxs, n_interfaces, listen_addr, queue, xdp_mode,
 						   rx_threads, false, enable_pcc);
