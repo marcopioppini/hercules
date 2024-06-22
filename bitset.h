@@ -34,7 +34,7 @@ struct bitset {
 
 #define HERCULES_BITSET_WORD_BITS (8 * sizeof(unsigned int))
 
-void bitset__create(struct bitset *s, u32 num);
+int bitset__create(struct bitset *s, u32 num);
 
 void bitset__destroy(struct bitset *s);
 

@@ -66,7 +66,7 @@ func http_status(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	io.WriteString(w, fmt.Sprintf("OK %d %d %d %d %d\n", info.status, info.state, info.err, info.time_elapsed, info.chunks_acked))
+	io.WriteString(w, fmt.Sprintf("OK %d %d %d %d %d\n", info.status, info.state, info.err, info.time_elapsed, info.bytes_acked))
 }
 
 // Handle cancelling a transfer

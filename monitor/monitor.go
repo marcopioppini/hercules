@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/snet"
@@ -70,18 +71,19 @@ const (
 // since the server has no concept of pending jobs.
 
 type HerculesTransfer struct {
-	id       int            // ID identifying this transfer
-	status   TransferStatus // Status as seen by the monitor
-	file     string         // Name of the file to transfer on the source host
-	destFile string         // Name of the file to transfer at destination host
-	dest     snet.UDPAddr   // Destination
-	pm       *PathManager
+	id           int            // ID identifying this transfer
+	status       TransferStatus // Status as seen by the monitor
+	file         string         // Name of the file to transfer on the source host
+	destFile     string         // Name of the file to transfer at destination host
+	dest         snet.UDPAddr   // Destination
+	pm           *PathManager
+	timeFinished time.Time
 	// The following two fields are meaningless if the job's status is 'Queued'
 	// They are updated when the server sends messages of type 'update_job'
 	state        C.enum_session_state // The state returned by the server
 	err          C.enum_session_error // The error returned by the server
 	time_elapsed int                  // Seconds the transfer has been running
-	chunks_acked int                  // Number of successfully transferred chunks
+	bytes_acked  int                  // Number of successfully transferred chunks
 }
 
 var transfersLock sync.Mutex // To protect the map below
@@ -103,7 +105,7 @@ func main() {
 
 	listenAddress = config.ListenAddress.addr
 
-	GlobalQuerier = newPathQuerier() // TODO can the connection time out or break?
+	GlobalQuerier = newPathQuerier() // XXX Can the connection time out or break?
 
 	monitorSocket, err := net.ResolveUnixAddr("unixgram", config.MonitorSocket)
 	if err != nil {
@@ -139,7 +141,6 @@ func main() {
 	http.HandleFunc("/stat", http_stat)
 	go http.ListenAndServe(":8000", nil)
 
-	// TODO remove finished sessions after a while
 	// Communication is always initiated by the server,
 	// the monitor's job is to respond to queries from the server
 	for {
@@ -160,17 +161,33 @@ func main() {
 				buf = buf[2:]
 				etherlen := binary.LittleEndian.Uint16(buf[:2])
 				buf = buf[2:]
-				fmt.Println("sampel len, etherlen", sample_len, etherlen)
 				replyPath, nextHop, err := getReplyPathHeader(buf[:sample_len], int(etherlen))
-				fmt.Println(err) // TODO signal error to server?
-				iface, _ := pm.interfaceForRoute(nextHop)
-				b := SerializePathHeader(replyPath, iface.Index, C.HERCULES_MAX_HEADERLEN)
+				var b []byte
+				if err != nil {
+					fmt.Println("Error in reply path lookup:", err)
+					b = append(b, 0)
+					usock.WriteToUnix(b, a)
+					continue
+				}
+				iface, err := pm.interfaceForRoute(nextHop)
+				if err != nil {
+					fmt.Println("Error in reply interface lookup:", err)
+					b = append(b, 0)
+					usock.WriteToUnix(b, a)
+					continue
+				}
+				b = append(b, 1)
+				b = append(b, SerializePathHeader(replyPath, iface.Index, C.HERCULES_MAX_HEADERLEN)...)
 				usock.WriteToUnix(b, a)
 
 			case C.SOCKMSG_TYPE_GET_NEW_JOB:
 				transfersLock.Lock()
 				var selectedJob *HerculesTransfer = nil
-				for _, job := range transfers {
+				for k, job := range transfers {
+					if job.status == Done && time.Since(job.timeFinished) > time.Hour {
+						// Clean up old jobs while we're at it
+						delete(transfers, k)
+					}
 					if job.status == Queued {
 						selectedJob = job
 						job.status = Submitted
@@ -186,7 +203,12 @@ func main() {
 					strlen_dst := len(selectedJob.destFile)
 					b = append(b, 1)
 					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.id))
-					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.dest.Host.Port))
+
+					// Address components in network byte order
+					b = binary.BigEndian.AppendUint64(b, uint64(selectedJob.dest.IA))
+					b = append(b, selectedJob.dest.Host.IP[len(selectedJob.dest.Host.IP)-4:]...)
+					b = binary.BigEndian.AppendUint16(b, uint16(selectedJob.dest.Host.Port))
+
 					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.pm.payloadLen))
 					b = binary.LittleEndian.AppendUint16(b, uint16(strlen_src))
 					b = binary.LittleEndian.AppendUint16(b, uint16(strlen_dst))
@@ -227,8 +249,9 @@ func main() {
 				job.err = errorcode
 				if job.state == C.SESSION_STATE_DONE {
 					job.status = Done
+					job.timeFinished = time.Now()
 				}
-				job.chunks_acked = int(bytes_acked) // FIXME
+				job.bytes_acked = int(bytes_acked)
 				job.time_elapsed = int(seconds)
 				isCancelled := job.status == Cancelled
 				transfersLock.Unlock()

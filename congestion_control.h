@@ -2,7 +2,6 @@
 #define _CCONTROL_H_
 
 #include "bitset.h"
-#include "hercules.h"
 #include "utils.h"
 #include <pthread.h>
 
@@ -76,13 +75,13 @@ struct ccontrol_state {
 */
 // Initialize congestion control state
 struct ccontrol_state *
-init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, u32 num_paths);
+init_ccontrol_state(u32 max_rate_limit, u32 num_paths);
 void terminate_ccontrol(struct ccontrol_state *cc_state);
 void continue_ccontrol(struct ccontrol_state *cc_state);
 void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt);
 u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now);
 void kick_ccontrol(struct ccontrol_state *cc_state);
-void destroy_ccontrol_state(struct ccontrol_state *cc_states, size_t num_paths);
+void destroy_ccontrol_state(struct ccontrol_state *cc_states);
 void ccontrol_start_monitoring_interval(struct ccontrol_state *cc_state);
 
 // Apply PCC control decision, return new rate

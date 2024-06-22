@@ -47,7 +47,8 @@ struct hercules_path_header {
 
 // Path are specified as ETH/IP/UDP/SCION/UDP headers.
 struct hercules_path {
-	__u64 next_handshake_at;
+	_Atomic __u64 next_handshake_at;
+	int nack_errs;
 	int headerlen;
 	int payloadlen;
 	int framelen;  //!< length of ethernet frame; headerlen + payloadlen
@@ -73,7 +74,7 @@ struct receiver_state {
 	atomic_uint_least64_t handshake_rtt;
 	/** Filesize in bytes */
 	size_t filesize;
-	size_t index_size;
+	size_t index_size;	// Size of the directory index in bytes.
 	/** Size of file data (in byte) per packet */
 	u32 chunklen;
 	/** Number of packets that will make up the entire file. Equal to
@@ -84,36 +85,43 @@ struct receiver_state {
 	char *mem;
 	char *index;
 
-	struct bitset received_chunks;
-	struct bitset received_chunks_index;
+	struct bitset received_chunks;	// Bitset for marking received DATA chunks
+	struct bitset received_chunks_index;  // Bitset for received IDX chunks
 
 	// The reply path to use for contacting the sender. This is the reversed
 	// path of the last initial packet with the SET_RETURN_PATH flag set.
-	// TODO needs atomic? -> perf?
-	struct hercules_path reply_path;
+	// XXX (Performance) Some form of synchronisation is required for
+	// reading/writing the reply path. Even though it's marked atomic, atomicity
+	// of updates is ensured using locks behind the scenes (the type is too
+	// large). Could be optimised by making it a pointer.
+	_Atomic struct hercules_path reply_path;
 
-	// Start/end time of the current transfer
-	u64 start_time;
-	u64 end_time;
-	u64 last_pkt_rcvd;	// Timeout detection
 	u32 ack_nr;
 	u64 next_nack_round_start;
+	u64 next_ack_round_start;
 	u8 num_tracked_paths;
 	bool is_pcc_benchmark;
 	struct receiver_state_per_path path_state[256];
-	u16 src_port;
+	u16 src_port;	 // The UDP/SCION port to use when sending packets (LE)
+	u64 start_time;	 // Start/end time of the current transfer
+	u64 end_time;
 };
 
 /// SENDER
 
 // Used to atomically swap in new paths
 struct path_set {
-	u64 epoch;
+	u64 epoch;	// Epoch value of this path set. Set by the updating thread.
 	u32 n_paths;
 	u8 path_index;	// Path to use for sending next batch (used by tx_p)
 	struct hercules_path paths[256];
 };
 
+// When a thread reads the current path set it published the epoch value of the
+// set it read to let the updating thread know when it has moved on to the new
+// pathset and it's thus safe to free the previous one.
+// These should occupy exactly one cache line to stop multiple threads from
+// frequently writing to the same cache line.
 struct thread_epoch {
 	_Atomic u64 epoch;
 	u64 _[7];
@@ -127,6 +135,8 @@ struct sender_state {
 	// State for transmit rate control
 	size_t tx_npkts_queued;
 	u64 prev_rate_check;
+	u64 rate_limit_wait_until;
+	u64 next_ack_due;
 	size_t prev_tx_npkts_queued;
 	_Atomic u32 rate_limit;
 	u64 prev_round_start;
@@ -135,6 +145,7 @@ struct sender_state {
 	u64 ack_wait_duration;
 	u32 prev_chunk_idx;
 	bool finished;
+
 	struct bitset acked_chunks;			  //< Chunks we've received an ack for
 	struct bitset acked_chunks_index;	  //< Chunks we've received an ack for
 	atomic_uint_least64_t handshake_rtt;  // Handshake RTT in ns
@@ -146,7 +157,6 @@ struct sender_state {
 
 	/** Filesize in bytes */
 	size_t filesize;
-	char filename[100];
 	/** Size of file data (in byte) per packet */
 	u32 chunklen;
 	/** Number of packets that will make up the entire file. Equal to
@@ -158,10 +168,13 @@ struct sender_state {
 	u64 start_time;
 	u64 end_time;
 
-	u32 index_chunks;
+	u32 index_chunks;  // Chunks that make up the directory index
 	char *index;
-	size_t index_size;
-	u16 src_port;
+	size_t index_size;			// Size of the directory index in bytes
+	bool needs_index_transfer;	// Index does not fit in initial packet and
+								// needs to be transferred separately
+
+	u16 src_port;  // UDP/SCION port to use when sending packets
 };
 
 /// SESSION
@@ -200,24 +213,25 @@ struct hercules_session {
 	struct receiver_state *rx_state;  //< Valid if this is the receiving side
 	struct sender_state *tx_state;	  //< Valid if this is the sending side
 	_Atomic enum session_state state;
-	_Atomic enum session_error error;  //< Valid if the session's state is DONE
+	_Atomic enum session_error error;
 	struct send_queue *send_queue;
 
-	u64 last_pkt_sent;
+	u64 last_pkt_sent;		//< Used for HS retransmit interval
 	u64 last_pkt_rcvd;		//< Used for timeout detection
 	u64 last_new_pkt_rcvd;	//< If we only receive packets containing
 							// already-seen chunks for a while something is
-							// probably wrong
-	u32 jobid;				//< The monitor's ID for this job
+							// probably wrong. (Only used by receiver)
+	u64 last_path_update;
+	u64 last_monitor_update;
+
+	size_t rx_npkts;  // Number of sent/received packets (for stats)
+	size_t tx_npkts;
+
+	struct hercules_app_addr peer;	//< UDP/SCION address of peer (big endian)
+	u32 jobid;						//< The monitor's ID for this job
 	u32 payloadlen;	 //< The payload length used for this transfer. Note that
 					 // the payload length includes the rbudp header while the
 					 // chunk length does not.
-
-	u16 dst_port;
-
-	// Number of sent/received packets (for stats)
-	size_t rx_npkts;
-	size_t tx_npkts;
 };
 
 /// SERVER
@@ -232,7 +246,7 @@ struct hercules_interface {
 	struct xsk_socket_info **xsks;
 };
 
-// Config determined at program start
+// Values obtained from config file (or defaults)
 struct hercules_config {
 	char *monitor_socket;
 	char *server_socket;
@@ -240,7 +254,9 @@ struct hercules_config {
 	int xdp_mode;
 	int queue;
 	bool configure_queues;
-	int num_threads;
+	bool enable_pcc;
+	int rate_limit;	 // Sending rate limit, only used when PCC is enabled
+	int n_threads;	 // Number of RX/TX worker threads
 	struct hercules_app_addr local_addr;
 	u16 port_min;  // Lowest port on which to accept packets (in HOST
 				   // endianness)
@@ -251,9 +267,6 @@ struct hercules_server {
 	struct hercules_config config;
 	int control_sockfd;	 // AF_PACKET socket used for control traffic
 	int usock;			 // Unix socket used for communication with the monitor
-	int max_paths;
-	int rate_limit;
-	int n_threads;					   // Number of RX/TX worker threads
 	struct worker_args **worker_args;  // Args passed to RX/TX workers
 
 	struct hercules_session *_Atomic
@@ -264,10 +277,11 @@ struct hercules_server {
 													  // waiting to be freed
 	struct hercules_session *_Atomic
 		sessions_rx[HERCULES_CONCURRENT_SESSIONS];	// Current RX sessions
-	struct hercules_session *deferreds_rx[HERCULES_CONCURRENT_SESSIONS];
+	struct hercules_session
+		*deferreds_rx[HERCULES_CONCURRENT_SESSIONS];  // Previous RX sessions,
+													  // waiting to be freed
 
-	bool enable_pcc;  // TODO make per path or session or something
-	int *ifindices;
+	unsigned int *ifindices;
 	int num_ifaces;
 	struct hercules_interface ifaces[];
 };
@@ -277,7 +291,8 @@ struct xsk_umem_info {
 	struct xsk_ring_prod fq;
 	struct xsk_ring_cons cq;
 	struct frame_queue available_frames;
-	// TODO ok to have locks closeby?
+	// XXX (Performance) Do we need to ensure spinlocks are in different
+	// cachelines?
 	pthread_spinlock_t fq_lock;	 // Lock for the fill queue (fq)
 	pthread_spinlock_t
 		frames_lock;  // Lock for the frame queue (available_frames)
@@ -300,37 +315,6 @@ struct worker_args {
 	u32 id;
 	struct hercules_server *server;
 	struct xsk_socket_info *xsks[];
-};
-
-/// STATS TODO
-struct path_stats_path {
-	__u64 total_packets;
-	__u64 pps_target;
-};
-
-struct path_stats {
-	__u32 num_paths;
-	struct path_stats_path paths[1];  // XXX this is actually used as a dynamic
-									  // struct member; the 1 is needed for CGO
-};
-struct path_stats *make_path_stats_buffer(int num_paths);
-
-struct hercules_stats {
-	__u64 start_time;
-	__u64 end_time;
-	__u64 now;
-
-	__u64 tx_npkts;
-	__u64 rx_npkts;
-
-	__u64 filesize;
-	__u32 framelen;
-	__u32 chunklen;
-	__u32 total_chunks;
-	__u32 completed_chunks;	 //!< either number of acked (for sender) or
-							 //!< received (for receiver) chunks
-
-	__u32 rate_limit;
 };
 
 #endif	// __HERCULES_H__

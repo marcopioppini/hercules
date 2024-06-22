@@ -118,8 +118,8 @@ struct hercules_header {
 #define INDEX_TYPE_DIR 1
 struct dir_index_entry {
 	__u32 filesize;
-	__u8 type;
 	__u32 path_len;
+	__u8 type;
 	__u8 path[];
 };
 
@@ -131,7 +131,7 @@ struct rbudp_initial_pkt {
 	__u64 timestamp;
 	__u8 path_index;
 	__u8 flags;
-	__u32 index_len;
+	__u64 index_len;
 	__u8 index[];
 };
 

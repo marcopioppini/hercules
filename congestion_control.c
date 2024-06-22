@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <float.h>
 
-#include "hercules.h"
 #include "congestion_control.h"
 #include "utils.h"
 
@@ -13,12 +12,15 @@
 
 #define MSS 1460
 
-struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit,
-										   u32 total_chunks, u32 num_paths) {
+struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 num_paths) {
 	struct ccontrol_state *cc_state = calloc(1, sizeof(struct ccontrol_state));
 	cc_state->max_rate_limit = max_rate_limit;
 	cc_state->num_paths = num_paths;
-	pthread_spin_init(&cc_state->lock, PTHREAD_PROCESS_PRIVATE);
+	int ret = pthread_spin_init(&cc_state->lock, PTHREAD_PROCESS_PRIVATE);
+	if (ret){
+		free(cc_state);
+		return NULL;
+	}
 
 	continue_ccontrol(cc_state);
 	return cc_state;
@@ -107,11 +109,12 @@ u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now)
 
 void kick_ccontrol(struct ccontrol_state *cc_state)
 {
+	(void)cc_state;
 	// TODO can / should we get rid of this?
 	//cc_state->state = pcc_startup;
 }
 
-void destroy_ccontrol_state(struct ccontrol_state *cc_states, size_t num_paths)
+void destroy_ccontrol_state(struct ccontrol_state *cc_states)
 {
 	free(cc_states);
 }

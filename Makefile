@@ -1,19 +1,27 @@
-# TODO change binary names
-TARGET_SERVER := runHercules
-TARGET_MONITOR := runMonitor
+TARGET_SERVER := hercules-server
+TARGET_MONITOR := hercules-monitor
 
 CC := gcc
-CFLAGS = -O0 -std=gnu11 -D_GNU_SOURCE
+CFLAGS = -O3 -flto -std=gnu11 -D_GNU_SOURCE -Itomlc99
 # CFLAGS += -Wall -Wextra
-# for debugging:
-# ASAN_FLAG := -fsanitize=address,leak,undefined,pointer-compare,pointer-subtract
-ASAN_FLAG := -fsanitize=address
-CFLAGS += -g3 -DDEBUG $(ASAN_FLAG)
+
+## Options:
+# Print rx/tx session stats
+CFLAGS += -DPRINT_STATS
+# Enforce checking the source SCION/UDP address/port of received packets
+CFLAGS += -DCHECK_SRC_ADDRESS
+# Randomise the UDP underlay port (no restriction on the range of used ports).
+# Enabling this currently breaks SCMP packet parsing
+# CFLAGS += -DRANDOMIZE_UNDERLAY_SRC
+
+## for debugging:
+# ASAN_FLAG := -fsanitize=address
+# CFLAGS += -g3 -DDEBUG $(ASAN_FLAG)
 # CFLAGS += -DDEBUG_PRINT_PKTS # print received/sent packets
-# CFLAGS += -DPRINT_STATS
-# CFLAGS += -DRANDOMIZE_UNDERLAY_SRC # Enabling this breaks SCMP packet parsing
-LDFLAGS = -lbpf -Lbpf/src -Ltomlc99 -lm -lelf -pthread -lz -ltoml -z noexecstack $(ASAN_FLAG)
-DEPFLAGS:=-MP -MD
+
+
+LDFLAGS = -flto -lbpf -Lbpf/src -Ltomlc99 -lm -lelf -latomic -pthread -lz -ltoml -z noexecstack $(ASAN_FLAG)
+DEPFLAGS := -MP -MD
 
 SRCS := $(wildcard *.c)
 OBJS := $(SRCS:.c=.o)
@@ -23,13 +31,18 @@ MONITORFILES := $(wildcard monitor/*)
 VERSION := $(shell (ref=$$(git describe --tags --long --dirty 2>/dev/null) && echo $$(git rev-parse --abbrev-ref HEAD)-$$ref) ||\
 					echo $$(git rev-parse --abbrev-ref HEAD)-untagged-$$(git describe --tags --dirty --always))
 
-# TODO: Install target
-# TODO: Native vs docker builds
+
 all: $(TARGET_MONITOR) $(TARGET_SERVER)
+
+install: all
+ifndef DESTDIR
+	$(error DESTDIR is not set)
+endif
+	cp hercules-server hercules-monitor hercules.conf $(DESTDIR)
 
 # List all headers as dependency because we include a header file via cgo (which in turn may include other headers)
 $(TARGET_MONITOR): $(MONITORFILES) $(wildcard *.h)
-	cd monitor && go build -o "../$@" -ldflags "-X main.startupVersion=${VERSION}"
+	docker exec -w /`basename $(PWD)`/monitor hercules-builder go build -o "../$@" -ldflags "-X main.startupVersion=${VERSION}"
 
 $(TARGET_SERVER): $(OBJS) bpf_prgm/redirect_userspace.o bpf/src/libbpf.a tomlc99/libtoml.a builder
 	@# update modification dates in assembly, so that the new version gets loaded
@@ -75,9 +88,8 @@ tomlc99/libtoml.a: builder
 
 .PHONY: builder builder_image install clean all
 
-# what to do with this??
-mockules: builder mockules/main.go mockules/network.go
-	docker exec -w /`basename $(PWD)`/mockules hercules-builder go build
+# mockules: builder mockules/main.go mockules/network.go
+# 	docker exec -w /`basename $(PWD)`/mockules hercules-builder go build
 
 # docker stuff
 builder: builder_image

@@ -58,19 +58,25 @@ struct xsk_umem_info *xsk_configure_umem_server(struct hercules_server *server,
 	if (ret) {
 		return NULL;
 	}
-	pthread_spin_init(&umem->fq_lock, 0);
-	pthread_spin_init(&umem->frames_lock, 0);
+	ret = pthread_spin_init(&umem->fq_lock, 0);
+	if (ret) {
+		return NULL;
+	}
+	ret = pthread_spin_init(&umem->frames_lock, 0);
+	if (ret) {
+		return NULL;
+	}
 	return umem;
 }
 
 void destroy_umem(struct xsk_umem_info *umem) {
 	xsk_umem__delete(umem->umem);
 	free(umem->buffer);
+	free(umem->available_frames.addrs);
 	free(umem);
 }
 
-int submit_initial_rx_frames(struct hercules_server *server,
-							 struct xsk_umem_info *umem) {
+int submit_initial_rx_frames(struct xsk_umem_info *umem) {
 	int initial_kernel_rx_frame_count =
 		XSK_RING_PROD__DEFAULT_NUM_DESCS - BATCH_SIZE;
 	u32 idx;
@@ -87,8 +93,7 @@ int submit_initial_rx_frames(struct hercules_server *server,
 	return 0;
 }
 
-int submit_initial_tx_frames(struct hercules_server *server,
-							 struct xsk_umem_info *umem) {
+int submit_initial_tx_frames(struct xsk_umem_info *umem) {
 	// This number needs to be smaller than the number of slots in the
 	// umem->available_frames queue (initialized in xsk_configure_umem();
 	// assumption in pop_completion_ring() and handle_send_queue_unit())
@@ -235,13 +240,16 @@ int set_bpf_prgm_active(struct hercules_server *server,
 	return 0;
 }
 
-int xsk_map__add_xsk(struct hercules_server *server, xskmap map, int index,
+int xsk_map__add_xsk(xskmap map, int index,
 					 struct xsk_socket_info *xsk) {
 	int xsk_fd = xsk_socket__fd(xsk->xsk);
 	if (xsk_fd < 0) {
 		return 1;
 	}
-	bpf_map_update_elem(map, &index, &xsk_fd, 0);
+	int ret = bpf_map_update_elem(map, &index, &xsk_fd, 0);
+	if (ret == -1) {
+		return 1;
+	}
 	return 0;
 }
 
@@ -265,7 +273,11 @@ int load_xsk_redirect_userspace(struct hercules_server *server,
 			return 1;
 		}
 		for (int s = 0; s < num_threads; s++) {
-			xsk_map__add_xsk(server, xsks_map_fd, s, args[s]->xsks[i]);
+			int ret =
+				xsk_map__add_xsk(xsks_map_fd, s, args[s]->xsks[i]);
+			if (ret) {
+				return 1;
+			}
 		}
 
 		// push XSKs meta
@@ -274,17 +286,26 @@ int load_xsk_redirect_userspace(struct hercules_server *server,
 		if (num_xsks_fd < 0) {
 			return 1;
 		}
-		bpf_map_update_elem(num_xsks_fd, &zero, &num_threads, 0);
+		int ret = bpf_map_update_elem(num_xsks_fd, &zero, &num_threads, 0);
+		if (ret == -1) {
+			return 1;
+		}
 
 		// push local address
 		int local_addr_fd = bpf_object__find_map_fd_by_name(obj, "local_addr");
 		if (local_addr_fd < 0) {
 			return 1;
 		}
-		bpf_map_update_elem(local_addr_fd, &zero, &server->config.local_addr,
-							0);
+		ret = bpf_map_update_elem(local_addr_fd, &zero,
+								  &server->config.local_addr, 0);
+		if (ret == -1) {
+			return 1;
+		}
 
-		set_bpf_prgm_active(server, &server->ifaces[i], prog_fd);
+		ret = set_bpf_prgm_active(server, &server->ifaces[i], prog_fd);
+		if (ret) {
+			return 1;
+		}
 	}
 	return 0;
 }
@@ -303,13 +324,26 @@ int xdp_setup(struct hercules_server *server) {
 
 		struct xsk_umem_info *umem = xsk_configure_umem_server(
 			server, i, umem_buf, NUM_FRAMES * XSK_UMEM__DEFAULT_FRAME_SIZE);
+		if (umem == NULL) {
+			debug_printf("Error in umem setup");
+			return -1;
+		}
 		debug_printf("Configured umem");
 
 		server->ifaces[i].xsks =
-			calloc(server->n_threads, sizeof(*server->ifaces[i].xsks));
+			calloc(server->config.n_threads, sizeof(*server->ifaces[i].xsks));
+		if (server->ifaces[i].xsks == NULL) {
+			return ENOMEM;
+		}
 		server->ifaces[i].umem = umem;
-		submit_initial_tx_frames(server, umem);
-		submit_initial_rx_frames(server, umem);
+		ret = submit_initial_tx_frames(umem);
+		if (ret) {
+			return -ret;
+		}
+		ret = submit_initial_rx_frames(umem);
+		if (ret) {
+			return -ret;
+		}
 		debug_printf("umem interface %d %s, queue %d", umem->iface->ifid,
 					 umem->iface->ifname, umem->iface->queue);
 		if (server->ifaces[i].ifid != umem->iface->ifid) {
@@ -321,7 +355,7 @@ int xdp_setup(struct hercules_server *server) {
 		}
 
 		// Create XSK sockets
-		for (int t = 0; t < server->n_threads; t++) {
+		for (int t = 0; t < server->config.n_threads; t++) {
 			struct xsk_socket_info *xsk;
 			xsk = calloc(1, sizeof(*xsk));
 			if (!xsk) {
@@ -349,23 +383,28 @@ int xdp_setup(struct hercules_server *server) {
 			}
 			server->ifaces[i].xsks[t] = xsk;
 		}
-		server->ifaces[i].num_sockets = server->n_threads;
+		server->ifaces[i].num_sockets = server->config.n_threads;
 	}
-	for (int t = 0; t < server->n_threads; t++) {
-		server->worker_args[t] =
-			malloc(sizeof(**server->worker_args) +
+	for (int t = 0; t < server->config.n_threads; t++) {
+		server->worker_args[t] = calloc(
+			1, sizeof(**server->worker_args) +
 				   server->num_ifaces * sizeof(*server->worker_args[t]->xsks));
 		if (server->worker_args[t] == NULL) {
 			return ENOMEM;
 		}
 		server->worker_args[t]->server = server;
-		server->worker_args[t]->id = t+1;
+		server->worker_args[t]->id = t + 1;
 		for (int i = 0; i < server->num_ifaces; i++) {
 			server->worker_args[t]->xsks[i] = server->ifaces[i].xsks[t];
 		}
 	}
 
-	load_xsk_redirect_userspace(server, server->worker_args, server->n_threads);
+	int ret = load_xsk_redirect_userspace(server, server->worker_args,
+										  server->config.n_threads);
+	if (ret) {
+		debug_printf("Error loading XDP redirect");
+		return ret;
+	}
 
 	if (server->config.configure_queues) {
 		int ret = configure_rx_queues(server);
@@ -378,7 +417,13 @@ int xdp_setup(struct hercules_server *server) {
 	return 0;
 }
 
-void xdp_teardown(struct hercules_server *server){
+void xdp_teardown(struct hercules_server *server) {
+	for (int i = 0; i < server->num_ifaces; i++) {
+		for (int j = 0; j < server->config.n_threads; j++) {
+			close_xsk(server->ifaces[i].xsks[j]);
+		}
+		destroy_umem(server->ifaces[i].umem);
+	}
 	remove_xdp_program(server);
 	unconfigure_rx_queues(server);
 }

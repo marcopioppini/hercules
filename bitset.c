@@ -15,13 +15,18 @@
 #include "bitset.h"
 #include <stdlib.h>
 
-void bitset__create(struct bitset *s, u32 num)
+int bitset__create(struct bitset *s, u32 num)
 {
 	s->bitmap = calloc((num + HERCULES_BITSET_WORD_BITS - 1) / HERCULES_BITSET_WORD_BITS,
 	                   HERCULES_BITSET_WORD_BITS / 8);
 	s->num = num;
 	s->num_set = 0;
-	pthread_spin_init(&s->lock, PTHREAD_PROCESS_PRIVATE);
+	int ret = pthread_spin_init(&s->lock, PTHREAD_PROCESS_PRIVATE);
+	if (ret){
+		free(s->bitmap);
+		return 1;
+	}
+	return 0;
 }
 
 void bitset__destroy(struct bitset *s)

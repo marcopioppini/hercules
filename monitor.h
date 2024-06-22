@@ -6,34 +6,41 @@
 #include "hercules.h"
 #include "utils.h"
 
-// Get a reply path from the monitor. The reversed path will be written to
-// *path. Returns false in case of error.
+// Get a reply path from the monitor. Supply a received packet, the monitor will
+// parse it and reverse the SCION path. The header with the reversed path will
+// be written to *path. Returns false in case of error.
 bool monitor_get_reply_path(int sockfd, const char *rx_sample_buf,
 							int rx_sample_len, int etherlen,
-							struct hercules_path *path);
+							_Atomic struct hercules_path *path);
 
-// Get SCION paths from the monitor. The caller is responsible for freeing
-// **paths.
+// Get SCION paths from the monitor for a given job ID. The caller is
+// responsible for freeing **paths.
+// Returns false on error.
 bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
 					   struct hercules_path **paths);
 
 // Check if the monitor has a new job available.
 // If so the function returns true and the job's details are filled into the
 // arguments.
-bool monitor_get_new_job(int sockfd, char *name, char *destname, u16 *job_id,
-						 u16 *dst_port, u16 *payloadlen);
+// Returns false if no new job available OR on error.
+// The caller is responsible for freeing **name and **destname if the return
+// value was true.
+bool monitor_get_new_job(int sockfd, char **name, char **destname, u16 *job_id,
+						 struct hercules_app_addr *dest, u16 *payloadlen);
 
-// Inform the monitor about a transfer's (new) status.
+// Inform the monitor about a transfer's status.
+// Returns false if the job was cancelled by the monitor or on error.
 bool monitor_update_job(int sockfd, int job_id, enum session_state state,
 						enum session_error err, u64 seconds_elapsed,
 						u64 bytes_acked);
 
-// Bind the socket for the daemon. The file is deleted if already present.
-// Returns the file descriptor if successful, 0 otherwise.
+// Bind and connect the socket for communication with the monitor. The file is
+// deleted if already present. Returns the file descriptor if successful, 0
+// otherwise.
 int monitor_bind_daemon_socket(char *server, char *monitor);
 
 #define HERCULES_DEFAULT_MONITOR_SOCKET "/var/run/herculesmon.sock"
-#define HERCULES_DEFAULT_DAEMON_SOCKET "/var/hercules.sock"
+#define HERCULES_DEFAULT_DAEMON_SOCKET "/var/run/hercules.sock"
 
 // Maximum size of variable-length fields in socket messages. Since we pass
 // entire packets to the monitor to get reply paths, this must be at least as
@@ -41,12 +48,13 @@ int monitor_bind_daemon_socket(char *server, char *monitor);
 #define SOCKMSG_MAX_PAYLOAD 5000
 _Static_assert(SOCKMSG_MAX_PAYLOAD >= HERCULES_MAX_PKTSIZE,
 			   "Socket messages too small");
+
 // Maximum number of paths transferred
 #define SOCKMSG_MAX_PATHS 10
 
-// Messages used for communication between the Hercules daemon and monitor
-// via unix socket. Queries are sent by the daemon, Replies by the monitor.
-// Structs suffixed _Q are queries, ones suffixed _A are answers.
+// The following messages are used for communication between the Hercules daemon
+// and monitor via unix socket. Queries are sent by the daemon, Replies by the
+// monitor. Structs suffixed _Q are queries, ones suffixed _A are answers.
 #pragma pack(push)
 #pragma pack(1)
 
@@ -67,21 +75,25 @@ struct sockmsg_serialized_path {
 };
 
 struct sockmsg_reply_path_A {
+	uint8_t reply_path_ok;
 	struct sockmsg_serialized_path path;
 };
 
-// Ask the monitor for new transfer jobs.
+// Ask the monitor for a new transfer job.
 // The answer contains at most one new job, if one was queued at the monitor.
 #define SOCKMSG_TYPE_GET_NEW_JOB (2)
 struct sockmsg_new_job_Q {};
 struct sockmsg_new_job_A {
 	uint8_t has_job;  // The other fields are only valid if this is set to 1
 	uint16_t job_id;
+	uint64_t dest_ia;  //< Destination address in network byte order
+	uint32_t dest_ip;
 	uint16_t dest_port;
 	uint16_t payloadlen;
-	uint16_t filename_len;
-	uint16_t destname_len;
-	uint8_t names[SOCKMSG_MAX_PAYLOAD]; // Filenames *without* terminating 0-byte
+	uint16_t filename_len;	// String length, excluding terminating 0-byte
+	uint16_t destname_len;	// Same
+	uint8_t names[SOCKMSG_MAX_PAYLOAD];	 // Concatenated filenames *without*
+										 // terminating 0-byte
 };
 
 // Get paths to use for a given job ID

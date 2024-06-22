@@ -17,11 +17,9 @@ struct xsk_umem_info *xsk_configure_umem_server(struct hercules_server *server,
 
 void destroy_umem(struct xsk_umem_info *umem);
 
-int submit_initial_rx_frames(struct hercules_server *server,
-							 struct xsk_umem_info *umem);
+int submit_initial_rx_frames(struct xsk_umem_info *umem);
 
-int submit_initial_tx_frames(struct hercules_server *server,
-							 struct xsk_umem_info *umem);
+int submit_initial_tx_frames(struct xsk_umem_info *umem);
 
 // Configure the NIC(s) to send incoming packets to the queue Hercules is using.
 int configure_rx_queues(struct hercules_server *server);
@@ -34,7 +32,7 @@ int load_bpf(const void *prgm, ssize_t prgm_size, struct bpf_object **obj);
 int set_bpf_prgm_active(struct hercules_server *server,
 						struct hercules_interface *iface, int prog_fd);
 
-int xsk_map__add_xsk(struct hercules_server *server, xskmap map, int index,
+int xsk_map__add_xsk(xskmap map, int index,
 					 struct xsk_socket_info *xsk);
 
 int load_xsk_redirect_userspace(struct hercules_server *server,

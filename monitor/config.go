@@ -51,11 +51,13 @@ type MonitorConfig struct {
 	ListenAddress    UDPAddr
 	Interfaces       []Interface
 	// The following are not used by the monitor, they are listed here for completeness
-	ServerSocket     string
-	XDPZeroCopy      bool
-	Queue            int
-	ConfigureQueues  bool
-	NumThreads       int
+	ServerSocket    string
+	XDPZeroCopy     bool
+	Queue           int
+	ConfigureQueues bool
+	EnablePCC       bool
+	RateLimit       int
+	NumThreads      int
 }
 
 type PathRules struct {

@@ -35,6 +35,8 @@ typedef __u8 u8;
 # define likely(x)              __builtin_expect(!!(x), 1)
 #endif
 
+#define ROUND_UP_PAGESIZE(x) (((4096 - 1) & x) ? ((x + 4096) & ~(4096 - 1)) : x)
+
 static inline u16 umin16(u16 a, u16 b)
 {
 	return (a < b) ? a : b;
