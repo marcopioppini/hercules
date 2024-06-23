@@ -28,8 +28,17 @@ func http_submit(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "parse err")
 		return
 	}
+	payloadlen := 0 // 0 means automatic selection
+	if r.URL.Query().Has("payloadlen") {
+		payloadlen, err = strconv.Atoi(r.URL.Query().Get("payloadlen"))
+		if err != nil {
+			io.WriteString(w, "parse err")
+			return
+		}
+	}
+
 	destination := findPathRule(&pathRules, destParsed)
-	pm, _ := initNewPathManager(activeInterfaces, &destination, listenAddress)
+	pm, _ := initNewPathManager(activeInterfaces, &destination, listenAddress, payloadlen)
 
 	transfersLock.Lock()
 	jobid := nextID

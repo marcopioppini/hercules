@@ -40,7 +40,7 @@ type PathWithInterface struct {
 	iface *net.Interface
 }
 
-func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet.UDPAddr) (*PathManager, error) {
+func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet.UDPAddr, payloadLen int) (*PathManager, error) {
 	ifMap := make(map[int]*net.Interface)
 	for _, iface := range interfaces {
 		ifMap[iface.Index] = iface
@@ -50,7 +50,7 @@ func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet
 		interfaces: ifMap,
 		src:        src,
 		dst:        &PathsToDestination{},
-		payloadLen: 0, // Will be set later, after the first path lookup
+		payloadLen: payloadLen,
 	}
 
 	if src.IA == dst.hostAddr.IA {
