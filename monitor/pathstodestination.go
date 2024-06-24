@@ -73,7 +73,7 @@ func (ptd *PathsToDestination) choosePaths() bool {
 		return false
 	}
 
-	if allPaths == nil {
+	if allPaths == nil || len(allPaths) == 0 {
 		return false
 	}
 

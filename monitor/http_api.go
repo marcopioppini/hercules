@@ -12,34 +12,44 @@ import (
 
 // Handle submission of a new transfer
 // GET params:
-// file (File to transfer)
+// file (Path to file to transfer)
+// destfile (Path at destination)
 // dest (Destination IA+Host)
+// payloadlen (optional, override automatic MTU selection)
 func http_submit(w http.ResponseWriter, r *http.Request) {
 	if !r.URL.Query().Has("file") || !r.URL.Query().Has("destfile") || !r.URL.Query().Has("dest") {
-		io.WriteString(w, "missing parameter")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, "Missing parameter\n")
 		return
 	}
 	file := r.URL.Query().Get("file")
 	destfile := r.URL.Query().Get("destfile")
 	dest := r.URL.Query().Get("dest")
-	fmt.Println(file, destfile, dest)
 	destParsed, err := snet.ParseUDPAddr(dest)
 	if err != nil {
-		io.WriteString(w, "parse err")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, "parse err\n")
 		return
 	}
+
 	payloadlen := 0 // 0 means automatic selection
 	if r.URL.Query().Has("payloadlen") {
 		payloadlen, err = strconv.Atoi(r.URL.Query().Get("payloadlen"))
 		if err != nil {
-			io.WriteString(w, "parse err")
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, "parse err\n")
 			return
 		}
 	}
 
 	destination := findPathRule(&pathRules, destParsed)
-	pm, _ := initNewPathManager(activeInterfaces, &destination, listenAddress, payloadlen)
+	pm, err := initNewPathManager(activeInterfaces, &destination, listenAddress, payloadlen)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
+	fmt.Printf("Received submission: %v -> %v %v\n", file, dest, destfile)
 	transfersLock.Lock()
 	jobid := nextID
 	transfers[nextID] = &HerculesTransfer{
@@ -62,19 +72,24 @@ func http_submit(w http.ResponseWriter, r *http.Request) {
 // Returns OK status state err seconds_elapsed chucks_acked
 func http_status(w http.ResponseWriter, r *http.Request) {
 	if !r.URL.Query().Has("id") {
-		io.WriteString(w, "missing parameter")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, "missing parameter\n")
 		return
 	}
 	id, err := strconv.Atoi(r.URL.Query().Get("id"))
 	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+
 	transfersLock.Lock()
 	info, ok := transfers[id]
 	transfersLock.Unlock()
 	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+
 	io.WriteString(w, fmt.Sprintf("OK %d %d %d %d %d\n", info.status, info.state, info.err, info.time_elapsed, info.bytes_acked))
 }
 
@@ -84,16 +99,19 @@ func http_status(w http.ResponseWriter, r *http.Request) {
 // Returns OK
 func http_cancel(w http.ResponseWriter, r *http.Request) {
 	if !r.URL.Query().Has("id") {
-		io.WriteString(w, "missing parameter")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, "missing parameter\n")
 		return
 	}
 	id, err := strconv.Atoi(r.URL.Query().Get("id"))
 	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	transfersLock.Lock()
 	info, ok := transfers[id]
 	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
 		transfersLock.Unlock()
 		return
 	}
@@ -109,7 +127,8 @@ func http_cancel(w http.ResponseWriter, r *http.Request) {
 // Returns OK exists? size
 func http_stat(w http.ResponseWriter, r *http.Request) {
 	if !r.URL.Query().Has("file") {
-		io.WriteString(w, "missing parameter")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, "missing parameter\n")
 		return
 	}
 	file := r.URL.Query().Get("file")
@@ -118,10 +137,12 @@ func http_stat(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "OK 0 0\n")
 		return
 	} else if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
 		io.WriteString(w, "err\n")
 		return
 	}
-	if !info.Mode().IsRegular() {
+	if !info.Mode().IsRegular() && !info.Mode().IsDir() {
+		w.WriteHeader(http.StatusBadRequest)
 		io.WriteString(w, "err\n")
 		return
 	}

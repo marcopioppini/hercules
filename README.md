@@ -1,3 +1,65 @@
+# Hercules-server
+## Overview
+This version of Hercules consists of two components:
+
+- The monitor (Go) is responsible for handling SCION paths and exposes a HTTP API which clients can use to submit new transfers, check the status of ongoing transfers, or cancel them.
+- The server (C) carries out the actual file transfers.
+
+Unlike previously, these are two separate processes that communicate via a unix socket.
+They share a configuration file, the simplest version of which is in `hercules.conf`; see `sampleconf.toml` for all options.
+
+## Changes from regular Hercules
+The following should be the most important changes:
+
+- Split C and Go parts into dedicated processes, with a unix socket between them.
+- This is now a server, i.e. intended to run forever, not just a single-transfer application.
+- No command line arguments (except for, optionally, the config file path), all options set in config file.
+- The sender includes the destination file path for the receiver to use in the setup handshake.
+CAVEAT: No checks on that path at the moment, so any file on the destination can be overwritten.
+- Multiple concurrent transfers (both rx and tx) are supported (up to `HERCULES_CONCURRENT_SESSIONS`).
+- Only 1 destination per transfer, the idea is to submit the transfer once per destination if multiple are needed.
+- Transfer of entire directories is supported: If the source path is a directory, Hercules will try to recursively transfer the entire directory.
+- In order to inform the receiver of the directory structure, a directory index is transferred at the beginning.
+If this index is larger than the space available in the initial packet, a first phase of RBUDP is performed to transfer the index.
+- Automatic MTU selection: At the start of a transfer, Hercules will pick the MTU (and, consequently, chunk length) that is as large as possible while still fitting on its selected paths.
+This relies on the MTU in the path metadata, for the empty path the sending interface's MTU is used.
+This behaviour can be overridden by manually supplying the desired payload length.
+- The server will periodically update a transfer's paths by querying the monitor. The monitor will reply with the set of paths to use, which do not need to overlap with the previous set.
+There is a restriction on path selection: All paths must be large enough to fit the payload length fixed at the beginning of the transfer.
+- Implemented SCMP error handling: Upon receiving an error, the offending path will be disabled. It will be re-enabled if it is returned by the monitor in the next path update.
+- Check the SCION/UDP source address/port of received packets match the expected values (i.e. the host that started the transfer).
+
+## Getting started
+
+### Building
+Running `make` should build both the monitor and server. This uses the provided dockerfile.
+
+### Running
+On both the sender and the receiver:
+
+- Fill in the provided `hercules.conf` with the host's SCION address and NIC
+- First, start the monitor: `./hercules-monitor`.
+- If there is already an XDP program loaded on the interface, you first have to remove it (e.g. `ip l set dev eth0 xdp off`)
+Then, in a second shell, start the server: `./hercules-server`.
+
+### Submitting a transfer
+- To transfer `infile` from the sender to `outfile` at the receiver with address `64-2:0:c,148.187.128.136:8000`, run the following on the sender: `curl "localhost:8000/submit?file=infile&destfile=outfile&dest=64-2:0:c,148.187.128.136:8000"`.
+- This should yield `OK 1`, where `1` is the submitted transfer's job id.
+- You should see the transfer progress in the server's output at both the sender and receiver.
+- It is also possible to query the transfer status via `curl "localhost:8000/status?id=1"`, though the output is not intended to be read by humans.
+
+## Testing/Debugging
+
+- It may be useful to uncomment some of the lines marked "for debugging" at the top of the Makefile.
+- If you want to run under valgrind, passing `--fair-sched=yes` is helpful.
+- The script `test.sh` will try 3 sets of transfers: a file, a directory, and 2 files concurrently.
+In order to use it, adjust the definitions at the top of the file (hostnames, addresses and interfaces).
+The script further relies on you having ssh keys set up for those two hosts.
+Depending on the network cards you may need to comment in the two lines with `ConfigureQueues = false`.
+
+
+# Readme not updated below this line.
+
 # Hercules
 
 High speed bulk data transfer application.

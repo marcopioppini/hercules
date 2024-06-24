@@ -49,6 +49,7 @@ type MonitorConfig struct {
 	DefaultNumPaths  int
 	MonitorSocket    string
 	ListenAddress    UDPAddr
+	MonitorHTTP		 string
 	Interfaces       []Interface
 	// The following are not used by the monitor, they are listed here for completeness
 	ServerSocket    string
@@ -94,8 +95,7 @@ func findPathRule(p *PathRules, dest *snet.UDPAddr) Destination {
 	}
 }
 
-const defaultConfigPath = "herculesmon.conf"
-const defaultMonitorSocket = "var/run/herculesmon.sock"
+const defaultMonitorHTTP = ":8000"
 
 // Decode the config file and fill in any unspecified values with defaults.
 // Will exit if an error occours or a required value is not specified.
@@ -118,6 +118,10 @@ func readConfig(configFile string) (MonitorConfig, PathRules) {
 
 	if config.MonitorSocket == "" {
 		config.MonitorSocket = defaultMonitorSocket
+	}
+
+	if config.MonitorHTTP == "" {
+		config.MonitorHTTP = defaultMonitorHTTP
 	}
 
 	// This is required

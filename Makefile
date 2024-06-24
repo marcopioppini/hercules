@@ -17,10 +17,11 @@ CFLAGS += -DCHECK_SRC_ADDRESS
 ## for debugging:
 # ASAN_FLAG := -fsanitize=address
 # CFLAGS += -g3 -DDEBUG $(ASAN_FLAG)
-# CFLAGS += -DDEBUG_PRINT_PKTS # print received/sent packets
+#
+# CFLAGS += -DDEBUG_PRINT_PKTS # print received/sent packets (lots of noise!)
 
 
-LDFLAGS = -flto -lbpf -Lbpf/src -Ltomlc99 -lm -lelf -latomic -pthread -lz -ltoml -z noexecstack $(ASAN_FLAG)
+LDFLAGS = -flto -l:libbpf.a -Lbpf/src -Ltomlc99 -lm -lelf -latomic -pthread -lz -ltoml -z noexecstack $(ASAN_FLAG)
 DEPFLAGS := -MP -MD
 
 SRCS := $(wildcard *.c)
@@ -41,7 +42,7 @@ endif
 	cp hercules-server hercules-monitor hercules.conf $(DESTDIR)
 
 # List all headers as dependency because we include a header file via cgo (which in turn may include other headers)
-$(TARGET_MONITOR): $(MONITORFILES) $(wildcard *.h)
+$(TARGET_MONITOR): $(MONITORFILES) $(wildcard *.h) builder
 	docker exec -w /`basename $(PWD)`/monitor hercules-builder go build -o "../$@" -ldflags "-X main.startupVersion=${VERSION}"
 
 $(TARGET_SERVER): $(OBJS) bpf_prgm/redirect_userspace.o bpf/src/libbpf.a tomlc99/libtoml.a builder

@@ -117,7 +117,7 @@ struct hercules_header {
 #define INDEX_TYPE_FILE 0
 #define INDEX_TYPE_DIR 1
 struct dir_index_entry {
-	__u32 filesize;
+	__u64 filesize;
 	__u32 path_len;
 	__u8 type;
 	__u8 path[];

@@ -12,6 +12,9 @@ ServerSocket = "var/run/hercules.sock"
 # SCION address the Hercules server should listen on
 ListenAddress = "17-ffaa:1:fe2,192.168.10.141:8000"
 
+# Listenting address for the monitor (HTTP)
+MonitorHTTP = ":8000"
+
 # Network interfaces to use for Hercules
 Interfaces = [
 "eth0",
@@ -35,7 +38,7 @@ ConfigureQueues = false
 EnablePCC = false
 
 # This sets a sending rate limit (in pps)
-# that applies to all transfers individually
+# that applies to transfers individually
 RateLimit = 100000
 
 # The number of RX/TX worker threads to use

@@ -361,7 +361,7 @@ func prepareHeader(path PathMeta, payloadLen int, srcUDP, dstUDP net.UDPAddr, sr
 // Return the path's underlay and scion header length by creating a bogus packet.
 func getPathHeaderlen(path snet.Path) (int, int) {
 	nilMAC := []byte{0, 0, 0, 0, 0, 0}
-	nilIP :=  []byte{0,0,0,0}
+	nilIP := []byte{0, 0, 0, 0}
 	underlayHeader, err := prepareUnderlayPacketHeader(nilMAC, nilMAC, nilIP, path.UnderlayNextHop().IP, uint16(path.UnderlayNextHop().Port), 9000)
 	if err != nil {
 		return 0, 0
@@ -388,7 +388,7 @@ func getPathHeaderlen(path snet.Path) (int, int) {
 
 	if err = destPkt.Serialize(); err != nil {
 		fmt.Println("serializer err", err)
-		return 0,0
+		return 0, 0
 	}
 	fmt.Println("Header length: ", len(destPkt.Bytes))
 	fmt.Println("Underlay Header length: ", len(underlayHeader))

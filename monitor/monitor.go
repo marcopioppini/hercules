@@ -18,6 +18,8 @@ import (
 import "C"
 
 const HerculesMaxPktsize = C.HERCULES_MAX_PKTSIZE
+const defaultConfigPath = C.HERCULES_DEFAULT_CONFIG_PATH
+const defaultMonitorSocket = C.HERCULES_DEFAULT_MONITOR_SOCKET
 
 // Select paths and serialize headers for a given transfer
 func headersToDestination(transfer HerculesTransfer) (int, []byte) {
@@ -29,7 +31,11 @@ func headersToDestination(transfer HerculesTransfer) (int, []byte) {
 		IA:   transfer.dest.IA,
 		Host: addr.MustParseHost(transfer.dest.Host.IP.String()),
 	}
-	transfer.pm.choosePaths()
+	ok := transfer.pm.choosePaths()
+	if !ok {
+		fmt.Println("Error choosing paths!")
+		return 0, nil
+	}
 	paths := transfer.pm.dst.paths
 	enabledPaths := []PathMeta{}
 	for _, p := range paths {
@@ -128,7 +134,7 @@ func main() {
 	// used for looking up reply path interface
 	pm, err := initNewPathManager(activeInterfaces, &Destination{
 		hostAddr: config.ListenAddress.addr,
-	}, config.ListenAddress.addr)
+	}, config.ListenAddress.addr, 0)
 	if err != nil {
 		fmt.Printf("Error initialising path manager: %v\n", err)
 		os.Exit(1)
@@ -139,13 +145,12 @@ func main() {
 	http.HandleFunc("/status", http_status)
 	http.HandleFunc("/cancel", http_cancel)
 	http.HandleFunc("/stat", http_stat)
-	go http.ListenAndServe(":8000", nil)
+	go http.ListenAndServe(config.MonitorHTTP, nil)
 
 	// Communication is always initiated by the server,
 	// the monitor's job is to respond to queries from the server
 	for {
 		buf := make([]byte, C.SOCKMSG_SIZE)
-		fmt.Println("read...", C.SOCKMSG_SIZE)
 		n, a, err := usock.ReadFromUnix(buf)
 		if err != nil {
 			fmt.Println("Error reading from socket!", err)
@@ -197,7 +202,7 @@ func main() {
 				transfersLock.Unlock()
 				var b []byte
 				if selectedJob != nil {
-					fmt.Println("sending file to daemon:", selectedJob.file, selectedJob.destFile, selectedJob.id)
+					fmt.Println("Sending transfer to daemon:", selectedJob.file, selectedJob.destFile, selectedJob.id)
 					_, _ = headersToDestination(*selectedJob) // look up paths to fix mtu
 					strlen_src := len(selectedJob.file)
 					strlen_dst := len(selectedJob.destFile)
@@ -243,8 +248,14 @@ func main() {
 				bytes_acked := binary.LittleEndian.Uint64(buf[:8])
 				buf = buf[8:]
 				fmt.Println("updating job", job_id, status, errorcode)
+				var b []byte
 				transfersLock.Lock()
-				job, _ := transfers[int(job_id)]
+				job, ok := transfers[int(job_id)]
+				if !ok {
+					b = binary.LittleEndian.AppendUint16(b, uint16(0))
+					usock.WriteToUnix(b,a)
+					continue
+				}
 				job.state = status
 				job.err = errorcode
 				if job.state == C.SESSION_STATE_DONE {
@@ -255,7 +266,6 @@ func main() {
 				job.time_elapsed = int(seconds)
 				isCancelled := job.status == Cancelled
 				transfersLock.Unlock()
-				var b []byte
 				if isCancelled {
 					b = binary.LittleEndian.AppendUint16(b, uint16(0))
 				} else {

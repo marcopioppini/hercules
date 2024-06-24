@@ -40,6 +40,7 @@ type PathWithInterface struct {
 	iface *net.Interface
 }
 
+// Setting payloadlen to 0 means automatic selection
 func initNewPathManager(interfaces []*net.Interface, dst *Destination, src *snet.UDPAddr, payloadLen int) (*PathManager, error) {
 	ifMap := make(map[int]*net.Interface)
 	for _, iface := range interfaces {

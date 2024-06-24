@@ -333,7 +333,7 @@ static void destroy_session_tx(struct hercules_server *server,
 	assert(session->state == SESSION_STATE_DONE);
 
 	int ret = munmap(session->tx_state->mem, session->tx_state->filesize);
-	if (ret == 0) {
+	if (ret) {
 		// XXX Is there anything we can do if this fails?
 		fprintf(stderr, "munmap failure!\n");
 		exit_with_error(server, errno);
@@ -367,7 +367,7 @@ static void destroy_session_rx(struct hercules_server *server,
 	assert(session->state == SESSION_STATE_DONE);
 
 	int ret = munmap(session->rx_state->mem, session->rx_state->filesize);
-	if (ret == 0) {
+	if (ret) {
 		fprintf(stderr, "munmap failure!\n");
 		exit_with_error(server, errno);
 	}
@@ -1136,7 +1136,7 @@ static char *rx_mmap(char *index, size_t index_size, size_t total_filesize) {
 	bool encountered_err = false;
 	for (char *p = index; p < index + index_size;) {
 		struct dir_index_entry *entry = (struct dir_index_entry *)p;
-		debug_printf("Read: %s (%d) %dB", entry->path, entry->type,
+		debug_printf("Read: %s (%d) %lluB", entry->path, entry->type,
 					 entry->filesize);
 
 		int ret;
@@ -1182,7 +1182,7 @@ static char *rx_mmap(char *index, size_t index_size, size_t total_filesize) {
 			next_mapping += filesize_up;
 			close(f);
 		} else if (entry->type == INDEX_TYPE_DIR) {
-			ret = mkdir((char *)entry->path, 0664);
+			ret = mkdir((char *)entry->path, 0775);
 			if (ret != 0) {
 				if (errno == EEXIST) {
 					struct stat statbuf;
@@ -1223,60 +1223,50 @@ static char *rx_mmap(char *index, size_t index_size, size_t total_filesize) {
 }
 
 // Create new receiver state. Returns null in case of error.
-static struct receiver_state *make_rx_state(struct hercules_session *session,
-											char *index, size_t index_size,
-											size_t filesize, int chunklen,
-											u16 src_port,
-											bool is_pcc_benchmark) {
-	struct receiver_state *rx_state;
-	rx_state = calloc(1, sizeof(*rx_state));
-	if (rx_state == NULL){
-		return NULL;
-	}
-	rx_state->session = session;
-	rx_state->filesize = filesize;
-	rx_state->chunklen = chunklen;
-	rx_state->total_chunks = (filesize + chunklen - 1) / chunklen;
-	bitset__create(&rx_state->received_chunks, rx_state->total_chunks);
-	rx_state->start_time = 0;
-	rx_state->end_time = 0;
-	rx_state->handshake_rtt = 0;
-	rx_state->is_pcc_benchmark = is_pcc_benchmark;
-	rx_state->src_port = src_port;
-	rx_state->mem = rx_mmap(index, index_size, filesize);
-	if (rx_state->mem == NULL) {
-		bitset__destroy(&rx_state->received_chunks);
-		free(rx_state);
-		return NULL;
-	}
-	return rx_state;
-}
-
-// For index transfer: Create new receiver state without mapping a file. Returns
-// null in case of error.
-static struct receiver_state *make_rx_state_nomap(
-	struct hercules_session *session, size_t index_size,
-	size_t filesize, int chunklen, u16 src_port, bool is_pcc_benchmark) {
+static struct receiver_state *make_rx_state(
+	struct hercules_session *session, struct rbudp_initial_pkt *parsed_pkt,
+	u16 src_port, bool can_map) {
 	struct receiver_state *rx_state;
 	rx_state = calloc(1, sizeof(*rx_state));
 	if (rx_state == NULL) {
 		return NULL;
 	}
 	rx_state->session = session;
-	rx_state->filesize = filesize;
-	rx_state->chunklen = chunklen;
-	rx_state->total_chunks = (filesize + chunklen - 1) / chunklen;
-	rx_state->index_chunks = (index_size + chunklen - 1) / chunklen;
+	rx_state->filesize = parsed_pkt->filesize;
+	rx_state->index_size = parsed_pkt->index_len;
+	rx_state->chunklen = parsed_pkt->chunklen;
+	rx_state->index = calloc(1, parsed_pkt->index_len);
+	if (rx_state->index == NULL) {
+		debug_printf("Error allocating index");
+		free(rx_state);
+		return NULL;
+	}
+	rx_state->total_chunks =
+		(rx_state->filesize + rx_state->chunklen - 1) / rx_state->chunklen;
+	rx_state->index_chunks =
+		(rx_state->index_size + rx_state->chunklen - 1) / rx_state->chunklen;
 	bitset__create(&rx_state->received_chunks, rx_state->total_chunks);
 	bitset__create(&rx_state->received_chunks_index, rx_state->index_chunks);
 	rx_state->start_time = 0;
 	rx_state->end_time = 0;
 	rx_state->handshake_rtt = 0;
+	rx_state->is_pcc_benchmark = false;
+#ifdef PCC_BENCH
+	rx_state->is_pcc_benchmark = true;
+#endif
 	rx_state->src_port = src_port;
-	rx_state->is_pcc_benchmark = is_pcc_benchmark;
-	// XXX We cannot map the file(s) yet since we don't have the index,
-	// but we could already reserve the required range (to check if there's even
-	// enough memory available)
+	if (can_map) {
+		rx_state->mem = rx_mmap((char *)parsed_pkt->index,
+								parsed_pkt->index_len, rx_state->filesize);
+		if (rx_state->mem == NULL) {
+			bitset__destroy(&rx_state->received_chunks);
+			free(rx_state);
+			return NULL;
+		}
+	}
+	// XXX In case of a separate index transfer, we cannot map the file(s) yet
+	// since we don't have the index, but we could already reserve the required
+	// range (to check if there's even enough memory available)
 	return rx_state;
 }
 
@@ -1427,8 +1417,7 @@ static void rx_accept_new_session(struct hercules_server *server,
 			// Entire index contained in this packet,
 			// we can go ahead and proceed with transfer
 			struct receiver_state *rx_state = make_rx_state(
-				session, (char *)parsed_pkt->index, parsed_pkt->index_len,
-				parsed_pkt->filesize, parsed_pkt->chunklen, src_port, false);
+				session, parsed_pkt, src_port, true);
 			if (rx_state == NULL) {
 				debug_printf("Error creating RX state!");
 				destroy_send_queue(session->send_queue);
@@ -1445,21 +1434,12 @@ static void rx_accept_new_session(struct hercules_server *server,
 
 		} else {
 			// Index transferred separately
-			struct receiver_state *rx_state = make_rx_state_nomap(
-				session, parsed_pkt->index_len, parsed_pkt->filesize,
-				parsed_pkt->chunklen, src_port, false);
+			struct receiver_state *rx_state = make_rx_state(
+				session, parsed_pkt, src_port, false);
 			if (rx_state == NULL) {
 				debug_printf("Error creating RX state!");
 				destroy_send_queue(session->send_queue);
 				free(session->send_queue);
-				free(session);
-				return;
-			}
-			rx_state->index_size = parsed_pkt->index_len;
-			rx_state->index = calloc(1, parsed_pkt->index_len);
-			if (rx_state->index == NULL) {
-				debug_printf("Error allocating index");
-				destroy_send_queue(session->send_queue);
 				free(session);
 				return;
 			}
@@ -2105,13 +2085,6 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 			total_chunks = tx_state->total_chunks;
 		}
 		if (chunk_idx == total_chunks) {
-			/* debug_printf("prev %d", rcvr->prev_chunk_idx); */
-			if(tx_state->prev_chunk_idx == 0) { // this receiver has finished
-				debug_printf("receiver has finished");
-				tx_state->finished = true;
-				break;
-			}
-
 			// switch round for this receiver:
 			debug_printf("Receiver %d switches to next round", rcvr_idx);
 
@@ -2428,9 +2401,9 @@ static char *tx_mmap(char *fname, char *dstname, size_t *filesize,
 	if (index == NULL) {
 		return NULL;
 	}
-	debug_printf("total filesize %lld", total_filesize);
-	debug_printf("real filesize %lld", real_filesize);
-	debug_printf("total entry size %lld", index_size);
+	debug_printf("total filesize %llu", total_filesize);
+	debug_printf("real filesize %llu", real_filesize);
+	debug_printf("total entry size %llu", index_size);
 
 	char *mem =
 		mmap(NULL, total_filesize, PROT_NONE, MAP_PRIVATE | MAP_ANON, 0, 0);
@@ -2438,6 +2411,7 @@ static char *tx_mmap(char *fname, char *dstname, size_t *filesize,
 		free(index);
 		return NULL;
 	}
+	debug_printf("Mapped at %p, %llu", mem, total_filesize);
 
 	// Now we go over the directory tree we just generated and
 	// - Map the files
@@ -2461,7 +2435,7 @@ static char *tx_mmap(char *fname, char *dstname, size_t *filesize,
 	bool encountered_err = false;
 	for (char *p = index; p < index + index_size;) {
 		struct dir_index_entry *entry = (struct dir_index_entry *)p;
-		debug_printf("Read: %s (%d) %dB", entry->path, entry->type,
+		debug_printf("Read: %s (%d) %lluB", entry->path, entry->type,
 					 entry->filesize);
 
 		int src_path_len = strlen((char *)entry->path);
@@ -2696,7 +2670,6 @@ static void tx_send_p(void *arg) {
 		struct hercules_session *session_tx = server->sessions_tx[cur_session];
 		if (session_tx == NULL ||
 			!session_state_is_running(session_tx->state)) {
-			kick_tx_server(server);	 // flush any pending packets
 			continue;
 		}
 		bool is_index_transfer = (session_tx->state == SESSION_STATE_RUNNING_IDX);
@@ -2729,6 +2702,7 @@ static void tx_send_p(void *arg) {
 								  frame_addrs, &unit, args->id,
 								  is_index_transfer);
 		atomic_fetch_add(&session_tx->tx_npkts, num_chunks_in_unit);
+		kick_tx_server(server);
 	}
 }
 
@@ -3893,9 +3867,10 @@ int main(int argc, char *argv[]) {
 	debug_printf(
 		"Starting Hercules using queue %d, queue config %d, %d worker "
 		"threads, "
-		"xdp mode 0x%x",
+		"xdp mode 0x%x, "
+		"Rate limit %d, PCC %d",
 		config.queue, config.configure_queues, config.n_threads,
-		config.xdp_mode);
+		config.xdp_mode, config.rate_limit, config.enable_pcc);
 
 	struct hercules_server *server =
 		hercules_init_server(config, if_idxs, n_interfaces);

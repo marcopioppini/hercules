@@ -1,4 +1,7 @@
 bpf_prgm/*.ll
 bpf_prgm/*.o
-hercules
+hercules-server
+hercules-monitor
+*.o
+monitor/monitor
 mockules/mockules
