@@ -353,6 +353,7 @@ static void destroy_session_tx(struct hercules_server *server,
 	}
 	FREE_NULL(session->tx_state->pathset);
 
+	FREE_NULL(session->tx_state->epochs);
 	FREE_NULL(session->tx_state->index);
 	FREE_NULL(session->tx_state);
 
@@ -378,6 +379,9 @@ static void destroy_session_rx(struct hercules_server *server,
 
 	bitset__destroy(&session->rx_state->received_chunks);
 	bitset__destroy(&session->rx_state->received_chunks_index);
+	for (int i = 0; i < 256; i++){
+		bitset__destroy(&session->rx_state->path_state[i].seq_rcvd);
+	}
 	FREE_NULL(session->rx_state->index);
 	FREE_NULL(session->rx_state);
 

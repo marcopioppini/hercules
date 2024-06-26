@@ -114,9 +114,10 @@ void kick_ccontrol(struct ccontrol_state *cc_state)
 	//cc_state->state = pcc_startup;
 }
 
-void destroy_ccontrol_state(struct ccontrol_state *cc_states)
+void destroy_ccontrol_state(struct ccontrol_state *cc_state)
 {
-	free(cc_states);
+	bitset__destroy(&cc_state->mi_nacked);
+	free(cc_state);
 }
 
 // XXX: explicitly use symbols from old libc version to allow building on
