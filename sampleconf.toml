@@ -13,7 +13,16 @@ ServerSocket = "var/run/hercules.sock"
 ListenAddress = "17-ffaa:1:fe2,192.168.10.141:8000"
 
 # Listenting address for the monitor (HTTP)
+# Set to "disabled" to disable
 MonitorHTTP = ":8000"
+
+# Listening address for the monitor (HTTPS)
+# Set to "disabled" to disable
+MonitorHTTPS = "disabled"
+
+# Path to the server's certificate and key for TLS
+TLSCert = "cert.pem"
+TLSKey = "key.pem"
 
 # Network interfaces to use for Hercules
 Interfaces = [
@@ -72,3 +81,13 @@ NumPaths = 2
 [[DestinationASes]]
 IA = "17-a:b:c"
 NumPaths = 2
+
+# Specify mapping of certificates to system users and groups to use for
+# file permission checks.
+[UserMap]
+"O=Internet Widgits Pty Ltd,ST=Some-State,C=AU" = {User = "marco", Group = "marco"}
+
+# Paths to certificates used for validation of TLS client certificates
+ClientCACerts = [
+"cert.pem",
+]

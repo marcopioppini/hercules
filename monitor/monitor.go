@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -83,6 +85,7 @@ type HerculesTransfer struct {
 	destFile     string         // Name of the file to transfer at destination host
 	dest         snet.UDPAddr   // Destination
 	pm           *PathManager
+	owner        string // The name in the certificate of whoever submitted the transfer
 	timeFinished time.Time
 	// The following two fields are meaningless if the job's status is 'Queued'
 	// They are updated when the server sends messages of type 'update_job'
@@ -100,6 +103,7 @@ var nextID int = 1 // ID to use for the next transfer
 var listenAddress *snet.UDPAddr
 var activeInterfaces []*net.Interface
 var pathRules PathRules
+var config MonitorConfig
 
 var startupVersion string
 
@@ -109,7 +113,6 @@ func main() {
 	flag.StringVar(&configFile, "c", defaultConfigPath, "Path to the monitor configuration file")
 	flag.Parse()
 
-	var config MonitorConfig
 	config, pathRules = readConfig(configFile)
 
 	listenAddress = config.ListenAddress.addr
@@ -148,7 +151,29 @@ func main() {
 	http.HandleFunc("/status", http_status)
 	http.HandleFunc("/cancel", http_cancel)
 	http.HandleFunc("/stat", http_stat)
-	go http.ListenAndServe(config.MonitorHTTP, nil)
+	if config.MonitorHTTP != "disabled" {
+		go http.ListenAndServe(config.MonitorHTTP, nil)
+	}
+
+	if config.MonitorHTTPS != "disabled" {
+		clientCAs := x509.NewCertPool()
+		for _, c := range config.ClientCACerts {
+			cert, err := os.ReadFile(c)
+			if err != nil {
+				fmt.Printf("Error reading file: %v\n", err)
+				os.Exit(1)
+			}
+			clientCAs.AppendCertsFromPEM(cert)
+		}
+		httpsServer := &http.Server{
+			Addr: config.MonitorHTTPS,
+			TLSConfig: &tls.Config{
+				ClientAuth: tls.RequireAndVerifyClientCert,
+				ClientCAs:  clientCAs,
+			},
+		}
+		go httpsServer.ListenAndServeTLS(config.TLSCert, config.TLSKey)
+	}
 
 	// Communication is always initiated by the server,
 	// the monitor's job is to respond to queries from the server
@@ -256,7 +281,7 @@ func main() {
 				job, ok := transfers[int(job_id)]
 				if !ok {
 					b = binary.LittleEndian.AppendUint16(b, uint16(0))
-					usock.WriteToUnix(b,a)
+					usock.WriteToUnix(b, a)
 					continue
 				}
 				job.state = status

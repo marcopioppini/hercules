@@ -3,12 +3,43 @@ package main
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"strconv"
+	"syscall"
 
 	"github.com/scionproto/scion/pkg/snet"
 )
+
+// Check if the user can open the file
+func checkReadPerm(user, file string) bool {
+	ug, ok := config.UserMap[user]
+	if !ok {
+		return false
+	}
+
+	err := syscall.Setegid(ug.gidLookup)
+	if err != nil {
+		return false
+	}
+	defer syscall.Setegid(0)
+	err = syscall.Seteuid(ug.uidLookup)
+	if err != nil {
+		return false
+	}
+	defer syscall.Seteuid(0)
+
+	f, err := os.Open(file)
+	if err != nil {
+		return false
+	}
+	err = f.Close()
+	if err != nil {
+		return false
+	}
+	return true
+}
 
 // Handle submission of a new transfer
 // GET params:
@@ -30,6 +61,18 @@ func http_submit(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		io.WriteString(w, "parse err\n")
 		return
+	}
+	owner := ""
+	if r.TLS != nil {
+		// There must be at least 1 cert because we require client certs in the TLS config
+		certDN := r.TLS.PeerCertificates[0].Subject.String()
+		fmt.Println("Read user from cert:", certDN)
+		if !checkReadPerm(certDN, file) {
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, "Source file does not exist or insufficient permissions\n")
+			return
+		}
+		owner = certDN
 	}
 
 	payloadlen := 0 // 0 means automatic selection
@@ -58,6 +101,7 @@ func http_submit(w http.ResponseWriter, r *http.Request) {
 		file:     file,
 		destFile: destfile,
 		dest:     *destParsed,
+		owner:    owner,
 		pm:       pm,
 	}
 	nextID += 1
@@ -89,6 +133,12 @@ func http_status(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	if r.TLS != nil {
+		if info.owner != r.TLS.PeerCertificates[0].Subject.String() {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+	}
 
 	io.WriteString(w, fmt.Sprintf("OK %d %d %d %d %d\n", info.status, info.state, info.err, info.time_elapsed, info.bytes_acked))
 }
@@ -115,10 +165,37 @@ func http_cancel(w http.ResponseWriter, r *http.Request) {
 		transfersLock.Unlock()
 		return
 	}
+	if r.TLS != nil {
+		if info.owner != r.TLS.PeerCertificates[0].Subject.String() {
+			w.WriteHeader(http.StatusUnauthorized)
+			transfersLock.Unlock()
+			return
+		}
+	}
 	info.status = Cancelled
 	transfersLock.Unlock()
 
 	io.WriteString(w, "OK\n")
+}
+
+func statAsUser(user, file string) (fs.FileInfo, error) {
+	ug, ok := config.UserMap[user]
+	if !ok {
+		return nil, fmt.Errorf("No user?")
+	}
+
+	err := syscall.Seteuid(ug.uidLookup)
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.Seteuid(0)
+	err = syscall.Setegid(ug.gidLookup)
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.Setegid(0)
+
+	return os.Stat(file)
 }
 
 // Handle gfal's stat command
@@ -132,7 +209,16 @@ func http_stat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	file := r.URL.Query().Get("file")
-	info, err := os.Stat(file)
+	var info fs.FileInfo
+	var err error
+	if r.TLS != nil {
+		// There must be at least 1 cert because we require client certs in the TLS config
+		certDN := r.TLS.PeerCertificates[0].Subject.String()
+		fmt.Println("Read user from cert:", certDN)
+		info, err = statAsUser(certDN, file)
+	} else {
+		info, err = os.Stat(file)
+	}
 	if os.IsNotExist(err) {
 		io.WriteString(w, "OK 0 0\n")
 		return
@@ -143,7 +229,7 @@ func http_stat(w http.ResponseWriter, r *http.Request) {
 	}
 	if !info.Mode().IsRegular() && !info.Mode().IsDir() {
 		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, "err\n")
+		io.WriteString(w, "File is not a regular file or directory\n")
 		return
 	}
 

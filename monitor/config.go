@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/user"
+	"strconv"
 
 	"github.com/BurntSushi/toml"
 	"github.com/scionproto/scion/pkg/addr"
@@ -43,14 +45,26 @@ func (i *Interface) UnmarshalText(text []byte) error {
 	return err
 }
 
+type UserGroup struct {
+	User      string // Username supplied in the config file
+	uidLookup int    // User ID, looked up and filled when parsing config
+	Group     string
+	gidLookup int
+}
+
 type MonitorConfig struct {
 	DestinationHosts []HostConfig
 	DestinationASes  []ASConfig
 	DefaultNumPaths  int
 	MonitorSocket    string
 	ListenAddress    UDPAddr
-	MonitorHTTP		 string
+	MonitorHTTP      string
+	MonitorHTTPS     string
+	TLSCert          string
+	TLSKey           string
 	Interfaces       []Interface
+	UserMap          map[string]*UserGroup
+	ClientCACerts    []string
 	// The following are not used by the monitor, they are listed here for completeness
 	ServerSocket    string
 	XDPZeroCopy     bool
@@ -96,6 +110,8 @@ func findPathRule(p *PathRules, dest *snet.UDPAddr) Destination {
 }
 
 const defaultMonitorHTTP = ":8000"
+const defaultMonitorHTTPS = "disabled"
+// Disabled by default because further config (certs) is needed
 
 // Decode the config file and fill in any unspecified values with defaults.
 // Will exit if an error occours or a required value is not specified.
@@ -124,6 +140,20 @@ func readConfig(configFile string) (MonitorConfig, PathRules) {
 		config.MonitorHTTP = defaultMonitorHTTP
 	}
 
+	if config.MonitorHTTPS == "" {
+		config.MonitorHTTPS = defaultMonitorHTTPS
+	}
+	if config.MonitorHTTPS != "disabled" {
+		if config.TLSCert == "" || config.TLSKey == "" {
+			fmt.Println("HTTPS enabled and no certificate or key specified")
+			os.Exit(1)
+		}
+		if len(config.ClientCACerts) == 0 {
+			fmt.Println("HTTPS enabled and no certificates for client authentication specified")
+			os.Exit(1)
+		}
+	}
+
 	// This is required
 	if config.ListenAddress.addr == nil {
 		fmt.Println("Error: Listening address not specified")
@@ -138,6 +168,28 @@ func readConfig(configFile string) (MonitorConfig, PathRules) {
 	if len(config.Interfaces) == 0 {
 		fmt.Println("Error: No interfaces specified")
 		os.Exit(1)
+	}
+
+	for _, u := range config.UserMap {
+		userLookup, err := user.Lookup(u.User)
+		if err != nil {
+			fmt.Printf("User lookup error: %v\n", u.User)
+			os.Exit(1)
+		}
+		u.uidLookup, err = strconv.Atoi(userLookup.Uid)
+		if err != nil {
+			os.Exit(1)
+		}
+
+		groupLookup, err := user.LookupGroup(u.Group)
+		if err != nil {
+			fmt.Printf("Group lookup error: %v\n", u.Group)
+			os.Exit(1)
+		}
+		u.gidLookup, err = strconv.Atoi(groupLookup.Gid)
+		if err != nil {
+			os.Exit(1)
+		}
 	}
 
 	pathRules := PathRules{}
