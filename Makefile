@@ -31,6 +31,7 @@ MONITORFILES := $(wildcard monitor/*)
 
 VERSION := $(shell (ref=$$(git describe --tags --long --dirty 2>/dev/null) && echo $$(git rev-parse --abbrev-ref HEAD)-$$ref) ||\
 					echo $$(git rev-parse --abbrev-ref HEAD)-untagged-$$(git describe --tags --dirty --always))
+CFLAGS += -DHERCULES_VERSION="\"$(VERSION)\""
 
 
 all: $(TARGET_MONITOR) $(TARGET_SERVER)

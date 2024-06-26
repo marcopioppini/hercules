@@ -101,7 +101,10 @@ var listenAddress *snet.UDPAddr
 var activeInterfaces []*net.Interface
 var pathRules PathRules
 
+var startupVersion string
+
 func main() {
+	fmt.Printf("Starting Hercules monitor [%v]\n", startupVersion)
 	var configFile string
 	flag.StringVar(&configFile, "c", defaultConfigPath, "Path to the monitor configuration file")
 	flag.Parse()

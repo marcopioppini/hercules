@@ -3718,8 +3718,13 @@ void usage(){
 	exit(1);
 }
 
+#ifndef HERCULES_VERSION
+#define HERCULES_VERSION "Version ??"
+#endif
+
 #define HERCULES_MAX_INTERFACES 3
 int main(int argc, char *argv[]) {
+	printf("Starting Hercules server [%s]\n", HERCULES_VERSION);
 	unsigned int if_idxs[HERCULES_MAX_INTERFACES];
 	int n_interfaces = 0;
 	char *config_path = NULL;
