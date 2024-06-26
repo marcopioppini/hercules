@@ -17,9 +17,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"time"
+
 	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/snet"
-	"os"
 )
 
 func exit(err error) {
@@ -40,7 +42,8 @@ func newDaemonConn(ctx context.Context) (daemon.Connector, error) {
 }
 
 func newPathQuerier() snet.PathQuerier {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second * 10)
+	defer cancel()
 	daemonConn, err := newDaemonConn(ctx)
 	if err != nil {
 		exit(err)
