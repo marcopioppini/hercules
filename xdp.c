@@ -402,7 +402,7 @@ int xdp_setup(struct hercules_server *server) {
 	int ret = load_xsk_redirect_userspace(server, server->worker_args,
 										  server->config.n_threads);
 	if (ret) {
-		debug_printf("Error loading XDP redirect");
+		fprintf(stderr, "Error loading XDP redirect, is another program loaded?\n");
 		return ret;
 	}
 

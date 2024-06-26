@@ -16,7 +16,7 @@ bool monitor_get_reply_path(int sockfd, const char *rx_sample_buf,
 // Get SCION paths from the monitor for a given job ID. The caller is
 // responsible for freeing **paths.
 // Returns false on error.
-bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
+bool monitor_get_paths(int sockfd, u64 job_id, int payloadlen, int *n_paths,
 					   struct hercules_path **paths);
 
 // Check if the monitor has a new job available.
@@ -25,12 +25,12 @@ bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
 // Returns false if no new job available OR on error.
 // The caller is responsible for freeing **name and **destname if the return
 // value was true.
-bool monitor_get_new_job(int sockfd, char **name, char **destname, u16 *job_id,
+bool monitor_get_new_job(int sockfd, char **name, char **destname, u64 *job_id,
 						 struct hercules_app_addr *dest, u16 *payloadlen);
 
 // Inform the monitor about a transfer's status.
 // Returns false if the job was cancelled by the monitor or on error.
-bool monitor_update_job(int sockfd, int job_id, enum session_state state,
+bool monitor_update_job(int sockfd, u64 job_id, enum session_state state,
 						enum session_error err, u64 seconds_elapsed,
 						u64 bytes_acked);
 
@@ -85,7 +85,7 @@ struct sockmsg_reply_path_A {
 struct sockmsg_new_job_Q {};
 struct sockmsg_new_job_A {
 	uint8_t has_job;  // The other fields are only valid if this is set to 1
-	uint16_t job_id;
+	uint64_t job_id;
 	uint64_t dest_ia;  //< Destination address in network byte order
 	uint32_t dest_ip;
 	uint16_t dest_port;
@@ -99,7 +99,7 @@ struct sockmsg_new_job_A {
 // Get paths to use for a given job ID
 #define SOCKMSG_TYPE_GET_PATHS (3)
 struct sockmsg_paths_Q {
-	uint16_t job_id;
+	uint64_t job_id;
 };
 struct sockmsg_paths_A {
 	uint16_t n_paths;
@@ -109,7 +109,7 @@ struct sockmsg_paths_A {
 // Inform the monitor about a job's status
 #define SOCKMSG_TYPE_UPDATE_JOB (4)
 struct sockmsg_update_job_Q {
-	uint16_t job_id;
+	uint64_t job_id;
 	uint32_t status;  // One of enum session_state
 	uint32_t error;	  // One of enum session_error
 	uint64_t seconds_elapsed;

@@ -229,7 +229,7 @@ struct hercules_session {
 	size_t tx_npkts;
 
 	struct hercules_app_addr peer;	//< UDP/SCION address of peer (big endian)
-	u32 jobid;						//< The monitor's ID for this job
+	u64 jobid;						//< The monitor's ID for this job
 	u32 payloadlen;	 //< The payload length used for this transfer. Note that
 					 // the payload length includes the rbudp header while the
 					 // chunk length does not.

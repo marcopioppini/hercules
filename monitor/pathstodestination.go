@@ -137,7 +137,6 @@ func (ptd *PathsToDestination) chooseNewPaths(availablePaths []PathWithInterface
 
 	// pick paths
 	picker := makePathPicker(ptd.dst.pathSpec, availablePaths, ptd.dst.numPaths)
-	fmt.Println(availablePaths)
 	var pathSet []PathWithInterface
 	disjointness := 0 // negative number denoting how many network interfaces are shared among paths (to be maximized)
 	maxRuleIdx := 0   // the highest index of a PathSpec that is used (to be minimized)

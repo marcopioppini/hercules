@@ -324,7 +324,6 @@ func prepareHeader(path PathMeta, payloadLen int, srcUDP, dstUDP net.UDPAddr, sr
 	etherLen := underlayHeaderLen + scionHdrLen + payloadLen
 
 	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcUDP.IP, path.path.UnderlayNextHop().IP, uint16(path.path.UnderlayNextHop().Port), etherLen)
-	fmt.Println(underlayHeader, err)
 
 	payload := snet.UDPPayload{
 		SrcPort: 0, // Will be filled by server, left empty for correct checksum computation
@@ -390,7 +389,5 @@ func getPathHeaderlen(path snet.Path) (int, int) {
 		fmt.Println("serializer err", err)
 		return 0, 0
 	}
-	fmt.Println("Header length: ", len(destPkt.Bytes))
-	fmt.Println("Underlay Header length: ", len(underlayHeader))
 	return len(underlayHeader), len(destPkt.Bytes)
 }

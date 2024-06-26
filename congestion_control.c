@@ -42,7 +42,6 @@ void ccontrol_start_monitoring_interval(struct ccontrol_state *cc_state)
 
 void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt)
 {
-	debug_printf("update rtt");
 	cc_state->rtt = rtt / 1e9;
 
 	float m = (rand() % 6) / 10.f + 1.7; // m in [1.7, 2.2]
@@ -89,7 +88,6 @@ void continue_ccontrol(struct ccontrol_state *cc_state)
 u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now)
 {
 	if(cc_state->state == pcc_uninitialized) {
-		debug_printf("uninit");
 		cc_state->state = pcc_startup;
 		cc_state->mi_start = get_nsecs();
 		cc_state->mi_end = cc_state->mi_start + cc_state->pcc_mi_duration * 1e9;

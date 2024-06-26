@@ -402,7 +402,8 @@ struct hercules_server *hercules_init_server(struct hercules_config config,
 	server->usock =
 		monitor_bind_daemon_socket(config.server_socket, config.monitor_socket);
 	if (server->usock == 0) {
-		fprintf(stderr, "Error binding daemon socket\n");
+		fprintf(stderr,
+				"Error binding daemon socket. Is the monitor running?\n");
 		exit_with_error(NULL, EINVAL);
 	}
 
@@ -1153,18 +1154,24 @@ static char *rx_mmap(char *index, size_t index_size, size_t total_filesize) {
 				struct stat statbuf;
 				ret = stat((char *)entry->path, &statbuf);
 				if (ret) {
+					fprintf(stderr, "Error reading %s\n", (char *)entry->path);
 					encountered_err = true;
 					break;
 				}
 				if (!(S_ISREG(statbuf.st_mode))) {
-					debug_printf("path exists but is not a regular file?");
+					fprintf(
+						stderr,
+						"Error: Path %s exists but is not a regular file?\n",
+						(char *)entry->path);
 					encountered_err = true;
 					break;
 				}
-				debug_printf("Overwriting existing file!");
+				fprintf(stderr, "!> Overwriting existing file: %s\n",
+						(char *)entry->path);
 				f = open((char *)entry->path, O_RDWR);
 			}
 			if (f == -1) {
+				fprintf(stderr, "Error opening %s\n", (char *)entry->path);
 				encountered_err = true;
 				break;
 			}
@@ -1199,11 +1206,14 @@ static char *rx_mmap(char *index, size_t index_size, size_t total_filesize) {
 						break;
 					}
 					if (!S_ISDIR(statbuf.st_mode)) {
-						debug_printf("path exists but is not a directory?");
+						fprintf(
+							stderr,
+							"Error: Path %s exists but is not a directory?\n",
+							(char *)entry->path);
 						encountered_err = true;
 						break;
 					}
-					fprintf(stderr, "Directory already exists: %s\n",
+					fprintf(stderr, "!> Directory already exists: %s\n",
 							(char *)entry->path);
 				} else {
 					debug_printf("mkdir err");
@@ -2103,9 +2113,7 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 {
 	u32 num_chunks_prepared = 0;
 	u32 chunk_idx = tx_state->prev_chunk_idx;
-	/* debug_printf("n chunks %d", num_chunks); */
 	for(; num_chunks_prepared < num_chunks; num_chunks_prepared++) {
-		/* debug_printf("prepared %d/%d chunks", num_chunks_prepared, num_chunks); */
 		u32 total_chunks;
 		if (is_index_transfer) {
 			chunk_idx =
@@ -2445,7 +2453,6 @@ static char *tx_mmap(char *fname, char *dstname, size_t *filesize,
 		free(index);
 		return NULL;
 	}
-	debug_printf("Mapped at %p, %llu", mem, total_filesize);
 
 	// Now we go over the directory tree we just generated and
 	// - Map the files
@@ -2503,6 +2510,7 @@ static char *tx_mmap(char *fname, char *dstname, size_t *filesize,
 		if (entry->type == INDEX_TYPE_FILE) {
 			int f = open((char *)entry->path, O_RDONLY);
 			if (f == -1) {
+				fprintf(stderr, "Error opening %s\n", (char *)entry->path);
 				encountered_err = true;
 				break;
 			}
@@ -2571,13 +2579,13 @@ static struct {
 	double target_duration, actual_duration;
 } pcc_trace[PCC_TRACE_SIZE];
 
-static void pcc_trace_push(u64 time, sequence_number range_start, sequence_number range_end, sequence_number mi_min,
+static bool pcc_trace_push(u64 time, sequence_number range_start, sequence_number range_end, sequence_number mi_min,
 						   sequence_number mi_max, u32 excess, float loss, u32 delta_left, u32 delta_right, u32 nnacks, u32 nack_pkts,
 						   enum pcc_state state, u32 target_rate, u32 actual_rate, double target_duration, double actual_duration) {
 	u32 idx = atomic_fetch_add(&pcc_trace_count, 1);
 	if(idx >= PCC_TRACE_SIZE) {
 		fprintf(stderr, "oops: pcc trace too small, trying to push #%d\n", idx);
-		exit(133);
+		return false;
 	}
 	pcc_trace[idx].time = time;
 	pcc_trace[idx].range_start = range_start;
@@ -2595,6 +2603,7 @@ static void pcc_trace_push(u64 time, sequence_number range_start, sequence_numbe
 	pcc_trace[idx].actual_rate = actual_rate;
 	pcc_trace[idx].target_duration = target_duration;
 	pcc_trace[idx].actual_duration = actual_duration;
+	return true;
 }
 
 static bool pcc_mi_elapsed(struct ccontrol_state *cc_state)
@@ -2634,6 +2643,8 @@ static void pcc_monitor(struct sender_state *tx_state)
 				fprintf(stderr, "Assumption violated.\n");
 				quit_session(tx_state->session, SESSION_ERROR_PCC);
 				cc_state->mi_end = now;
+				pthread_spin_unlock(&cc_state->lock);
+				return;
 			}
 			u32 throughput = cc_state->mi_seq_end - cc_state->mi_seq_start; // pkts sent in MI
 
@@ -2659,8 +2670,16 @@ static void pcc_monitor(struct sender_state *tx_state)
 			enum pcc_state state = cc_state->state;
 			double actual_duration = (double)(cc_state->mi_end - cc_state->mi_start) / 1e9;
 
-			pcc_trace_push(now, start, end, mi_min, mi_max, excess, loss, delta_left, delta_right, nnacks, nack_pkts, state,
-							cc_state->curr_rate * cc_state->pcc_mi_duration, throughput, cc_state->pcc_mi_duration, actual_duration);
+			bool ok = pcc_trace_push(
+				now, start, end, mi_min, mi_max, excess, loss, delta_left,
+				delta_right, nnacks, nack_pkts, state,
+				cc_state->curr_rate * cc_state->pcc_mi_duration, throughput,
+				cc_state->pcc_mi_duration, actual_duration);
+			if (!ok) {
+				pthread_spin_unlock(&cc_state->lock);
+				quit_session(tx_state->session, SESSION_ERROR_PCC);
+				return;
+			}
 
 			if(cc_state->num_nack_pkts != 0) { // skip PCC control if no NACKs received
 				if(cc_state->ignored_first_mi) { // first MI after booting will only contain partial feedback, skip it as well
@@ -2957,7 +2976,7 @@ static void new_tx_if_available(struct hercules_server *server) {
 	// slot it will still be free when we assign to it later on
 	char *fname;
 	char *destname;
-	u16 jobid;
+	u64 jobid;
 	u16 payloadlen;
 	struct hercules_app_addr dest;
 	int ret = monitor_get_new_job(server->usock, &fname, &destname, &jobid,
@@ -2965,13 +2984,13 @@ static void new_tx_if_available(struct hercules_server *server) {
 	if (!ret) {
 		return;
 	}
-	debug_printf("new job: %s -> %s", fname, destname);
-	debug_printf("using tx slot %d", session_slot);
-	debug_printf("destination address %x-%x:%x:%x %u.%u.%u.%u %u",
-				 ntohs(*((u16 *)&dest.ia + 3)), ntohs(*((u16 *)&dest.ia + 2)),
-				 ntohs(*((u16 *)&dest.ia + 1)), ntohs(*((u16 *)&dest.ia + 0)),
-				 *((u8 *)&dest.ip + 3), *((u8 *)&dest.ip + 2),
-				 *((u8 *)&dest.ip + 1), *((u8 *)&dest.ip + 0), ntohs(dest.port));
+	fprintf(stderr, "Starting new transfer (%2d): %s -> %s\n", session_slot,
+			fname, destname);
+	fprintf(stderr, "Destination address: %u-%x:%x:%x %u.%u.%u.%u %u\n",
+			ntohs(*((u16 *)&dest.ia + 0)), ntohs(*((u16 *)&dest.ia + 1)),
+			ntohs(*((u16 *)&dest.ia + 2)), ntohs(*((u16 *)&dest.ia + 3)),
+			*((u8 *)&dest.ip + 0), *((u8 *)&dest.ip + 1), *((u8 *)&dest.ip + 2),
+			*((u8 *)&dest.ip + 3), ntohs(dest.port));
 
 	// It's ok to ignore the return value of monitor_update_job here: Since
 	// we're informing the monitor about an error we don't care if the
@@ -3073,7 +3092,7 @@ static void cleanup_finished_sessions(struct hercules_server *server, int s, u64
 							   sec_elapsed, bytes_acked);
 			struct hercules_session *current = session_tx;
 			atomic_store(&server->sessions_tx[s], NULL);
-			fprintf(stderr, "Cleaning up TX session %d...\n", s);
+			debug_printf("Cleaning up TX session %d", s);
 			// At this point we don't know if some other thread still has a
 			// pointer to the session that it might dereference, so we
 			// cannot safely free it. So, we record the pointer and defer
@@ -3089,7 +3108,7 @@ static void cleanup_finished_sessions(struct hercules_server *server, int s, u64
 		if (now > session_rx->last_pkt_rcvd + session_timeout * 2) {
 			struct hercules_session *current = session_rx;
 			atomic_store(&server->sessions_rx[s], NULL);
-			fprintf(stderr, "Cleaning up RX session %d...\n", s);
+			debug_printf("Cleaning up RX session %d", s);
 			// See the note above on deferred freeing
 			destroy_session_rx(server, server->deferreds_rx[s]);
 			server->deferreds_rx[s] = current;
@@ -3104,18 +3123,18 @@ static void mark_timed_out_sessions(struct hercules_server *server, int s,
 	if (session_tx && session_tx->state != SESSION_STATE_DONE) {
 		if (now > session_tx->last_pkt_rcvd + session_timeout) {
 			quit_session(session_tx, SESSION_ERROR_TIMEOUT);
-			debug_printf("Session (TX %2d) timed out!", s);
+			fprintf(stderr, "Session (TX %2d) timed out!\n", s);
 		}
 	}
 	struct hercules_session *session_rx = server->sessions_rx[s];
 	if (session_rx && session_rx->state != SESSION_STATE_DONE) {
 		if (now > session_rx->last_pkt_rcvd + session_timeout) {
 			quit_session(session_rx, SESSION_ERROR_TIMEOUT);
-			debug_printf("Session (RX %2d) timed out!", s);
+			fprintf(stderr, "Session (RX %2d) timed out!\n", s);
 		} else if (now >
 				   session_rx->last_new_pkt_rcvd + session_stale_timeout) {
 			quit_session(session_rx, SESSION_ERROR_STALE);
-			debug_printf("Session (RX %2d) stale!", s);
+			fprintf(stderr, "Session (RX %2d) stale!\n", s);
 		}
 	}
 }
@@ -3262,7 +3281,7 @@ static void print_session_stats(struct hercules_server *server, u64 now,
 			double progress_percent = acked_count / (double)total * 100;
 			send_rate_total += send_rate;
 			fprintf(
-				stderr,
+				stdout,
 				"(TX %2d) [%4.1f%%] Chunks: %9u/%9u, rx: %9ld, tx:%9ld, rate "
 				"%8.2f "
 				"Mbps\n",
@@ -3286,7 +3305,7 @@ static void print_session_stats(struct hercules_server *server, u64 now,
 				8 * recv_rate_pps * session_rx->rx_state->chunklen / 1e6;
 			recv_rate_total += recv_rate;
 			double progress_percent = rec_count / (double)total * 100;
-			fprintf(stderr,
+			fprintf(stdout,
 					"(RX %2d) [%4.1f%%] Chunks: %9u/%9u, rx: %9ld, tx:%9ld, "
 					"rate %8.2f "
 					"Mbps\n",
@@ -3295,9 +3314,9 @@ static void print_session_stats(struct hercules_server *server, u64 now,
 		}
 	}
 	if (active_session) {
-		fprintf(stderr, "TX Total Rate: %.2f Mbps\n", send_rate_total);
-		fprintf(stderr, "RX Total Rate: %.2f Mbps\n", recv_rate_total);
-		fprintf(stderr, "\n");
+		fprintf(stdout, "TX Total Rate: %.2f Mbps\n", send_rate_total);
+		fprintf(stdout, "RX Total Rate: %.2f Mbps\n", recv_rate_total);
+		fprintf(stdout, "\n");
 	}
 }
 
@@ -3344,7 +3363,7 @@ static void stop_finished_sessions(struct hercules_server *server, int slot,
 	struct hercules_session *session_tx = server->sessions_tx[slot];
 	if (session_tx != NULL && session_tx->state != SESSION_STATE_DONE &&
 		session_tx->error != SESSION_ERROR_NONE) {
-		debug_printf("Stopping TX %d", slot);
+		fprintf(stderr, "Stopping TX %d\n", slot);
 		session_tx->state = SESSION_STATE_DONE;
 		u64 sec_elapsed = (now - session_tx->last_pkt_rcvd) / (int)1e9;
 		u64 bytes_acked = session_tx->tx_state->chunklen *
@@ -3357,13 +3376,13 @@ static void stop_finished_sessions(struct hercules_server *server, int slot,
 	struct hercules_session *session_rx = server->sessions_rx[slot];
 	if (session_rx != NULL && session_rx->state != SESSION_STATE_DONE &&
 		session_rx->error != SESSION_ERROR_NONE) {
-		debug_printf("Stopping RX %d", slot);
+		fprintf(stderr, "Stopping RX %d\n", slot);
 		session_rx->state = SESSION_STATE_DONE;
 		int ret =
 			msync(session_rx->rx_state->mem, session_rx->rx_state->filesize,
 				  MS_ASYNC);  // XXX do we need SYNC here?
 		if (ret) {
-			debug_printf("msync err? %s", strerror(errno));
+			fprintf(stderr, "msync err? %s\n", strerror(errno));
 		}
 	}
 }

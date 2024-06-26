@@ -210,7 +210,7 @@ func main() {
 					strlen_src := len(selectedJob.file)
 					strlen_dst := len(selectedJob.destFile)
 					b = append(b, 1)
-					b = binary.LittleEndian.AppendUint16(b, uint16(selectedJob.id))
+					b = binary.LittleEndian.AppendUint64(b, uint64(selectedJob.id))
 
 					// Address components in network byte order
 					b = binary.BigEndian.AppendUint64(b, uint64(selectedJob.dest.IA))
@@ -229,8 +229,8 @@ func main() {
 				usock.WriteToUnix(b, a)
 
 			case C.SOCKMSG_TYPE_GET_PATHS:
-				job_id := binary.LittleEndian.Uint16(buf[:2])
-				buf = buf[2:]
+				job_id := binary.LittleEndian.Uint64(buf[:8])
+				buf = buf[8:]
 				transfersLock.Lock()
 				job, _ := transfers[int(job_id)]
 				n_headers, headers := headersToDestination(*job)
@@ -240,8 +240,8 @@ func main() {
 				usock.WriteToUnix(b, a)
 
 			case C.SOCKMSG_TYPE_UPDATE_JOB:
-				job_id := binary.LittleEndian.Uint16(buf[:2])
-				buf = buf[2:]
+				job_id := binary.LittleEndian.Uint64(buf[:8])
+				buf = buf[8:]
 				status := binary.LittleEndian.Uint32(buf[:4])
 				buf = buf[4:]
 				errorcode := binary.LittleEndian.Uint32(buf[:4])

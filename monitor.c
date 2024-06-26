@@ -15,12 +15,12 @@ static bool monitor_send_recv(int sockfd, struct hercules_sockmsg_Q *in,
 							  struct hercules_sockmsg_A *out) {
 	int ret = send(sockfd, in, sizeof(*in), 0);
 	if (ret != sizeof(*in)) {
-		debug_printf("Error sending to monitor?");
+		fprintf(stderr, "Error sending to monitor?\n");
 		return false;
 	}
 	ret = recv(sockfd, out, sizeof(*out), 0);
 	if (ret <= 0) {
-		debug_printf("Error reading from monitor?");
+		fprintf(stderr, "Error reading from monitor?\n");
 		return false;
 	}
 	return true;
@@ -61,7 +61,7 @@ bool monitor_get_reply_path(int sockfd, const char *rx_sample_buf,
 
 // The payload length is fixed when first fetching the job, we pass it in here
 // to compute the paths payload and frame lengths.
-bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
+bool monitor_get_paths(int sockfd, u64 job_id, int payloadlen, int *n_paths,
 					   struct hercules_path **paths) {
 	struct hercules_sockmsg_Q msg;
 	msg.msgtype = SOCKMSG_TYPE_GET_PATHS;
@@ -97,7 +97,7 @@ bool monitor_get_paths(int sockfd, int job_id, int payloadlen, int *n_paths,
 	return true;
 }
 
-bool monitor_get_new_job(int sockfd, char **name, char **destname, u16 *job_id,
+bool monitor_get_new_job(int sockfd, char **name, char **destname, u64 *job_id,
 						 struct hercules_app_addr *dest, u16 *payloadlen) {
 	struct hercules_sockmsg_Q msg = {.msgtype = SOCKMSG_TYPE_GET_NEW_JOB};
 
@@ -130,7 +130,7 @@ bool monitor_get_new_job(int sockfd, char **name, char **destname, u16 *job_id,
 		*destname,
 		(char *)reply.payload.newjob.names + reply.payload.newjob.filename_len,
 		reply.payload.newjob.destname_len);
-	debug_printf("received job id %d", reply.payload.newjob.job_id);
+	debug_printf("received job id %lu", reply.payload.newjob.job_id);
 	*job_id = reply.payload.newjob.job_id;
 	*payloadlen = reply.payload.newjob.payloadlen;
 	dest->ia = reply.payload.newjob.dest_ia;
@@ -139,7 +139,7 @@ bool monitor_get_new_job(int sockfd, char **name, char **destname, u16 *job_id,
 	return true;
 }
 
-bool monitor_update_job(int sockfd, int job_id, enum session_state state,
+bool monitor_update_job(int sockfd, u64 job_id, enum session_state state,
 						enum session_error err, u64 seconds_elapsed,
 						u64 bytes_acked) {
 	struct hercules_sockmsg_Q msg;
