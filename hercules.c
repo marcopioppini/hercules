@@ -3335,18 +3335,32 @@ static void rx_send_cts(struct hercules_server *server, int s) {
 // ERROR_NONE (generally via quit_session()). If the error is set, this changes
 // the sessions state to DONE. The state update needs to happen in the events_p
 // thread, otherwise there's a chance of getting stuck (e.g. in update_paths).
-static void stop_finished_sessions(struct hercules_server *server, int slot) {
+static void stop_finished_sessions(struct hercules_server *server, int slot,
+								   u64 now) {
 	struct hercules_session *session_tx = server->sessions_tx[slot];
 	if (session_tx != NULL && session_tx->state != SESSION_STATE_DONE &&
 		session_tx->error != SESSION_ERROR_NONE) {
 		debug_printf("Stopping TX %d", slot);
 		session_tx->state = SESSION_STATE_DONE;
+		u64 sec_elapsed = (now - session_tx->last_pkt_rcvd) / (int)1e9;
+		u64 bytes_acked = session_tx->tx_state->chunklen *
+						  session_tx->tx_state->acked_chunks.num_set;
+		// OK to ignore return value: We're done with the transfer and don't
+		// care if the monitor wants us to stop it
+		monitor_update_job(server->usock, session_tx->jobid, session_tx->state,
+						   session_tx->error, sec_elapsed, bytes_acked);
 	}
 	struct hercules_session *session_rx = server->sessions_rx[slot];
 	if (session_rx != NULL && session_rx->state != SESSION_STATE_DONE &&
 		session_rx->error != SESSION_ERROR_NONE) {
 		debug_printf("Stopping RX %d", slot);
 		session_rx->state = SESSION_STATE_DONE;
+		int ret =
+			msync(session_rx->rx_state->mem, session_rx->rx_state->filesize,
+				  MS_ASYNC);  // XXX do we need SYNC here?
+		if (ret) {
+			debug_printf("msync err? %s", strerror(errno));
+		}
 	}
 }
 
@@ -3373,7 +3387,7 @@ static void events_p(void *arg) {
 		current_slot = (current_slot + 1) % HERCULES_CONCURRENT_SESSIONS;
 
 		mark_timed_out_sessions(server, current_slot, now);
-		stop_finished_sessions(server, current_slot);
+		stop_finished_sessions(server, current_slot, now);
 		tx_update_monitor(server, current_slot, now);
 		tx_update_paths(server, current_slot, now);
 		cleanup_finished_sessions(server, current_slot, now);
