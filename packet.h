@@ -161,6 +161,7 @@ struct rbudp_ack_pkt {
 #define CONTROL_PACKET_TYPE_INITIAL 0
 #define CONTROL_PACKET_TYPE_ACK 1
 #define CONTROL_PACKET_TYPE_NACK 2
+#define CONTROL_PACKET_TYPE_RTT 3
 
 struct hercules_control_packet {
 	__u8 type;

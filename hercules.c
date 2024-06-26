@@ -254,6 +254,9 @@ void debug_print_rbudp_pkt(const char *pkt, bool recv) {
 				}
 				printf("\n");
 				break;
+			case CONTROL_PACKET_TYPE_RTT:
+				printf("%s   RTT\n", prefix);
+				break;
 			default:
 				printf("%s   ?? UNKNOWN CONTROL PACKET TYPE", prefix);
 				break;
@@ -1358,6 +1361,7 @@ static void rx_handle_initial(struct hercules_server *server,
 		if (!ok) {
 			quit_session(rx_state->session, SESSION_ERROR_NO_PATHS);
 		}
+		rx_state->sent_initial_at = get_nsecs();
 	}
 	rx_send_rtt_ack(server, rx_state, initial);  // echo back initial pkt to ACK filesize
 }
@@ -1760,6 +1764,29 @@ static void tx_send_initial(struct hercules_server *server,
 	stitch_dst_port(path, session->peer.port, buf);
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, 0, (char *)&pld,
 				   initial_pl_size, path->payloadlen);
+	stitch_checksum_with_dst(path, path->header.checksum, buf);
+
+	send_eth_frame(server, path, buf);
+	atomic_fetch_add(&session->tx_npkts, 1);
+	session->last_pkt_sent = timestamp;
+}
+
+static void tx_send_rtt(struct hercules_server *server,
+						struct hercules_session *session,
+						const struct hercules_path *path, u64 timestamp) {
+	debug_printf("Sending RTT packet");
+	struct sender_state *tx_state = session->tx_state;
+	char buf[HERCULES_MAX_PKTSIZE];
+	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
+
+	struct hercules_control_packet pld = {
+		.type = CONTROL_PACKET_TYPE_RTT,
+	};
+
+	stitch_src_port(path, tx_state->src_port, buf);
+	stitch_dst_port(path, session->peer.port, buf);
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, 0, (char *)&pld,
+				   sizeof(pld.type), path->payloadlen);
 	stitch_checksum_with_dst(path, path->header.checksum, buf);
 
 	send_eth_frame(server, path, buf);
@@ -2243,7 +2270,6 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 			}
 			ccontrol_update_rtt(pathset->paths[0].cc_state,
 								tx_state->handshake_rtt);
-
 			// Return path is always idx 0
 			debug_printf(
 				"[receiver %d] [path 0] handshake_rtt: "
@@ -2262,6 +2288,7 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 		session_tx->peer.port = pkt_src->port;
 		debug_printf("Updating peer port for this session to %u",
 					 ntohs(pkt_src->port));
+		tx_send_rtt(server, session_tx, &pathset->paths[0], now);
 		if (tx_state->needs_index_transfer) {
 			// Need to do index transfer first
 			if (!(parsed_pkt->flags & HANDSHAKE_FLAG_INDEX_FOLLOWS)) {
@@ -2283,7 +2310,7 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 #ifdef CHECK_SRC_ADDRESS
 		if (!src_matches_address(session_tx, pkt_src)) {
 			debug_printf(
-				"Dropping initail packet with wrong source IA/IP/Port");
+				"Dropping initial packet with wrong source IA/IP/Port");
 			return;
 		}
 #endif
@@ -2293,6 +2320,8 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 		if (server->config.enable_pcc) {
 			ccontrol_update_rtt(pathset->paths[parsed_pkt->path_index].cc_state,
 								now - parsed_pkt->timestamp);
+			debug_printf("[Path %d] New RTT %fs", parsed_pkt->path_index,
+						 (now - parsed_pkt->timestamp) / 1e9);
 		}
 		pathset->paths[parsed_pkt->path_index].next_handshake_at = UINT64_MAX;
 
@@ -2306,6 +2335,7 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 					pathset->paths[p].cc_state->rtt = DBL_MAX;
 				}
 			}
+			tx_send_rtt(server, session_tx, &pathset->paths[0], now);
 		}
 		count_received_pkt(session_tx, pkt_path_idx);
 		return;
@@ -3440,6 +3470,10 @@ static void events_p(void *arg) {
 			struct hercules_control_packet *cp =
 				(struct hercules_control_packet *)pl;
 			u32 control_pkt_payloadlen = rbudp_len - rbudp_headerlen;
+			struct hercules_session *session_rx =
+				lookup_session_rx(server, pkt_dst_port);
+			struct hercules_session *session_tx =
+				lookup_session_tx(server, pkt_dst_port);
 
 			switch (cp->type) {
 				case CONTROL_PACKET_TYPE_INITIAL:;
@@ -3456,8 +3490,6 @@ static void events_p(void *arg) {
 					}
 
 					// Otherwise, we process and reflect the packet
-					struct hercules_session *session_rx =
-						lookup_session_rx(server, pkt_dst_port);
 					if (session_rx != NULL &&
 						session_state_is_running(session_rx->state)) {
 						if (!(parsed_pkt->flags &
@@ -3493,8 +3525,6 @@ static void events_p(void *arg) {
 						debug_printf("ACK packet too short");
 						break;
 					}
-					struct hercules_session *session_tx =
-						lookup_session_tx(server, pkt_dst_port);
 #ifdef CHECK_SRC_ADDRESS
 					if (session_tx != NULL &&
 						!src_matches_address(session_tx, &pkt_source)) {
@@ -3542,7 +3572,6 @@ static void events_p(void *arg) {
 						debug_printf("NACK packet too short");
 						break;
 					}
-					session_tx = lookup_session_tx(server, pkt_dst_port);
 #ifdef CHECK_SRC_ADDRESS
 					if (session_tx != NULL &&
 						!src_matches_address(session_tx, &pkt_source)) {
@@ -3574,12 +3603,22 @@ static void events_p(void *arg) {
 						}
 					}
 					break;
+
+				case CONTROL_PACKET_TYPE_RTT:;
+					if (session_rx &&
+						src_matches_address(session_rx, &pkt_source)) {
+						struct receiver_state *rx_state = session_rx->rx_state;
+						rx_state->handshake_rtt =
+							get_nsecs() - rx_state->sent_initial_at;
+						debug_printf("Updating RTT to %fs",
+									 rx_state->handshake_rtt / 1e9);
+					}
+					break;
+
 				default:
 					debug_printf("Received control packet of unknown type");
 					break;
 			}
-			struct hercules_session *session_tx =
-				lookup_session_tx(server, pkt_dst_port);
 			if (session_tx) {
 				pcc_monitor(session_tx->tx_state);
 			}

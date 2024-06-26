@@ -105,6 +105,7 @@ struct receiver_state {
 	u16 src_port;	 // The UDP/SCION port to use when sending packets (LE)
 	u64 start_time;	 // Start/end time of the current transfer
 	u64 end_time;
+	u64 sent_initial_at;
 };
 
 /// SENDER
