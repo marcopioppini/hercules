@@ -2,12 +2,6 @@
 // Copyright(c) 2017 - 2018 Intel Corporation.
 // Copyright(c) 2019 ETH Zurich.
 
-// Enable extra warnings; cannot be enabled in CFLAGS because cgo generates a
-// ton of warnings that can apparantly not be suppressed.
-#pragma GCC diagnostic warning "-Wextra"
-/* #pragma GCC diagnostic warning "-Wunused" */
-/* #pragma GCC diagnostic warning "-Wpedantic" */
-
 #include "hercules.h"
 #include "packet.h"
 #include <stdatomic.h>
@@ -58,6 +52,7 @@
 #include "bpf_prgms.h"
 #include "monitor.h"
 #include "xdp.h"
+#include "errors.h"
 
 #define MAX_MIDDLEBOX_PROTO_EXTENSION_SIZE 128 // E.g., SCION SPAO header added by LightningFilter
 
@@ -1319,6 +1314,9 @@ static bool rx_update_reply_path(
 static bool rx_get_reply_path(struct receiver_state *rx_state,
 							  struct hercules_path *path) {
 	struct hercules_path p = atomic_load(&rx_state->reply_path);
+	if (!p.enabled) {
+		return false;
+	}
 	memcpy(path, &p, sizeof(*path));
 	return true;
 }
