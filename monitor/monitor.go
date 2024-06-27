@@ -180,6 +180,14 @@ func main() {
 	// the monitor's job is to respond to queries from the server
 	for {
 		buf := make([]byte, C.SOCKMSG_SIZE)
+		// XXX FIXME Sometimes this read will miss a message that was sent by the server.
+		// The culprit seem to be the seteuid/gid calls in http_api.go, with those
+		// removed the issue does not seem to appear, it also only happens
+		// together with calls to the endpoints using seteuid. Adding a lock around
+		// read/seteuid does not help. The server will retry the request if it
+		// does not receive a response for a while, so this is not *terrible*,
+		// still, it's strange that this happens and I don't know how to fix it.
+		//
 		n, a, err := usock.ReadFromUnix(buf)
 		if err != nil {
 			fmt.Println("Error reading from socket!", err)
@@ -188,6 +196,10 @@ func main() {
 		if n > 0 {
 			msgtype := binary.LittleEndian.Uint16(buf[:2])
 			buf = buf[2:]
+			msgno := binary.LittleEndian.Uint16(buf[:2])
+			buf = buf[2:]
+			var b []byte
+			b = binary.LittleEndian.AppendUint16(b, uint16(msgno))
 			switch msgtype {
 
 			case C.SOCKMSG_TYPE_GET_REPLY_PATH:
@@ -196,7 +208,6 @@ func main() {
 				etherlen := binary.LittleEndian.Uint16(buf[:2])
 				buf = buf[2:]
 				replyPath, nextHop, err := getReplyPathHeader(buf[:sample_len], int(etherlen))
-				var b []byte
 				if err != nil {
 					fmt.Println("Error in reply path lookup:", err)
 					b = append(b, 0)
@@ -229,7 +240,6 @@ func main() {
 					}
 				}
 				transfersLock.Unlock()
-				var b []byte
 				if selectedJob != nil {
 					fmt.Println("Sending transfer to daemon:", selectedJob.file, selectedJob.destFile, selectedJob.id)
 					_, _ = headersToDestination(*selectedJob) // look up paths to fix mtu
@@ -261,7 +271,7 @@ func main() {
 				job, _ := transfers[int(job_id)]
 				n_headers, headers := headersToDestination(*job)
 				transfersLock.Unlock()
-				b := binary.LittleEndian.AppendUint16(nil, uint16(n_headers))
+				b = binary.LittleEndian.AppendUint16(b, uint16(n_headers))
 				b = append(b, headers...)
 				usock.WriteToUnix(b, a)
 
@@ -277,7 +287,6 @@ func main() {
 				bytes_acked := binary.LittleEndian.Uint64(buf[:8])
 				buf = buf[8:]
 				fmt.Println("updating job", job_id, status, errorcode)
-				var b []byte
 				transfersLock.Lock()
 				job, ok := transfers[int(job_id)]
 				if !ok {

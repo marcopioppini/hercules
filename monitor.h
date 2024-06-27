@@ -121,6 +121,7 @@ struct sockmsg_update_job_A {
 
 struct hercules_sockmsg_Q {
 	uint16_t msgtype;
+	uint16_t msgno;
 	union {
 		struct sockmsg_reply_path_Q reply_path;
 		struct sockmsg_paths_Q paths;
@@ -132,6 +133,7 @@ struct hercules_sockmsg_Q {
 #define SOCKMSG_SIZE sizeof(struct hercules_sockmsg_Q)
 
 struct hercules_sockmsg_A {
+	uint16_t msgno;
 	union {
 		struct sockmsg_reply_path_A reply_path;
 		struct sockmsg_paths_A paths;

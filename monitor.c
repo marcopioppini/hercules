@@ -11,19 +11,26 @@
 #include "hercules.h"
 #include "utils.h"
 
+static int msgno = 0;
+
 static bool monitor_send_recv(int sockfd, struct hercules_sockmsg_Q *in,
 							  struct hercules_sockmsg_A *out) {
-	int ret = send(sockfd, in, sizeof(*in), 0);
-	if (ret != sizeof(*in)) {
-		fprintf(stderr, "Error sending to monitor?\n");
-		return false;
+	for (int i = 0; i < 3; i++) {  // 3 Retries, see comment in monitor.go
+		in->msgno = msgno++;
+		int ret = send(sockfd, in, sizeof(*in), 0);
+		if (ret != sizeof(*in)) {
+			fprintf(stderr, "Error sending to monitor?\n");
+			return false;
+		}
+		ret = recv(sockfd, out, sizeof(*out), 0);
+		if (ret <= 0) {
+			fprintf(stderr, "Error reading from monitor?\n");
+			continue;
+		}
+		assert(out->msgno == in->msgno && "Monitor replied with wrong msgno?!");
+		return true;
 	}
-	ret = recv(sockfd, out, sizeof(*out), 0);
-	if (ret <= 0) {
-		fprintf(stderr, "Error reading from monitor?\n");
-		return false;
-	}
-	return true;
+	return false;
 }
 
 bool monitor_get_reply_path(int sockfd, const char *rx_sample_buf,
@@ -40,7 +47,7 @@ bool monitor_get_reply_path(int sockfd, const char *rx_sample_buf,
 	if (!ret) {
 		return false;
 	}
-	if (!reply.payload.reply_path.reply_path_ok){
+	if (!reply.payload.reply_path.reply_path_ok) {
 		return false;
 	}
 
@@ -170,7 +177,7 @@ int monitor_bind_daemon_socket(char *server, char *monitor) {
 	struct sockaddr_un name;
 	name.sun_family = AF_UNIX;
 	// Unix socket paths limited to 107 chars
-	strncpy(name.sun_path, server, sizeof(name.sun_path)-1);
+	strncpy(name.sun_path, server, sizeof(name.sun_path) - 1);
 	unlink(server);
 	int ret = bind(usock, (struct sockaddr *)&name, sizeof(name));
 	if (ret) {
@@ -182,6 +189,11 @@ int monitor_bind_daemon_socket(char *server, char *monitor) {
 	strncpy(monitor_sock.sun_path, monitor, 107);
 	ret =
 		connect(usock, (struct sockaddr *)&monitor_sock, sizeof(monitor_sock));
+	if (ret) {
+		return 0;
+	}
+	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
+	ret = setsockopt(usock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 	if (ret) {
 		return 0;
 	}
