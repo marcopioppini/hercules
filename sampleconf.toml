@@ -24,6 +24,11 @@ MonitorHTTPS = "disabled"
 TLSCert = "cert.pem"
 TLSKey = "key.pem"
 
+# Paths to certificates used for validation of TLS client certificates
+ClientCACerts = [
+"cert.pem",
+]
+
 # Network interfaces to use for Hercules
 Interfaces = [
 "eth0",
@@ -86,8 +91,3 @@ NumPaths = 2
 # file permission checks.
 [UserMap]
 "O=Internet Widgits Pty Ltd,ST=Some-State,C=AU" = {User = "marco", Group = "marco"}
-
-# Paths to certificates used for validation of TLS client certificates
-ClientCACerts = [
-"cert.pem",
-]

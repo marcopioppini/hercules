@@ -184,16 +184,16 @@ func statAsUser(user, file string) (fs.FileInfo, error) {
 		return nil, fmt.Errorf("No user?")
 	}
 
-	err := syscall.Seteuid(ug.uidLookup)
-	if err != nil {
-		return nil, err
-	}
-	defer syscall.Seteuid(0)
-	err = syscall.Setegid(ug.gidLookup)
+	err := syscall.Setegid(ug.gidLookup)
 	if err != nil {
 		return nil, err
 	}
 	defer syscall.Setegid(0)
+	err = syscall.Seteuid(ug.uidLookup)
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.Seteuid(0)
 
 	return os.Stat(file)
 }
@@ -234,4 +234,9 @@ func http_stat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	io.WriteString(w, fmt.Sprintf("OK 1 %d\n", info.Size()))
+}
+
+// Return the server's SCION address (needed for gfal)
+func http_server(w http.ResponseWriter, _ *http.Request) {
+	io.WriteString(w, fmt.Sprintf("OK %s", config.ListenAddress.addr.String()))
 }

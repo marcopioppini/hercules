@@ -150,6 +150,7 @@ func main() {
 	http.HandleFunc("/submit", http_submit)
 	http.HandleFunc("/status", http_status)
 	http.HandleFunc("/cancel", http_cancel)
+	http.HandleFunc("/server", http_server)
 	http.HandleFunc("/stat", http_stat)
 	if config.MonitorHTTP != "disabled" {
 		go http.ListenAndServe(config.MonitorHTTP, nil)
@@ -282,6 +283,8 @@ func main() {
 				if !ok {
 					b = binary.LittleEndian.AppendUint16(b, uint16(0))
 					usock.WriteToUnix(b, a)
+					fmt.Printf("Received job id %v does not exist?\n", job)
+					transfersLock.Unlock()
 					continue
 				}
 				job.state = status

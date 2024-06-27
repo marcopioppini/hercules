@@ -1,0 +1,16 @@
+Hercules plugin for gfal2
+=========================
+This plugin adds support for the Hercules file transfer tool to gfal2 (and FTS).
+The plugin will handle transfers with URLs of the following form:
+hercules://hercules_monitor/path/to/file
+where `hercules_monitor` is the address and port of the Hercules monitor.
+
+
+To build this plugin, you will need the following dependencies:
+- gfal2
+- libcurl
+
+To build, type `make`.
+To install the plugin, type `make install`. By default, this will install the
+plugin, documentation and configuration to `/usr/local`. Depending on your FTS
+installation, you may need to use `PREFIX=/usr SYSCONFDIR=/etc make install`.
