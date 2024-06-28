@@ -60,6 +60,8 @@
 
 #define RANDOMIZE_FLOWID
 
+/* #define PCC_BENCH */
+
 #define RATE_LIMIT_CHECK 1000 // check rate limit every X packets
 // Maximum burst above target pps allowed
 #define PATH_HANDSHAKE_TIMEOUT_NS 100e6 // send a path handshake every X=100 ms until the first response arrives
@@ -67,7 +69,7 @@
 #define ACK_RATE_TIME_MS 100 // send ACKS after at most X milliseconds
 
 // After how many NACK tracking errors to resend a path handshake
-#define NACK_ERRS_ALLOWED 20
+#define NACK_ERRS_ALLOWED 10
 
 static const int rbudp_headerlen = sizeof(struct hercules_header);
 static const u64 session_timeout = 10e9;				// 10 sec
@@ -1358,6 +1360,7 @@ static void rx_send_rtt_ack(struct hercules_server *server,
 static void rx_handle_initial(struct hercules_server *server,
 							  struct receiver_state *rx_state,
 							  struct rbudp_initial_pkt *initial,
+							  u64 pkt_received_at,
 							  const char *buf, const char *payload,
 							  int framelen) {
 	debug_printf("handling initial");
@@ -1373,9 +1376,14 @@ static void rx_handle_initial(struct hercules_server *server,
 		if (!ok) {
 			quit_session(rx_state->session, SESSION_ERROR_NO_PATHS);
 		}
+	}
+	u64 proctime = get_nsecs() - pkt_received_at;
+	debug_printf("Adjusting timestamp by %fs", proctime / 1e9);
+	initial->timestamp += proctime;
+	rx_send_rtt_ack(server, rx_state, initial);  // echo back initial pkt to ACK filesize
+	if (initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
 		rx_state->sent_initial_at = get_nsecs();
 	}
-	rx_send_rtt_ack(server, rx_state, initial);  // echo back initial pkt to ACK filesize
 }
 
 // Send an empty ACK, indicating to the sender that it may start sending data
@@ -1417,6 +1425,7 @@ static int find_free_rx_slot(struct hercules_server *server){
 static void rx_accept_new_session(struct hercules_server *server,
 								  struct rbudp_initial_pkt *parsed_pkt,
 								  struct hercules_app_addr *peer,
+								  u64 pkt_received_at,
 								  const char *buf, const char *payload,
 								  ssize_t len, int rx_slot) {
 	if (parsed_pkt->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
@@ -1432,8 +1441,8 @@ static void rx_accept_new_session(struct hercules_server *server,
 		if (!(parsed_pkt->flags & HANDSHAKE_FLAG_INDEX_FOLLOWS)) {
 			// Entire index contained in this packet,
 			// we can go ahead and proceed with transfer
-			struct receiver_state *rx_state = make_rx_state(
-				session, parsed_pkt, src_port, true);
+			struct receiver_state *rx_state =
+				make_rx_state(session, parsed_pkt, src_port, true);
 			if (rx_state == NULL) {
 				debug_printf("Error creating RX state!");
 				destroy_send_queue(session->send_queue);
@@ -1443,15 +1452,15 @@ static void rx_accept_new_session(struct hercules_server *server,
 			}
 			session->rx_state = rx_state;
 
-			rx_handle_initial(server, rx_state, parsed_pkt, buf,
-							  payload, len);
+			rx_handle_initial(server, rx_state, parsed_pkt, pkt_received_at,
+							  buf, payload, len);
 			rx_send_cts_ack(server, rx_state);
 			session->state = SESSION_STATE_RUNNING_DATA;
 
 		} else {
 			// Index transferred separately
-			struct receiver_state *rx_state = make_rx_state(
-				session, parsed_pkt, src_port, false);
+			struct receiver_state *rx_state =
+				make_rx_state(session, parsed_pkt, src_port, false);
 			if (rx_state == NULL) {
 				debug_printf("Error creating RX state!");
 				destroy_send_queue(session->send_queue);
@@ -1461,8 +1470,8 @@ static void rx_accept_new_session(struct hercules_server *server,
 			}
 			session->rx_state = rx_state;
 
-			rx_handle_initial(server, rx_state, parsed_pkt, buf,
-							  payload, len);
+			rx_handle_initial(server, rx_state, parsed_pkt, pkt_received_at,
+							  buf, payload, len);
 			session->state = SESSION_STATE_RUNNING_IDX;
 		}
 		server->sessions_rx[rx_slot] = session;
@@ -2272,6 +2281,11 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 		}
 		struct path_set *pathset = tx_state->pathset;
 		u64 now = get_nsecs();
+		tx_state->start_time = now;
+		session_tx->peer.port = pkt_src->port;
+		tx_send_rtt(server, session_tx, &pathset->paths[0], now);
+		debug_printf("Updating peer port for this session to %u",
+					 ntohs(pkt_src->port));
 		if (server->config.enable_pcc) {
 			tx_state->handshake_rtt = now - parsed_pkt->timestamp;
 			for (u32 i = 0; i < pathset->n_paths; i++) {
@@ -2294,11 +2308,6 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 		for (u32 p = 1; p < pathset->n_paths; p++) {
 			pathset->paths[p].next_handshake_at = now;
 		}
-		tx_state->start_time = get_nsecs();
-		session_tx->peer.port = pkt_src->port;
-		debug_printf("Updating peer port for this session to %u",
-					 ntohs(pkt_src->port));
-		tx_send_rtt(server, session_tx, &pathset->paths[0], now);
 		if (tx_state->needs_index_transfer) {
 			// Need to do index transfer first
 			if (!(parsed_pkt->flags & HANDSHAKE_FLAG_INDEX_FOLLOWS)) {
@@ -2337,6 +2346,7 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 
 		// We have a new return path, redo handshakes on all other paths
 		if (parsed_pkt->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
+			tx_send_rtt(server, session_tx, &pathset->paths[0], now);
 			tx_state->handshake_rtt = now - parsed_pkt->timestamp;
 			for (u32 p = 0; p < pathset->n_paths; p++) {
 				if (p != parsed_pkt->path_index && pathset->paths[p].enabled) {
@@ -2345,7 +2355,6 @@ static void tx_handle_hs_confirm(struct hercules_server *server,
 					pathset->paths[p].cc_state->rtt = DBL_MAX;
 				}
 			}
-			tx_send_rtt(server, session_tx, &pathset->paths[0], now);
 		}
 		count_received_pkt(session_tx, pkt_path_idx);
 		return;
@@ -2810,13 +2819,13 @@ static void rx_trickle_nacks(void *arg) {
 						  is_index_transfer);
 			u64 ack_round_end = get_nsecs();
 			if (ack_round_end >
-				ack_round_start + rx_state->handshake_rtt * 1000 / 4) {
+				ack_round_start + rx_state->handshake_rtt / 4) {
 				/* fprintf(stderr, "NACK send too slow (took %lld of %ld)\n", */
 				/* 		ack_round_end - ack_round_start, */
-				/* 		rx_state->handshake_rtt * 1000 / 4); */
+				/* 		rx_state->handshake_rtt / 4); */
 			} else {
 				rx_state->next_nack_round_start =
-					ack_round_start + rx_state->handshake_rtt * 1000 / 4;
+					ack_round_start + rx_state->handshake_rtt / 4;
 			}
 			rx_state->ack_nr++;
 		}
@@ -3480,6 +3489,7 @@ static void events_p(void *arg) {
 			struct hercules_app_addr pkt_source = {.port = udphdr->uh_sport,
 												   .ip = scionaddrhdr->src_ip,
 												   .ia = scionaddrhdr->src_ia};
+			u64 pkt_received_at = get_nsecs();
 
 			const size_t rbudp_len = len - (rbudp_pkt - buf);
 			if (rbudp_len < sizeof(u32)) {
@@ -3535,7 +3545,7 @@ static void events_p(void *arg) {
 								"Handling initial packet for existing session");
 							count_received_pkt(session_rx, h->path);
 							rx_handle_initial(server, session_rx->rx_state,
-											  parsed_pkt, buf,
+											  parsed_pkt, pkt_received_at, buf,
 											  rbudp_pkt + rbudp_headerlen, len);
 						} else {
 							debug_printf(
@@ -3551,7 +3561,8 @@ static void events_p(void *arg) {
 						// attempt to start a new one, go ahead and start a
 						// new rx session
 						rx_accept_new_session(server, parsed_pkt, &pkt_source,
-											  buf, pl, len, rx_slot);
+											  pkt_received_at, buf, pl, len,
+											  rx_slot);
 					}
 					break;
 
@@ -3632,6 +3643,7 @@ static void events_p(void *arg) {
 							pathset->paths[h->path].nack_errs++;
 							if (pathset->paths[h->path].nack_errs >
 								NACK_ERRS_ALLOWED) {
+								debug_printf("Nack track errs exceeded, resending handshake");
 								pathset->paths[h->path].next_handshake_at = now;
 								pathset->paths[h->path].nack_errs = 0;
 							}
@@ -3640,11 +3652,14 @@ static void events_p(void *arg) {
 					break;
 
 				case CONTROL_PACKET_TYPE_RTT:;
+					debug_printf("RTT received");
 					if (session_rx &&
 						src_matches_address(session_rx, &pkt_source)) {
 						struct receiver_state *rx_state = session_rx->rx_state;
 						rx_state->handshake_rtt =
-							get_nsecs() - rx_state->sent_initial_at;
+							pkt_received_at - rx_state->sent_initial_at;
+						// XXX Could simply include the RTT value for the
+						// receiver in this packet, instead of computing it
 						debug_printf("Updating RTT to %fs",
 									 rx_state->handshake_rtt / 1e9);
 					}
