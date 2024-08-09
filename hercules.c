@@ -61,6 +61,7 @@
 #define RANDOMIZE_FLOWID
 
 /* #define PCC_BENCH */
+#define PCC_BENCH_SEC 30
 
 #define RATE_LIMIT_CHECK 1000 // check rate limit every X packets
 // Maximum burst above target pps allowed
@@ -74,9 +75,9 @@
 static const int rbudp_headerlen = sizeof(struct hercules_header);
 static const u64 session_timeout = 10e9;				// 10 sec
 static const u64 session_hs_retransmit_interval = 2e9;	// 2 sec
-static const u64 session_stale_timeout = 30e9;			// 30 sec
+static const u64 session_stale_timeout = 50e9;			// 30 sec
 static const u64 print_stats_interval = 1e9;			// 1 sec
-static const u64 path_update_interval = 60e9 * 2;		// 2 minutes
+static const u64 path_update_interval = 60e9 * 5;		// 5 minutes
 static const u64 monitor_update_interval = 30e9;		// 30 seconds
 #define PCC_NO_PATH \
 	UINT8_MAX  // tell the receiver not to count the packet on any path
@@ -180,10 +181,7 @@ static void send_eth_frame(struct hercules_server *server,
 }
 
 static inline bool session_state_is_running(enum session_state s) {
-	if (s == SESSION_STATE_RUNNING_IDX || s == SESSION_STATE_RUNNING_DATA) {
-		return true;
-	}
-	return false;
+	return (s == SESSION_STATE_RUNNING_IDX || s == SESSION_STATE_RUNNING_DATA);
 }
 
 static inline void count_received_pkt(struct hercules_session *session,
@@ -310,6 +308,7 @@ static struct hercules_session *make_session(
 	s->state = SESSION_STATE_NONE;
 	s->error = SESSION_ERROR_NONE;
 	s->payloadlen = payloadlen;
+	debug_printf("Using payloadlen %u", payloadlen);
 	s->jobid = job_id;
 	s->peer = *peer_addr;
 	s->last_pkt_sent = 0;
@@ -396,12 +395,19 @@ struct hercules_server *hercules_init_server(struct hercules_config config,
 		exit_with_error(NULL, ENOMEM);
 	}
 
-	server->usock =
-		monitor_bind_daemon_socket(config.server_socket, config.monitor_socket);
-	if (server->usock == 0) {
-		fprintf(stderr,
-				"Error binding daemon socket. Is the monitor running?\n");
-		exit_with_error(NULL, EINVAL);
+	for (int i = 0; i < 5; i++) {
+		server->usock = monitor_bind_daemon_socket(config.server_socket,
+												   config.monitor_socket);
+		if (server->usock == 0) {
+			fprintf(stderr,
+					"Error binding daemon socket. Is the monitor running?\n");
+			if (i == 4) {
+				exit_with_error(NULL, EINVAL);
+			}
+			sleep(1);
+		} else {
+			break;
+		}
 	}
 
 	server->config = config;
@@ -1073,6 +1079,10 @@ static void rx_receive_batch(struct hercules_server *server,
 		u32 len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->len;
 		const char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 		const char *rbudp_pkt = parse_pkt_fast_path(pkt, len, true, UINT32_MAX);
+		if (!rbudp_pkt) {
+			debug_printf("Unparseable packet on XDP socket, ignoring");
+			continue;
+		}
 		u16 pkt_dst_port = ntohs(*(u16 *)(rbudp_pkt - 6));
 
 		struct hercules_session *session_rx =
@@ -1115,8 +1125,6 @@ static void rx_receive_batch(struct hercules_server *server,
 									   len - (rbudp_pkt - pkt))) {
 				debug_printf("Non-data packet on XDP socket? Ignoring.");
 			}
-		} else {
-			debug_printf("Unparseable packet on XDP socket, ignoring");
 		}
 		atomic_fetch_add(&session_rx->rx_npkts, 1);
 	}
@@ -1261,7 +1269,7 @@ static struct receiver_state *make_rx_state(
 		(rx_state->index_size + rx_state->chunklen - 1) / rx_state->chunklen;
 	bitset__create(&rx_state->received_chunks, rx_state->total_chunks);
 	bitset__create(&rx_state->received_chunks_index, rx_state->index_chunks);
-	rx_state->start_time = 0;
+	rx_state->start_time = get_nsecs();
 	rx_state->end_time = 0;
 	rx_state->handshake_rtt = 0;
 	rx_state->is_pcc_benchmark = false;
@@ -2454,8 +2462,13 @@ static char *tx_mmap(char *fname, char *dstname, size_t *filesize,
 	debug_printf("real filesize %llu", real_filesize);
 	debug_printf("total entry size %llu", index_size);
 
-	char *mem =
-		mmap(NULL, total_filesize, PROT_NONE, MAP_PRIVATE | MAP_ANON, 0, 0);
+	char *mem = mmap(NULL, total_filesize, PROT_NONE,
+					 MAP_PRIVATE | MAP_ANON
+	#ifdef PCC_BENCH
+						 | MAP_POPULATE
+	#endif
+					 ,
+					 0, 0);
 	if (mem == MAP_FAILED) {
 		free(index);
 		return NULL;
@@ -2725,9 +2738,11 @@ static void tx_send_p(void *arg) {
 	struct worker_args *args = arg;
 	struct hercules_server *server = args->server;
 	int cur_session = 0;
+	int batch = 0;
 	while (!wants_shutdown) {
 		cur_session = ( cur_session + 1 ) % HERCULES_CONCURRENT_SESSIONS;
 		struct hercules_session *session_tx = server->sessions_tx[cur_session];
+		// XXX may need another kick_tx here?
 		if (session_tx == NULL ||
 			!session_state_is_running(session_tx->state)) {
 			continue;
@@ -2736,7 +2751,9 @@ static void tx_send_p(void *arg) {
 		struct send_queue_unit unit;
 		int ret = send_queue_pop(session_tx->send_queue, &unit);
 		if (!ret) {
-			kick_tx_server(server);
+			for (int i = 0; i < server->num_ifaces; i++){
+				kick_tx(server, args->xsks[i]);
+			}
 			continue;
 		}
 		// The unit may contain fewer than the max number of chunks. We only
@@ -2762,7 +2779,12 @@ static void tx_send_p(void *arg) {
 								  frame_addrs, &unit, args->id,
 								  is_index_transfer);
 		atomic_fetch_add(&session_tx->tx_npkts, num_chunks_in_unit);
-		kick_tx_server(server);
+		if (++batch > 5){
+		for (int i = 0; i < server->num_ifaces; i++){
+			kick_tx(server, args->xsks[i]);
+		}
+		batch = 0;
+		}
 	}
 }
 
@@ -2789,6 +2811,7 @@ static void rx_trickle_acks(void *arg) {
 					session_rx->state = SESSION_STATE_INDEX_READY;
 				} else {
 					debug_printf("Received all, done.");
+					debug_printf("Time elapsed %.2f sec", (get_nsecs() - rx_state->start_time) / 1.e9);
 					rx_send_acks(server, rx_state, is_index_transfer);
 					quit_session(session_rx, SESSION_ERROR_OK);
 				}
@@ -3132,6 +3155,12 @@ static void mark_timed_out_sessions(struct hercules_server *server, int s,
 			quit_session(session_tx, SESSION_ERROR_TIMEOUT);
 			fprintf(stderr, "Session (TX %2d) timed out!\n", s);
 		}
+#ifdef PCC_BENCH
+		if (session_tx->tx_state->start_time != 0 &&
+			now > session_tx->tx_state->start_time + PCC_BENCH_SEC * 1e9) {
+			quit_session(session_tx, SESSION_ERROR_OK);
+		}
+#endif
 	}
 	struct hercules_session *session_rx = server->sessions_rx[s];
 	if (session_rx && session_rx->state != SESSION_STATE_DONE) {
@@ -3143,6 +3172,12 @@ static void mark_timed_out_sessions(struct hercules_server *server, int s,
 			quit_session(session_rx, SESSION_ERROR_STALE);
 			fprintf(stderr, "Session (RX %2d) stale!\n", s);
 		}
+#ifdef PCC_BENCH
+		if (session_rx->rx_state->start_time != 0 &&
+			now > session_rx->rx_state->start_time + PCC_BENCH_SEC * 1e9) {
+			quit_session(session_rx, SESSION_ERROR_OK);
+		}
+#endif
 	}
 }
 
@@ -3260,9 +3295,10 @@ static void tx_update_paths(struct hercules_server *server, int s, u64 now) {
 }
 
 struct print_info {
-	u32 rx_received;
-	u32 tx_sent;
 	u64 ts;
+	u32 rx_received;
+	u32 rx_chunks;
+	u32 tx_sent;
 };
 
 static void print_session_stats(struct hercules_server *server, u64 now,
@@ -3279,6 +3315,7 @@ static void print_session_stats(struct hercules_server *server, u64 now,
 			u32 acked_count = session_tx->tx_state->acked_chunks.num_set;
 			u32 total = session_tx->tx_state->acked_chunks.num;
 			u64 tdiff = now - p->ts;
+			u64 elapsed = (now - session_tx->tx_state->start_time) / 1e9;
 			p->ts = now;
 			double send_rate_pps =
 				(sent_now - p->tx_sent) / ((double)tdiff / 1e9);
@@ -3289,10 +3326,10 @@ static void print_session_stats(struct hercules_server *server, u64 now,
 			send_rate_total += send_rate;
 			fprintf(
 				stdout,
-				"(TX %2d) [%4.1f%%] Chunks: %9u/%9u, rx: %9ld, tx:%9ld, rate "
+				"(TX %2d) [%4.1f%%] %5llus Chunks: %9u/%9u, rx: %9ld, tx:%9ld, rate "
 				"%8.2f "
 				"Mbps\n",
-				s, progress_percent, acked_count, total, session_tx->rx_npkts,
+				s, progress_percent, elapsed, acked_count, total, session_tx->rx_npkts,
 				session_tx->tx_npkts, send_rate);
 		}
 
@@ -3304,26 +3341,38 @@ static void print_session_stats(struct hercules_server *server, u64 now,
 			u32 total = session_rx->rx_state->received_chunks.num;
 			u32 rcvd_now = session_rx->rx_npkts;
 			u64 tdiff = now - p->ts;
+			u64 elapsed = (now - session_rx->rx_state->start_time) / 1e9;
 			p->ts = now;
 			double recv_rate_pps =
 				(rcvd_now - p->rx_received) / ((double)tdiff / 1e9);
+			double goodput_pps = (rec_count - p->rx_chunks) / ((double) tdiff / 1e9);
 			p->rx_received = rcvd_now;
+			p->rx_chunks = rec_count;
 			double recv_rate =
 				8 * recv_rate_pps * session_rx->rx_state->chunklen / 1e6;
+			double goodput_rate =
+				8 * goodput_pps * session_rx->rx_state->chunklen / 1e6;
 			recv_rate_total += recv_rate;
 			double progress_percent = rec_count / (double)total * 100;
 			fprintf(stdout,
-					"(RX %2d) [%4.1f%%] Chunks: %9u/%9u, rx: %9ld, tx:%9ld, "
-					"rate %8.2f "
+					"(RX %2d) [%4.1f%%] %5llus Chunks: %9u/%9u, rx: %9ld, tx:%9ld, "
+					"rate %8.2f (%8.2f)"
 					"Mbps\n",
-					s, progress_percent, rec_count, total, session_rx->rx_npkts,
-					session_rx->tx_npkts, recv_rate);
+					s, progress_percent, elapsed, rec_count, total, session_rx->rx_npkts,
+					session_rx->tx_npkts, recv_rate, goodput_rate);
+			fprintf(stdout, "(RX %2d) 1: %u | 2: %u | 3: %u | 4: %u\n",
+					s,
+					session_rx->rx_state->path_state[0].rx_npkts,
+					session_rx->rx_state->path_state[1].rx_npkts,
+					session_rx->rx_state->path_state[2].rx_npkts,
+					session_rx->rx_state->path_state[3].rx_npkts);
 		}
 	}
 	if (active_session) {
 		fprintf(stdout, "TX Total Rate: %.2f Mbps\n", send_rate_total);
 		fprintf(stdout, "RX Total Rate: %.2f Mbps\n", recv_rate_total);
 		fprintf(stdout, "\n");
+		fflush(stdout);
 	}
 }
 
@@ -3383,7 +3432,7 @@ static void stop_finished_sessions(struct hercules_server *server, int slot,
 	struct hercules_session *session_rx = server->sessions_rx[slot];
 	if (session_rx != NULL && session_rx->state != SESSION_STATE_DONE &&
 		session_rx->error != SESSION_ERROR_NONE) {
-		fprintf(stderr, "Stopping RX %d\n", slot);
+		fprintf(stderr, "Stopping RX %d. Time elapsed: %.2fs\n", slot, (now - session_rx->rx_state->start_time)/1e9);
 		session_rx->state = SESSION_STATE_DONE;
 		int ret =
 			msync(session_rx->rx_state->mem, session_rx->rx_state->filesize,
@@ -3439,6 +3488,7 @@ static void events_p(void *arg) {
 			ssize_t len =
 				recvfrom(server->control_sockfd, buf, sizeof(buf), MSG_DONTWAIT,
 						 (struct sockaddr *)&addr, &addr_size);
+			u64 pkt_received_at = get_nsecs();
 			if (len == -1) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
 					continue;
@@ -3489,7 +3539,6 @@ static void events_p(void *arg) {
 			struct hercules_app_addr pkt_source = {.port = udphdr->uh_sport,
 												   .ip = scionaddrhdr->src_ip,
 												   .ia = scionaddrhdr->src_ia};
-			u64 pkt_received_at = get_nsecs();
 
 			const size_t rbudp_len = len - (rbudp_pkt - buf);
 			if (rbudp_len < sizeof(u32)) {

@@ -2,14 +2,15 @@ TARGET_SERVER := hercules-server
 TARGET_MONITOR := hercules-monitor
 
 CC := gcc
-CFLAGS = -O3 -flto -std=gnu11 -D_GNU_SOURCE -Itomlc99
+CFLAGS = -O3 -g3 -std=gnu11 -D_GNU_SOURCE -Itomlc99
+# CFLAGS += -DNDEBUG
 # CFLAGS += -Wall -Wextra
 
 ## Options:
 # Print rx/tx session stats
 CFLAGS += -DPRINT_STATS
 # Enforce checking the source SCION/UDP address/port of received packets
-CFLAGS += -DCHECK_SRC_ADDRESS
+# CFLAGS += -DCHECK_SRC_ADDRESS
 # Randomise the UDP underlay port (no restriction on the range of used ports).
 # Enabling this currently breaks SCMP packet parsing
 # CFLAGS += -DRANDOMIZE_UNDERLAY_SRC
@@ -21,7 +22,7 @@ CFLAGS += -DCHECK_SRC_ADDRESS
 # CFLAGS += -DDEBUG_PRINT_PKTS # print received/sent packets (lots of noise!)
 
 
-LDFLAGS = -flto -l:libbpf.a -Lbpf/src -Ltomlc99 -lm -lelf -latomic -pthread -lz -ltoml -z noexecstack $(ASAN_FLAG)
+LDFLAGS = -g3 -l:libbpf.a -Lbpf/src -Ltomlc99 -lm -lelf -latomic -pthread -lz -ltoml -z noexecstack $(ASAN_FLAG)
 DEPFLAGS := -MP -MD
 
 SRCS := $(wildcard *.c)

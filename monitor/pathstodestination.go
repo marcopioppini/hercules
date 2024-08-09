@@ -105,6 +105,9 @@ func (ptd *PathsToDestination) choosePaths() bool {
 		// No payloadlen set yet, we set it to the maximum that all selected paths and interfaces support
 		maxPayloadlen := HerculesMaxPktsize
 		for _, path := range ptd.paths {
+			if !path.enabled {
+				continue;
+			}
 			pathMTU := int(path.path.Metadata().MTU)
 			underlayHeaderLen, scionHeaderLen := getPathHeaderlen(path.path)
 			if pathMTU == 0 {
@@ -121,7 +124,7 @@ func (ptd *PathsToDestination) choosePaths() bool {
 			if maxPayloadlen+scionHeaderLen+underlayHeaderLen-14 > path.iface.MTU {
 				// Packet exceeds the interface MTU
 				// 14 is the size of the ethernet header, which is not included in the interface's MTU
-				fmt.Printf("Interface (%v) MTU too low, decreasing payload length", path.iface.Name)
+				fmt.Printf("Interface (%v) MTU too low, decreasing payload length\n", path.iface.Name)
 				maxPayloadlen = path.iface.MTU - underlayHeaderLen - scionHeaderLen
 			}
 		}
