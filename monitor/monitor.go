@@ -286,7 +286,7 @@ func main() {
 				buf = buf[8:]
 				bytes_acked := binary.LittleEndian.Uint64(buf[:8])
 				buf = buf[8:]
-				fmt.Println("updating job", job_id, status, errorcode)
+				fmt.Println("updating job", job_id, status, errorcode, bytes_acked)
 				transfersLock.Lock()
 				job, ok := transfers[int(job_id)]
 				if !ok {

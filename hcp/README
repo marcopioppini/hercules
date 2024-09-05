@@ -1,0 +1,16 @@
+hcp: CLI Client for the Hercules Server
+=================================================
+
+This tool is intended to simplify interaction with the Hercules server via its API.
+
+Usage: `hcp [OPTIONS]... SRC-API SRC-PATH DST-ADDR DST-PATH`
+
+For example, if you're running this tool on the same machine as the source Hercules server
+and want to transfer the file `hercules.in` to `hercules.out`, with the destination
+Hercules server listening on `64-2:0:9,192.168.4.2:10000`, run the following command:
+
+`hcp localhost:8000 hercules.in 64-2:0:9,192.168.4.2:10000 hercules.out`
+
+Building
+==========
+`go build`

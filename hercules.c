@@ -78,7 +78,7 @@ static const u64 session_hs_retransmit_interval = 2e9;	// 2 sec
 static const u64 session_stale_timeout = 50e9;			// 30 sec
 static const u64 print_stats_interval = 1e9;			// 1 sec
 static const u64 path_update_interval = 60e9 * 5;		// 5 minutes
-static const u64 monitor_update_interval = 30e9;		// 30 seconds
+static const u64 monitor_update_interval = 5e9;		// 5 seconds
 #define PCC_NO_PATH \
 	UINT8_MAX  // tell the receiver not to count the packet on any path
 _Atomic bool wants_shutdown = false;
@@ -3386,8 +3386,8 @@ static void tx_update_monitor(struct hercules_server *server, int s, u64 now) {
 		bool ret = monitor_update_job(
 			server->usock, session_tx->jobid, session_tx->state, 0,
 			(now - session_tx->tx_state->start_time) / (int)1e9,
-			session_tx->tx_state->chunklen *
-				session_tx->tx_state->acked_chunks.num_set);
+			(u64) session_tx->tx_state->chunklen *
+				(u64) session_tx->tx_state->acked_chunks.num_set);
 		if (!ret) {
 			quit_session(session_tx, SESSION_ERROR_CANCELLED);
 		}
