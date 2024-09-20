@@ -32,6 +32,7 @@ There is a restriction on path selection: All paths must be large enough to fit 
 ## Getting started
 
 ### Building
+First, run `git submodule update --init`.
 Running `make` should build both the monitor and server. This uses the provided dockerfile.
 
 ### Running

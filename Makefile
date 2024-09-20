@@ -49,14 +49,13 @@ $(TARGET_MONITOR): $(MONITORFILES) $(wildcard *.h) builder
 
 $(TARGET_SERVER): $(OBJS) bpf_prgm/redirect_userspace.o bpf/src/libbpf.a tomlc99/libtoml.a builder
 	@# update modification dates in assembly, so that the new version gets loaded
-	@sed -i -e "s/\(load bpf_prgm_pass\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/pass.c | head -c 32)/g" bpf_prgms.s
 	@sed -i -e "s/\(load bpf_prgm_redirect_userspace\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/redirect_userspace.c | head -c 32)/g" bpf_prgms.s
 	docker exec hercules-builder $(CC) -o $@ $(OBJS) bpf_prgms.s $(LDFLAGS)
 
 %.o: %.c builder
 	docker exec hercules-builder $(CC) $(DEPFLAGS) $(CFLAGS) -c $< -o $@
 
-hercules: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.o bpf_prgm/pass.o bpf/src/libbpf.a
+hercules: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.o bpf/src/libbpf.a
 	docker exec hercules-builder go build -ldflags "-X main.startupVersion=$${startupVersion}"
 
 bpf_prgm/%.ll: bpf_prgm/%.c
