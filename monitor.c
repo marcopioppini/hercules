@@ -15,7 +15,7 @@ static int msgno = 0;
 
 static bool monitor_send_recv(int sockfd, struct hercules_sockmsg_Q *in,
 							  struct hercules_sockmsg_A *out) {
-	for (int i = 0; i < 3; i++) {  // 3 Retries, see comment in monitor.go
+	for (int i = 0; i < 1; i++) {  // 3 Retries, see comment in monitor.go
 		in->msgno = msgno++;
 		int ret = send(sockfd, in, sizeof(*in), 0);
 		if (ret != sizeof(*in)) {
@@ -25,6 +25,7 @@ static bool monitor_send_recv(int sockfd, struct hercules_sockmsg_Q *in,
 		ret = recv(sockfd, out, sizeof(*out), 0);
 		if (ret <= 0) {
 			fprintf(stderr, "Error reading from monitor?\n");
+			fprintf(stderr, "Error was %s", strerror(errno));
 			continue;
 		}
 		assert(out->msgno == in->msgno && "Monitor replied with wrong msgno?!");
@@ -192,10 +193,10 @@ int monitor_bind_daemon_socket(char *server, char *monitor) {
 	if (ret) {
 		return 0;
 	}
-	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
-	ret = setsockopt(usock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
-	if (ret) {
-		return 0;
-	}
+	/* struct timeval to = {.tv_sec = 1, .tv_usec = 0}; */
+	/* ret = setsockopt(usock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to)); */
+	/* if (ret) { */
+	/* 	return 0; */
+	/* } */
 	return usock;
 }
