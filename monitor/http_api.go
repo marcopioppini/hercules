@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"syscall"
 
@@ -233,7 +234,27 @@ func http_stat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	io.WriteString(w, fmt.Sprintf("OK 1 %d\n", info.Size()))
+	totalSize := info.Size()
+	if info.Mode().IsDir() {
+		dirSize := 0
+		walker := func(_ string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.Mode().IsRegular() {
+				dirSize += int(info.Size())
+			}
+			return nil
+		}
+		err := filepath.Walk(file, walker)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		totalSize = int64(dirSize)
+	}
+
+	io.WriteString(w, fmt.Sprintf("OK 1 %d\n", totalSize))
 }
 
 // Return the server's SCION address (needed for gfal)
