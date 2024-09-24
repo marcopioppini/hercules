@@ -20,6 +20,9 @@ MonitorHTTP = ":8000"
 # Set to "disabled" to disable
 MonitorHTTPS = "disabled"
 
+# Drop privileges to the specified user after startup
+DropUser = "_hercules"
+
 # Path to the server's certificate and key for TLS
 TLSCert = "cert.pem"
 TLSKey = "key.pem"

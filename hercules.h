@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "bpf/src/xsk.h"
 #include "congestion_control.h"
@@ -223,6 +224,8 @@ struct hercules_interface {
 struct hercules_config {
 	char *monitor_socket;
 	char *server_socket;
+	uid_t drop_uid;
+	gid_t drop_gid;
 	u32 xdp_flags;
 	int xdp_mode;
 	int queue;

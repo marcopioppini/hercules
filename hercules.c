@@ -31,6 +31,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <pwd.h>
 #include <fts.h>
 #include <unistd.h>
 #include <float.h>
@@ -3753,6 +3754,17 @@ void hercules_main(struct hercules_server *server) {
 	  exit(1);
   }
 
+  // Drop privileges
+  ret = setgid(server->config.drop_gid);
+  if (ret != 0) {
+    fprintf(stderr, "Error in setgid\n");
+    exit(1);
+  }
+  ret = setuid(server->config.drop_uid);
+  if (ret != 0) {
+    fprintf(stderr, "Error in setuid\n");
+    exit(1);
+  }
   // Start the NACK sender thread
   debug_printf("starting NACK trickle thread");
   pthread_t trickle_nacks = start_thread(NULL, rx_trickle_nacks, server);
@@ -3814,6 +3826,8 @@ int main(int argc, char *argv[]) {
 	// Set defaults
 	config.monitor_socket = HERCULES_DEFAULT_MONITOR_SOCKET;
 	config.server_socket = HERCULES_DEFAULT_DAEMON_SOCKET;
+	config.drop_uid = 0;
+	config.drop_gid = 0;
 	config.queue = 0;
 	config.configure_queues = true;
 	config.enable_pcc = true;
@@ -3876,6 +3890,22 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
+	// User/group to drop privileges
+	toml_datum_t drop_user = toml_string_in(conf, "DropUser");
+	if (drop_user.ok) {
+		struct passwd *user = getpwnam(drop_user.u.s);
+		if (!user){
+			fprintf(stderr, "Error looking up user\n");
+			exit(1);
+		}
+		config.drop_uid = user->pw_uid;
+		config.drop_gid = user->pw_gid;
+	} else {
+		if (toml_key_exists(conf, "DropUser")) {
+			fprintf(stderr, "Error parsing DropUser\n");
+			exit(1);
+		}
+	}
 	// Listening address
 	toml_datum_t listen_addr = toml_string_in(conf, "ListenAddress");
 	if (!listen_addr.ok) {
