@@ -14,6 +14,8 @@ CFLAGS += -DPRINT_STATS
 # Randomise the UDP underlay port (no restriction on the range of used ports).
 # Enabling this currently breaks SCMP packet parsing
 # CFLAGS += -DRANDOMIZE_UNDERLAY_SRC
+# Ignore SCMP error messages, just keep sending
+# CFLAGS += -DIGNORE_SCMP
 
 ## for debugging:
 # ASAN_FLAG := -fsanitize=address

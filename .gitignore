@@ -3,5 +3,6 @@ bpf_prgm/*.o
 hercules-server
 hercules-monitor
 *.o
+*.d
 monitor/monitor
 mockules/mockules

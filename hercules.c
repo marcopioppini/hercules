@@ -556,7 +556,7 @@ static const char *parse_pkt_fast_path(const char *pkt, size_t length, bool chec
 // Returns the offending path's id, or PCC_NO_PATH on failure.
 // XXX Not checking dst or source ia/addr/port in reflected packet
 static u8 parse_scmp_packet(const struct scmp_message *scmp, size_t length,
-							u16 *offending_dst_port) {
+							u16 *offending_src_port) {
 	size_t offset = 0;
 	const char *pkt = NULL;
 	debug_printf("SCMP type %d", scmp->type);
@@ -637,13 +637,13 @@ static u8 parse_scmp_packet(const struct scmp_message *scmp, size_t length,
 		return PCC_NO_PATH;
 	}
 
-	const struct udphdr *l4udph = (const struct udphdr *)(pkt + offset);
+	const struct udphdr *l4udph = (const struct udphdr *)((char *)scmp + offset);
 
 	offset += sizeof(struct udphdr);
 	const struct hercules_header *rbudp_hdr =
-		(const struct hercules_header *)(pkt + offset);
-	if (offending_dst_port) {
-		*offending_dst_port = ntohs(l4udph->uh_dport);
+		(const struct hercules_header *)((char *)scmp + offset);
+	if (offending_src_port) {
+		*offending_src_port = ntohs(l4udph->uh_sport);
 	}
 	return rbudp_hdr->path;
 }
@@ -735,20 +735,24 @@ static const char *parse_pkt(const struct hercules_server *server,
 		next_header = *((__u8 *)pkt + next_offset);
 		next_offset += (*((__u8 *)pkt + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
 	}
-	if(next_header != IPPROTO_UDP) {
-		if (next_header == L4_SCMP) {
-			if (next_offset + sizeof(struct scmp_message) > length) {
-				debug_printf("SCMP, too short?");
-				return NULL;
-			}
-			const struct scmp_message *scmp_msg =
-				(const struct scmp_message *)(pkt + next_offset);
-			*scmp_offending_path_o =
-				parse_scmp_packet(scmp_msg, length - next_offset, scmp_offending_dst_port_o);
-		} else {
-			debug_printf("unknown SCION L4: %u", next_header);
+	if (next_header != IPPROTO_UDP) {
+	  if (next_header == L4_SCMP) {
+		if (next_offset + sizeof(struct scmp_message) > length) {
+		  debug_printf("SCMP, too short?");
+		  return NULL;
 		}
-		return NULL;
+#ifndef IGNORE_SCMP
+		const struct scmp_message *scmp_msg =
+			(const struct scmp_message *)(pkt + next_offset);
+		*scmp_offending_path_o = parse_scmp_packet(scmp_msg, length - next_offset,
+												   scmp_offending_dst_port_o);
+#else
+		debug_printf("Received SCMP error, ignoring");
+#endif
+	  } else {
+		debug_printf("unknown SCION L4: %u", next_header);
+	  }
+	  return NULL;
 	}
 	const struct scionaddrhdr_ipv4 *scionaddrh = (const struct scionaddrhdr_ipv4 *)(pkt + offset +
 	                                                                                sizeof(struct scionhdr));
@@ -3510,6 +3514,7 @@ static void events_p(void *arg) {
 				parse_pkt(server, buf, len, true, &scionaddrhdr, &udphdr,
 						  &scmp_bad_path, &scmp_bad_port);
 			if (rbudp_pkt == NULL) {
+				// SCMP messages are ignored for sessions running without PCC
 				if (scmp_bad_path != PCC_NO_PATH) {
 					debug_printf(
 						"Received SCMP error on path %d, dst port %u, "
@@ -3522,6 +3527,9 @@ static void events_p(void *arg) {
 					// update paths and on the exact SCMP error. Also, should
 					// "destination unreachable" be treated as a permanent
 					// failure and the session abandoned immediately?
+					// XXX Nothing happens if we receive an SCMP error for a
+					// session where we're the receiver, i.e the SCMP error is
+					// a response to an ACK/NACK we sent
 					struct hercules_session *session_tx =
 						lookup_session_tx(server, scmp_bad_port);
 					if (session_tx != NULL &&
