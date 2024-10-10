@@ -23,9 +23,10 @@ import (
 )
 
 type Destination struct {
-	hostAddr *snet.UDPAddr
-	pathSpec *[]PathSpec
-	numPaths int
+	hostAddr   *snet.UDPAddr
+	pathSpec   *[]PathSpec
+	numPaths   int
+	payloadlen int
 }
 
 type PathManager struct {

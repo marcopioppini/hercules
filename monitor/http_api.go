@@ -87,6 +87,12 @@ func http_submit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	destination := findPathRule(&pathRules, destParsed)
+
+	// If the config specifies a payload length, use that value
+	if destination.payloadlen != 0 {
+		payloadlen = destination.payloadlen
+	}
+
 	pm, err := initNewPathManager(activeInterfaces, &destination, listenAddress, payloadlen)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)

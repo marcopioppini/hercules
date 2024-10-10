@@ -79,10 +79,13 @@ PathSpec = [
 ]
 
 # In this case the number of paths is set to 2, but the exact set of paths
-# is left unspecified
+# is left unspecified.
+# We additionally override automatic MTU selection based on SCION path metadata
+# and use a payload length of 1000B for all transfers to this host.
 [[DestinationHosts]]
 HostAddr = "18-a:b:c,2.2.2.2"
 NumPaths = 2
+Payloadlen = 1000
 
 
 # Similarly, but for an entire destination AS instead of a specific host

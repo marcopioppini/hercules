@@ -14,14 +14,16 @@ import (
 
 // These specify how to read the config file
 type HostConfig struct {
-	HostAddr addr.Addr
-	NumPaths int
-	PathSpec []PathSpec
+	HostAddr   addr.Addr
+	NumPaths   int
+	PathSpec   []PathSpec
+	Payloadlen int
 }
 type ASConfig struct {
-	IA       addr.IA
-	NumPaths int
-	PathSpec []PathSpec
+	IA         addr.IA
+	NumPaths   int
+	PathSpec   []PathSpec
+	Payloadlen int
 }
 
 // This wraps snet.UDPAddr to make the config parsing work
@@ -67,7 +69,7 @@ type MonitorConfig struct {
 	ClientCACerts    []string
 	// The following are not used by the monitor, they are listed here for completeness
 	ServerSocket    string
-	DropUser		string
+	DropUser        string
 	XDPZeroCopy     bool
 	Queue           int
 	ConfigureQueues bool
@@ -90,17 +92,19 @@ func findPathRule(p *PathRules, dest *snet.UDPAddr) Destination {
 	confHost, ok := p.Hosts[a]
 	if ok {
 		return Destination{
-			hostAddr: dest,
-			pathSpec: &confHost.PathSpec,
-			numPaths: confHost.NumPaths,
+			hostAddr:   dest,
+			pathSpec:   &confHost.PathSpec,
+			numPaths:   confHost.NumPaths,
+			payloadlen: confHost.Payloadlen,
 		}
 	}
 	conf, ok := p.ASes[dest.IA]
 	if ok {
 		return Destination{
-			hostAddr: dest,
-			pathSpec: &conf.PathSpec,
-			numPaths: conf.NumPaths,
+			hostAddr:   dest,
+			pathSpec:   &conf.PathSpec,
+			numPaths:   conf.NumPaths,
+			payloadlen: conf.Payloadlen,
 		}
 	}
 	return Destination{
@@ -112,6 +116,7 @@ func findPathRule(p *PathRules, dest *snet.UDPAddr) Destination {
 
 const defaultMonitorHTTP = ":8000"
 const defaultMonitorHTTPS = "disabled"
+
 // Disabled by default because further config (certs) is needed
 
 // Decode the config file and fill in any unspecified values with defaults.
@@ -208,9 +213,10 @@ func readConfig(configFile string) (MonitorConfig, PathRules) {
 			pathspec = host.PathSpec
 		}
 		pathRules.Hosts[host.HostAddr] = HostConfig{
-			HostAddr: host.HostAddr,
-			NumPaths: numpaths,
-			PathSpec: pathspec,
+			HostAddr:   host.HostAddr,
+			NumPaths:   numpaths,
+			PathSpec:   pathspec,
+			Payloadlen: host.Payloadlen,
 		}
 	}
 
@@ -225,9 +231,10 @@ func readConfig(configFile string) (MonitorConfig, PathRules) {
 			pathspec = as.PathSpec
 		}
 		pathRules.ASes[as.IA] = ASConfig{
-			IA:       as.IA,
-			NumPaths: numpaths,
-			PathSpec: pathspec,
+			IA:         as.IA,
+			NumPaths:   numpaths,
+			PathSpec:   pathspec,
+			Payloadlen: as.Payloadlen,
 		}
 	}
 
