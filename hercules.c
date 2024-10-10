@@ -3361,12 +3361,12 @@ static void print_session_stats(struct hercules_server *server, u64 now,
 					"Mbps\n",
 					s, progress_percent, elapsed, rec_count, total, session_rx->rx_npkts,
 					session_rx->tx_npkts, recv_rate, goodput_rate);
-			fprintf(stdout, "(RX %2d) 1: %u | 2: %u | 3: %u | 4: %u\n",
-					s,
-					session_rx->rx_state->path_state[0].rx_npkts,
-					session_rx->rx_state->path_state[1].rx_npkts,
-					session_rx->rx_state->path_state[2].rx_npkts,
-					session_rx->rx_state->path_state[3].rx_npkts);
+			/* fprintf(stdout, "(RX %2d) 1: %u | 2: %u | 3: %u | 4: %u\n", */
+			/* 		s, */
+			/* 		session_rx->rx_state->path_state[0].rx_npkts, */
+			/* 		session_rx->rx_state->path_state[1].rx_npkts, */
+			/* 		session_rx->rx_state->path_state[2].rx_npkts, */
+			/* 		session_rx->rx_state->path_state[3].rx_npkts); */
 		}
 	}
 	if (active_session) {
