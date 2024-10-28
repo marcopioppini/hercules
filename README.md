@@ -1,285 +1,166 @@
-# Hercules-server
+# Hercules
+
+Hercules is a high-speed [SCION](scion-architecture.net)-native bulk data transfer application.
+
+Hercules achieves high transfer rates by combining the Linux kernel `AF_XDP` express data path and PCC congestion control with a custom data transfer protocol.
+Hercules can take advantage of SCION's native multipath capabilities to transfer data using multiple network paths simultaneously.
+
+The Hercules server is intended to run on dedicated machines.
+Clients submit transfer jobs to Hercules via a HTTP API. The server may handle multiple concurrent transfers in both the sending and receiving direction.
+Hercules supports transferring entire directories in one go.
+
+## Prerequisites
+
+To run Hercules, the machine on which you plan to install it must have a working SCION endhost stack.
+See [HERE](https://docs.scion.org/projects/scion-applications/en/latest/applications/access.html) for how to set that up.
+
+Hercules relies on `AF_XDP` and loads an XDP program on the interface it uses. Make sure you have no other programs that want to attach XDP programs to the same interface.
+
 ## Overview
-This version of Hercules consists of two components:
 
-- The monitor (Go) is responsible for handling SCION paths and exposes a HTTP API which clients can use to submit new transfers, check the status of ongoing transfers, or cancel them.
-- The server (C) carries out the actual file transfers.
+A Hercules server installation consists of two components, i.e.,
+two separate processes that communicate via a Unix socket.
 
-Unlike previously, these are two separate processes that communicate via a unix socket.
-They share a configuration file, the simplest version of which is in `hercules.conf`; see `sampleconf.toml` for all options.
+- The monitor (`hercules-monitor`) is responsible for handling SCION paths and
+  exposes a HTTP API which clients can use to submit new transfers, check the
+  status of ongoing transfers, or cancel them.
+- The server (`hercules-server`) carries out the actual file transfers.
 
-## Changes from regular Hercules
-The following should be the most important changes:
+The monitor and server processes must be started and stopped together, you
+should not restart one without also restarting the other.
+The provided systemd service files ensure this, if you use a different method
+to run Hercules you must ensure this yourself.
 
-- Split C and Go parts into dedicated processes, with a unix socket between them.
-- This is now a server, i.e. intended to run forever, not just a single-transfer application.
-- No command line arguments (except for, optionally, the config file path), all options set in config file.
-- The sender includes the destination file path for the receiver to use in the setup handshake.
-CAVEAT: No checks on that path at the moment, so any file on the destination can be overwritten.
-- Multiple concurrent transfers (both rx and tx) are supported (up to `HERCULES_CONCURRENT_SESSIONS`).
-- Only 1 destination per transfer, the idea is to submit the transfer once per destination if multiple are needed.
-- Transfer of entire directories is supported: If the source path is a directory, Hercules will try to recursively transfer the entire directory.
-- In order to inform the receiver of the directory structure, a directory index is transferred at the beginning.
-If this index is larger than the space available in the initial packet, a first phase of RBUDP is performed to transfer the index.
-- Automatic MTU selection: At the start of a transfer, Hercules will pick the MTU (and, consequently, chunk length) that is as large as possible while still fitting on its selected paths.
-This relies on the MTU in the path metadata, for the empty path the sending interface's MTU is used.
-This behaviour can be overridden by manually supplying the desired payload length.
-- The server will periodically update a transfer's paths by querying the monitor. The monitor will reply with the set of paths to use, which do not need to overlap with the previous set.
-There is a restriction on path selection: All paths must be large enough to fit the payload length fixed at the beginning of the transfer.
-- Implemented SCMP error handling: Upon receiving an error, the offending path will be disabled. It will be re-enabled if it is returned by the monitor in the next path update.
-- Check the SCION/UDP source address/port of received packets match the expected values (i.e. the host that started the transfer).
+Clients interact with Hercules via its HTTP API.
+You may use this API directly (see [the API docs](doc/api.md)), but the easiest way for users to transfer files is using the provided `hcp` command line tool.
+Integration with FTS/gfal2 is also possible via a plugin, see the [`gfal2-hercules`](./gfal2-hercules/) directory for more information.
 
 ## Getting started
 
-### Building
-First, run `git submodule update --init`.
-Running `make` should build both the monitor and server. This uses the provided dockerfile.
+The following should help you get started with Hercules.
 
-### Running
-On both the sender and the receiver:
+### Installing 
 
-- Fill in the provided `hercules.conf` with the host's SCION address and NIC
-- First, start the monitor: `./hercules-monitor`.
-- If there is already an XDP program loaded on the interface, you first have to remove it (e.g. `ip l set dev eth0 xdp off`)
-- Depending on your network card/setup, you may want to specify `ConfigureQueues = false` in the config file. If you get an error related to XDP upon starting the server, try this.
-Then, in a second shell, start the server: `./hercules-server`.
+To install Hercules, you may build it yourself from source
+(see ["Building from Source"](#building-from-source)) or use the provided packages.
+TODO packages.
 
-### Submitting a transfer
-- To transfer `infile` from the sender to `outfile` at the receiver with address `64-2:0:c,148.187.128.136:8000`, run the following on the sender: `curl "localhost:8000/submit?file=infile&destfile=outfile&dest=64-2:0:c,148.187.128.136:8000"`.
-- This should yield `OK 1`, where `1` is the submitted transfer's job id.
-- You should see the transfer progress in the server's output at both the sender and receiver.
-- It is also possible to query the transfer status via `curl "localhost:8000/status?id=1"`, though the output is not intended to be read by humans.
+### Configuration
 
-## Testing/Debugging
+> For more information, see the Hercules monitor's manual
+> ([hercules-monitor(1)](doc/hercules-monitor.1.md)), the Hercules server's manual
+> ([hercules-server(1)](doc/hercules-server.1.md)), and the Hercules configuration
+> manual ([hercules.conf(5)](doc/hercules.conf.5.md)).
+> The manuals are installed alongside Hercules, if you used the packages
+> or `make install`.
 
-- It may be useful to uncomment some of the lines marked "for debugging" at the top of the Makefile.
-- If you want to run under valgrind, passing `--fair-sched=yes` is helpful.
-- The script `test.sh` will try 3 sets of transfers: a file, a directory, and 2 files concurrently.
-In order to use it, adjust the definitions at the top of the file (hostnames, addresses and interfaces).
-The script further relies on you having ssh keys set up for those two hosts.
-Depending on the network cards you may need to comment in the two lines with `ConfigureQueues = false`.
+Hercules is configured using a configuration file.
+The default configuration file is `/usr/local/etc/hercules.conf`.
 
-## API
-The Monitor's API supports the following operations via HTTP GET requests.
+To get started, filling in the following information is required:
 
-### `/submit`: Submitting a new transfer
-Parameters:
-- `file`: Path to source file, from the server's point of view
-- `dest`: SCION address of the destination Hercules server
-- `destfile`: Destination file path
-- `payloadlen`: (Optional) override automatic MTU selection and use the specified payload length instead.
+- Change `ListenAddress` to the SCION/UDP address and port your Hercules instance should listen on.
+- Replace the entry in `Interfaces` with the network interface Hercules should use.
 
-Example: `localhost:8000/submit?file=infile&destfile=outfile&dest=64-2:0:c,148.187.128.136:8000`
+In both cases you should replace the entire string, including the `replaceme//` markers.
 
-Returns: `OK id`, where `id` is an integer identifying the submitted job on success, an HTTP error code otherwise.
+While the above two settings are sufficient to run Hercules, we **strongly recommend** additionally setting the option `DropUser`.
+Hercules will then drop its privileges to the specified user after startup and thus use the provided user's permissions for filesystem access.
+Hence, you should ensure the specified user has the appropriate read/write permissions on the paths you intend to send from/receive to.
+If you omit this option, Hercules will run as root.
+See [the configuration documentation](doc/hercules.conf.5.md#CAVEATS) for a discussion of the security implications.
 
-### `/status`: Check a transfer's status
-Parameters:
-- `id`: An id previously returned by `/submit`.
+See [hercules(5)](doc/hercules.conf.5.md) or the sample configuration file, [`hercules.conf.sample`](hercules.conf.sample) for an example illustrating all
+available configuration options.
 
-Returns: `OK status state error time_elapsed bytes_acked` on success, an HTTP error code otherwise.
-- `status` is the monitor's internal transfer status and one of `TransferStatus`, as defined in the go code.
-- `state` is an integer corresponding to the transfers current status (one of `session_state`, as defined in `errors.h`)
-- `error` is an integer corresponding to the transfers error state (one of `session_error`, as defined in `errors.h`)
-- `time_elapsed` is an integer representing the number of seconds elapsed since the server started this transfer.
-- `bytes_acked` is the number of bytes acknowledged by the receiver.
+### Starting Hercules
 
-### `/cancel`: Cancel a transfer
-Parameters:
-- `id`: An id previously returned by `/submit`.
+To start the Hercules server, you may use `systemctl start hercules-server`, if you installed Hercules as described above.
+This will start both the server and monitor processes.
+You can check their status and log output via `systemctl status hercules-server` or `systemctl status hercules-monitor`, respectively.
+If the `hercules-server` process fails to start with `Error in XDP setup!`, the cause is likely either that your setup requires specifying `ConfigureQueues = false` in the config file, or that an XDP program is already loaded on the specified network interface. See the section "[Troubleshooting](#troubleshooting)" below for more information.
 
-Returns: `OK`on success, an HTTP error code otherwise.
+### Submitting a Transfer
 
-### `/server`: Returns the server's SCION address
-This functionality is provided for integration with FTS.
+Transfers can be submitted to Hercules via its HTTP API.
+A user submits his transfer to the sending-side (source) Hercules server. The user does not interact with the receiving-side (destination) Hercules server.
+The easiest way to transfer files is using the provided `hcp` utility.
+For example, assume we have two hosts with Hercules set up, `hercules1` and `hercules2` and wish to copy the file `/tmp/data/myfile` from `hercules1` to `/mnt/storage/myfile` on `hercules2`.
+To do so, we need to know the IP address and port the source Hercules server's API is exposed on, as well as the SCION/UDP address and port the destination Hercules server on `hercules2` is listening on.
+The HTTP API is exposed on port 8000 by default.
+If you followed this guide, you should have set the destinations listening address in `hercules2`'s configuration file.
+Let's assume, for this example, that the server on `hercules2` is listening on `64-2:0:c,10.0.0.12:10000`.
+Then, running the following from `hercules1` will transfer the file, giving a progress report while the transfer is running:
+``` shell
+$ hcp localhost:8000 /tmp/data/myfile 64-2:0:c,10.0.0.12:10000 /mnt/storage/myfile
+```
 
-Parameters: None
+Note that in the above example we specified `localhost:8000` as the first argument since we submitted the transfer from the very host the source Hercules server is running on.
+In practice, `hcp` may be run from a different host, such as a user's machine, too.
+In that case, the first argument should be substituted with the listening address of the source server's HTTP API, e.g., `10.10.10.10:8000`.
+Note however, that the paths are still relative to the source and destination servers, respectively.
+This also implies that the file to be transferred must first be made available to the source Hercules server somehow. This could be done in several ways, e.g., by plugging in a physical disk or via a network share.
 
-Returns: `OK addr`, where `addr` is the server's SCION address.
+See [the hcp manual](hcp/hcp.1.md) for more information about the `hcp` tool.
+If you wish to use the API directly, see [the API docs](doc/api.md) for its description.
 
-### `/stat`: Retrieve stat information on a file
-This is provided for compatibility with FTS, but also (optionally) used by hcp.
+## Building from Source
 
-Parameters:
-- `file`: Path to file
+Clone this git repository and change to the directory you cloned it to.
+Before building Hercules, you must run `git submodule update --init` to download some required dependencies.
+You can then build Hercules, either using Docker or natively.
 
-Returns: `OK exists size`, where `exists` is 1 if the file exists, 0 otherwise; `size` is the file's size in bytes.
+### Building with Docker
 
+Hercules can be built from source using Docker and the provided `Dockerfile` which prepares the required build environment.
 
-# Readme not updated below this line.
+To build Hercules using Docker, simply run `make`. This will build the server and monitor executables.
+With `sudo make install`, you can then install Hercules to your machine.
+By default, this will install Hercules to `/usr/local/`.
 
-# Hercules
+### TODO Native Build
 
-High speed bulk data transfer application.
+## Debugging and Development
 
-This is a proof of concept implementation of file transfer using SCION/UDP (over ethernet/IPv4/UDP).
-To achieve high transmit and receive rates, the `hercules` tool is implemented using `AF_XDP`.
-On suitable hardware, a single instance can achieve >98Gbps transfer rate, and multiple instances can run in parallel on different network interfaces.
+See the [developer guide](doc/developers.md).
 
-`hercules` is not a daemon, it performs for only a single file transmission and then stops. 
-There are at least two hosts involved; exactly one of which behaves as a _sender_, the remaining hosts behave as receiver.
-The sender transmits the data to all receivers.
-Each receiver waits for the sender to start the transmission.
-There is no authorization, access control etc. The idea is that this will be integrated in a more generic framework that does all of that (e.g. make this run as an FTP extension).
+## Troubleshooting
 
-## Building
-
-Option
-1. Build in Docker, using the `Dockerfile` and `Makefile` provided in the repo; just run `make`.
-
-1. Build using `go build`
+- If Hercules is aborted forcefully (e.g. while debugging) or crashes, it can leave an XDP program loaded which will prevent the server from starting again, yielding the following error message:
+  ```text
+  libbpf: Kernel error message: XDP program already attached
+  Error loading XDP redirect, is another program loaded?
+  Error in XDP setup!
+  ```
+  To remove the XDP program from the interface, run `ip link set dev <device> xdp off`.
   
-   Requires:
-    - gcc/clang
-    - linux kernel headers >= 5.0
-    - go 1.21
+  
+- Some network cards support multiple receive queues.
+  In such a case, it must be ensured that all incoming Hercules packets are sent to the same queue.
+  Hercules will, by default, attempt to configure the queues accordingly.
+  However this fails when using network cards that do not support multiple queues, yielding the following error message:
+  ```text
+  rxclass: Cannot get RX class rule count: Operation not supported
+  Cannot insert classification rule
+  could not configure queue 0 on interface ens5f0, abort
+  Error in XDP setup!
+  ```
+  To resolve this, specify `ConfigureQueues = false` in the configuration file.
+  
+- The sending-side Hercules attempts to start a transfer, but the receiver does not show any indication of a received packet and the transfer times out.
 
+  Hercules attempts to automatically pick the right packet size based on the MTU in the SCION path metadata and the sending interface.
+  In some cases, however, this information is not accurate and the really supported MTU is smaller.
+  To work around this, you can manually specify the payload size to be used, e.g., by supplying the `TODO` option to `hcp`, or by specifying the payload on a per-destination basis in the configuration file.
+  
+## Performance Configuration
 
-## Running
+Depending on your performance requirements and your specific bottlenecks, the following configuration options may help improve performance:
 
-> **WARNING**: network drivers seem to crash occasionally.
+- On machines with multiple NUMA nodes, it may be beneficial to bind the Hercules server process to CPU cores "closer" to the network card. 
+  To do so, install the `numactl` utility and adjust the file `/usr/local/lib/systemd/system/hercules-server.service` so it reads `ExecStart=/usr/bin/numactl -l --cpunodebind=netdev:<device> -- /home/marco/hercules-server`, replacing `<device>` with your network interface.
 
-> **WARNING**: due to the most recent changes on the branch `multicore`, the rate-limit `computation` is a bit off.
-  When setting the rate-limit with `-p`, keep this in mind and set a lower rate than you aim at.
+- Setting the option `XDPZeroCopy = true` can substantially improve performance, but whether it is supported depends on the combination of network card and driver in your setup.
 
-> **NOTE**: if hercules is aborted forcefully (e.g. while debugging), it can leave an XDP program loaded which will prevent starting again.
-						Run `ip link set dev <device> xdp off`.
+- Increasing the number of worker threads via the option `NumThreads` can also improve performance.
 
-> **NOTE**: many things can go wrong, expect to diagnose things before getting it to work.
-
-> **NOTE**: Some devices use separate queues for copy and zero-copy mode (e.g. Mellanox).
-  Make sure to use queues that support the selected mode.
-  Additionally, you may need to postpone step 2 until the handshake has succeeded.
-
-1. Make sure that SCION endhost services (sciond, dispatcher) are configured and running on both sender and receiver machines.
-   For the most recent versions of Hercules, use a SCION version compatible to `https://github.com/scionproto/scion/releases/tag/v0.10.0`.
-
-1. Configure queue network interfaces to particular queue (if supported by device); in this example queue 0 is used. 
-
-    ```shell
-    sudo ethtool -N <device> rx-flow-hash udp4 fn
-    sudo ethtool -N <device> flow-type udp4 dst-port 30041 action 0
-    ```
-
-1. Start hercules on receiver side
-
-    ```shell
-    sudo numactl -l --cpunodebind=netdev:<device> -- \ 
-        ./hercules -i <device> -q 0 -l <receiver addr> -o path/to/output/file.bin
-    ```
-
-1. Start hercules on sender side
-
-    ```shell
-    sudo numactl -l --cpunodebind=netdev:<device> -- \
-        ./hercules -i <device> -q 0 -l <sender addr> -d <receiver addr> -t path/to/file.bin
-    ```
-
-* Both `<receiver addr>` and `<sender addr>` are SCION/IPv4 addresses with UDP port, e.g. `17-ffaa:0:1102,[172.16.0.1]:10000`.
-* To send data to multiple receivers, just provide `-d` multiple times.
-* The `numactl` is optional but has a huge effect on performance on systems with multiple numa nodes.
-* The command above will use PCC for congestion control. For benchmarking, you might want to use `-pcc=false` and provide a maximum sending rate using `-p`.
-* For transfer rates >30Gbps, you might need to use multiple networking queues. At the receiver this is currently only possible in combination with multiple IP addresses. 
-* See source code (or `-h`) for additional options.
-* You should be able to omit `-l`.
-* For more sophisticated run configurations (e.g. using multiple paths), it is recommended to use a configuration file.
-* When using 4 or more paths per destination, you might need to specify path preferences to make the path selection more efficient. 
-
-
-## Protocol
-
-The transmitter splits the file into chunks of the same size. All the chunks are transmitted (in order).
-The receiver acknowledges the chunks at regular intervals.
-Once the sender has transmitted all chunks once, it will start to retransmit all chunks that have not been acknowledge in time. 
-This is repeated until all chunks are acked.
-
-
----
-
-
-All packets have the following basic layout:
-
-	|  index  |  path  | seqnr | payload ... |
-	|   u32   |   u8   |  u32  |     ...     |
-
-
-> **NOTE**: Integers are transmitted little endian (host endianness).
-
-For control packets (handshake and acknowledgements, either sender to receiver or receiver to sender), index is `UINT_MAX`.
-For all control packets, the first byte of the payload contains the control packet type.
-The following control packet types exist:
-
-    0: Handshake packet
-    1: ACK packet
-    2: NACK packet
-
-For data packets (sender to receiver), the index field is the index of the chunk being transmitted.
-This is **not** a packet sequence number, as chunks may be retransmitted; hence the separate field `seqnr` contains the per-path sequence number.
-A NACK packet is always associated with a path. 
-
-If path is not `UINT8_MAX`, it is used to account the packet to a specific path.
-This is used to provide quick feedback to the PCC algorithm, if enabled.
-
-
-#### Handshake
-
-1. Sender sends initial packet:
-
-        | num entries | filesize | chunksize | timestamp | path index | flags |
-        |     u8      |   u64    |   u32     |    u64    |    u32     |  u8   |
-        
-    Where `num entries` is `UINT8_MAX` to distinguish handshake replies from ACKs.
-    
-    Flags:
-    - 0-th bit: `SET_RETURN_PATH` The receiver should use this path for sending
-    ACKs from now on.
-
-1. Receiver replies immediately with the same packet.
-
-    This first packet is used to determine an approximate round trip time.
-    
-	The receiver proceeds to  prepare the file mapping etc.
-
-1. Receiver replies with an empty ACK signaling "Clear to send"
-
-##### Path handshakes
-
-Every time the sender starts using a new path or the receiver starts using a new
-return path, the sender will update the RTT estimate used by PCC.
-In order to achieve this, it sends a handshake (identical to the above) on the
-affected path(s).
-The receiver replies immediately with the same packet (using the current return path).
-
-#### Data transmit
-
-* The sender sends (un-acknowledged) chunks in data packets at chosen send rate
-* The receiver sends ACK packets for the entire file at 100ms intervals.
-    
-  ACK packets consist of a list of `begin`,`end` pairs declaring that chunks
-  with index `i` in `begin <= i < end` have been received.
-  Lists longer than the packet payload size are transmitted as multiple 
-  independent packets with identical structure.
-
-
-        | begin, end | begin, end | begin, end | ...
-        |  u32   u32 |  u32   u32 |  u32   u32 | ...
-
-* The receiver sends a NACK packets four times per RTT to provide timely feedback to congestion control.
-  The NACK packet layout is identical to the ACK packet layout.
-       
-  NACK packets are only sent if non-empty.
-  Hence, if no path uses PCC, or no recent packet loss has been observed, no NACKs are sent. 
-
-#### Termination
-
-1. Once the receiver has received all chunks, it sends one more ACK for the entire range and terminates.
-1. When the sender receives this last ACK, it determines that all chunks have been received and terminates.
-
-## Issues, Todos, Future Work
-
-* [ ] Flow control: if the receiver is slower than the sender (e.g. because it needs to write stuff to disk) it just drops packets.
-	  The congestion control naturally solves this too, but is fairly slow to adapt.
-	  Maybe a simple window size would work.
-* [ ] Abort of transmission not handled (if one side is stopped, the other side will wait forever).
-* [ ] Replace paths used for sending before they expire (for very long transmissions)
-* [ ] Optimisations; check sum computations, file write (would be broken for huge files), ...

@@ -36,14 +36,27 @@ VERSION := $(shell (ref=$$(git describe --tags --long --dirty 2>/dev/null) && ec
 					echo $$(git rev-parse --abbrev-ref HEAD)-untagged-$$(git describe --tags --dirty --always))
 CFLAGS += -DHERCULES_VERSION="\"$(VERSION)\""
 
+PREFIX ?= /usr/local
+
+.PHONY: all install
 
 all: $(TARGET_MONITOR) $(TARGET_SERVER)
 
-install: all
-ifndef DESTDIR
-	$(error DESTDIR is not set)
-endif
-	cp hercules-server hercules-monitor hercules.conf $(DESTDIR)
+install:
+	install -d $(DESTDIR)$(PREFIX)/bin/
+	install $(TARGET_MONITOR) $(DESTDIR)$(PREFIX)/bin/
+	install $(TARGET_SERVER) $(DESTDIR)$(PREFIX)/bin/
+
+	install -d $(DESTDIR)$(PREFIX)/etc/
+	install hercules.conf $(DESTDIR)$(PREFIX)/etc/
+
+	install -d $(DESTDIR)$(PREFIX)/share/doc/hercules/
+	install hercules.conf.sample $(DESTDIR)$(PREFIX)/share/doc/hercules/
+
+	install -d $(DESTDIR)$(PREFIX)/share/man/man1/
+	install doc/hercules-server.1 $(DESTDIR)$(PREFIX)/share/man/man1/
+	install doc/hercules-monitor.1 $(DESTDIR)$(PREFIX)/share/man/man1/
+	install hcp/hcp.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 
 # List all headers as dependency because we include a header file via cgo (which in turn may include other headers)
 $(TARGET_MONITOR): $(MONITORFILES) $(wildcard *.h) builder
@@ -90,7 +103,7 @@ tomlc99/libtoml.a: builder
 	fi
 
 
-.PHONY: builder builder_image install clean all
+.PHONY: builder builder_image clean
 
 # mockules: builder mockules/main.go mockules/network.go
 # 	docker exec -w /`basename $(PWD)`/mockules hercules-builder go build
@@ -111,5 +124,15 @@ clean:
 	rm -f hercules mockules/mockules
 	docker container rm -f hercules-builder || true
 	docker rmi hercules-builder || true
+
+MANFILES := $(wildcard doc/*.[157]) hcp/hcp.1
+MDFILES := $(addsuffix .md,$(MANFILES))
+
+%.md: $(basename %)
+# Show linter output for all warning levels, but continue if it's not severe
+	mandoc -T lint -Wall $< || true
+	mandoc -T markdown -W warning,stop $< > $@
+
+docs: $(MDFILES)
 
 -include $(DEPS)

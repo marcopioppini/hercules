@@ -1,0 +1,263 @@
+.\" -*- mode: nroff -*-
+.\" .Dd $Mdocdate$
+.Dd October 29, 2024
+.Dt HERCULES.CONF 5
+.Os
+.Sh NAME
+.Nm hercules.conf
+.Nd "Hercules configuration file"
+.Sh DESCRIPTION
+.Nm
+is the configuration file for the Hercules file transfer system.
+This configuration file is used by
+.Xr hercules-server 1
+and
+.Xr hercules-monitor 1 .
+Its default location is
+.Pa /usr/local/etc/hercules.conf .
+The configuration file is in TOML format.
+.Pp
+The following two options must be set, as they have no default values:
+.Bl -tag -width Ds
+.It Ic ListenAddress Ns = Ns Ar str
+This specifies the SCION/UDP address Hercules will listen on
+for incoming transfers.
+.Pp
+Example: ListenAddress = "17-ffaa:1:fe2,192.168.10.141:8000"
+.It Ic Interfaces Ns = Ns [ Ar str , ]
+The network interface Hercules should use for data traffic.
+Hercules will load an XDP program on this interface.
+.Pp
+Example: Interfaces = ["eth0"]
+.El
+.Pp
+It is
+.Em strongly
+recommended to also set the
+.Ic DropUser
+option, described below.
+See
+.Sx CAVEATS
+for more information.
+.Ss GENERAL CONFIGURATION
+The following general configuration options are available:
+.Bl -tag -width Ds
+.It Ic DefaultNumPaths Ns = Ns Ar int
+Specify how many SCION path to use for data transfers.
+This is an upper limit, if fewer paths are available only those will be used.
+This value may be overridden on a per-destination basis, see
+.Sx PER-DESTINATION OVERRIDES .
+The default value is
+.Ar 1 .
+.Pp
+Example: DefaultNumPaths = 2
+.It Ic MonitorSocket Ns = Ns Ar str
+Path to the monitor's Unix socket.
+The default value is
+.Pa /var/run/herculesmon.sock .
+.It Ic ServerSocket Ns = Ns Ar str
+Path to the server's Unix socket.
+The default value is
+.Pa /var/run/hercules.sock .
+.It Ic MonitorHTTP Ns = Ns Ar str
+The address and port on which to expose the Hercules HTTP API.
+This option may be set to the special string "disabled"
+to disable the HTTP API.
+The default value is
+.Ar ":8000" .
+.Pp
+Example: MonitorHTTP = "0.0.0.0:1818"
+.It Ic DropUser Ns = Ns Ar str
+Name of a local system user.
+If specified, the server will drop its privileges to this user after startup.
+If unspecified, the server will run as root.
+Running the server as root is discouraged, as it presents a security risk.
+See
+.Sx CAVEATS
+for more information.
+.Pp
+Example: DropUser = "_hercules"
+.It Ic EnablePCC Ns = Ns Ar bool
+Setting this option to
+.Ar false
+disables PCC congestion control and Hercules will send as fast as possible,
+up to its rate limit (see below).
+This may be useful for testing, but sending without congestion control across
+public networks is probably a bad idea.
+The default value is
+.Ar true .
+.It Ic RateLimit Ns = Ns Ar int
+This option limits Hercules' sending rate.
+The limit is applied to each transfer indivudually.
+The value is in packets per second.
+The default value is
+.Ar 3'333'333 .
+.It Ic NumThreads Ns = Ns Ar int
+Set the number of RX/TX worker threads to use.
+Setting this number to 2, for example, will start 2 RX worker threads
+and 2 TX workers.
+Depending on the bottleneck in your setup, increasing this number will
+improve performance.
+Hercules spawns other threads, too, so this is
+.Em not
+the total number of threads used by Hercules.
+The default value is
+.Ar 1 .
+.It Ic XDPZeroCopy Ns = Ns Ar bool
+If your combination of NIC/drivers supports XDP in zero-copy mode,
+enabling it here will likely improve performance.
+The default value is
+.Ar false .
+.It Ic Queue Ns = Ns Ar int
+Specify the NIC RX queue on which to receive packets.
+The default value is
+.Ar 0 .
+.It Ic ConfigureQueues Ns = Ns Ar bool
+For Hercules to receive traffic, packets must be redirected to the queue
+specified above.
+Hercules will try to configure this automatically, but this
+behaviour can be overridden, e.g. if you wish to set custom rules or automatic
+configuration fails.
+If you set this to false, you must manually ensure packets end up in the
+right queue.
+Some network interfaces do not support multiple queues, in which case automatic
+configuration will fail and the server will not start with this option enabled.
+In such cases, you may simply set this option to
+.Ar false
+without further configuration.
+The default value is
+.Ar true .
+.El
+.Ss PER-DESTINATION OVERRIDES
+The maximum number of paths and payload size to use can be overridden,
+either for a single destination host or an entire destination AS.
+Additionally, the paths to use towards each destination can be specified via
+path rules.
+In case both an AS rule and a Host rule match a destination, the Host rule
+takes precedence.
+Choosing specific paths is useful if too many paths to the destination are
+available, or if certain paths are known to perform better.
+Choosing a specific payload length is useful if the MTU listed in the SCION
+path metadata is higher than the actual MTU the path(s) can support.
+In such a case, Hercules' automatic payload size selection will fail, and it
+must be set manually.
+.Pp
+Destination-host rules are set as follows:
+.Bl -tag -width Ds
+.It Bq Bq Ic DestinationHosts
+.Bl -tag -width Ds -compact
+.It Ic HostAddr Ns = Ns Ar str
+The destination host this rule applies to.
+.It Op Ic NumPaths Ns = Ns Ar int
+The maximum number of paths to use towards the destination.
+Specifying this is optional, if not set the value of
+.Ic DefaultNumPaths
+will be used.
+.It Op Ic PathSpec Ns = Ns [[ Ar str , ] ,]
+A list of AS-interface sequences that must be present on the paths towards
+the destination.
+Specifying this is optional, if not set no path restrictions are applied.
+.It Op Ic Payloadlen Ns = Ns Ar int
+The payload length to use for packets towards this destination.
+Note that the payload length does not include the Hercules, UDP or SCION
+headers.
+Hence, the value should be set slightly lower than the actual maximum MTU.
+Usually, a value of ca. 100 bytes less than the MTU is fine, but it may need to
+be smaller for longer paths.
+Specifying this is optional, if not set Hercules will attempt to pick the
+right payload size based on the SCION path metadata and the MTU of the sending
+interface.
+.El
+.It Bq Bq Ic DestinationASes
+.Bl -tag -width Ds -compact
+.It Ic IA Ns = Ns Ar str
+The destination ISD-AS this rule applies to
+.It Op Ic NumPaths Ns = Ns Ar int
+.It Op Ic PathSpec Ns = Ns [[ Ar str , ] ,]
+.It Op Ic Payloadlen Ns = Ns Ar int
+These options work the same as in the
+.Ic DestinationHosts
+rules described above.
+.El
+.El
+.Pp
+Example: The following set of rules specifies that
+.Bl -bullet
+.It
+For transfers to the host
+.Em 17-ffaa:1:fe2,1.1.1.1 :
+.Bl -bullet -compact
+.It
+Transfers may use up to 42 paths.
+.It
+The paths must contain either the AS-interface sequence
+      17-f:f:f 1 -> 17:f:f:a 2
+      OR 1-f:0:0 22 .
+.El
+.It
+For transfers to the host
+.Em 18-a:b:c,2.2.2.2 :
+.Bl -bullet -compact
+.It
+Up to two paths should be used.
+.It
+Automatic MTU selection is overridden and a payload length of 1000B is used.
+.El
+.It
+For transfers to any other host in AS
+.Em 18-a:b:c :
+.Bl -bullet -compact
+.It
+A payload length of 1400 should be used.
+.El
+.El
+.Pp
+Example:
+.Bd -literal
+[[DestinationHosts]]
+HostAddr = "17-ffa:1:fe2,1.1.1.1"
+NumPaths = 42
+PathSpec = [
+["17-f:f:f 1", "17-f:f:a 2"],
+["1-f:0:0 22"],
+]
+
+[[DestinationHosts]]
+HostAddr = "18-a:b:c,2.2.2.2"
+NumPaths = 2
+Payloadlen = 1000
+
+[[DestinationASes]]
+IA = "18-a:b:c"
+Payloadlen = 1400
+.Ed
+.Sh FILES
+.Bl -tag -width Ds -compact
+.It Pa /usr/local/etc/hercules.conf
+Default configuration file
+.It Pa /usr/local/share/doc/hercules/hercules.conf.sample
+Example config file showcasing the available options.
+.El
+.Sh SEE ALSO
+.Xr hcp 1 ,
+.Xr hercules-monitor 1 ,
+.Xr hercules-server 1 ,
+.Xr hercules 7
+.Pp
+Further information about Hercules is available on
+.Lk https://github.com/netsec-ethz/hercules .
+For more information about SCION, please see
+.Lk https://scion-architecture.net .
+.Sh AUTHORS
+.An Network Security Group, ETH Zürich
+.Sh CAVEATS
+Two security issues are present when Hercules is run as the root user:
+First, because the receiving-side Hercules server simply writes data to the file
+specified by the sender and no authentication of the sender is performed,
+a sender may overwrite arbitrary system files.
+Second, because the sending-side Hercules server simply copies data from the
+file specified by the user and no authentication of the user is performed,
+a user may copy arbitrary system files to the destination server.
+To mitigate these issues, it is recommended that you set the
+.Ic DropUser
+option described above.

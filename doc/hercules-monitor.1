@@ -1,0 +1,70 @@
+.Dd October 29, 2024
+.Dt HERCULES-MONITOR 1
+.Os
+.Sh NAME
+.Nm hercules-monitor
+.Nd "Monitor component of the Hercules file transfer system"
+.Sh SYNOPSIS
+.Nm hercules-monitor
+.Bk -words
+.Op Fl c Ar conffile
+.Ek
+.Sh DESCRIPTION
+.Nm
+is the monitor component of the Hercules file transfer sytem.
+The monitor is the link between users and the Hercules server.
+Users interact with the monitor via its HTTP API.
+The monitor interacts with the server component via a local Unix socket.
+Hercules is configured via a configuration file (see
+.Xr hercules.conf 5 ) .
+.Pp
+The monitor and server processes must be started and stopped together, you
+should not restart one without also restarting the other.
+The provided systemd service files ensure this, if you use a different method
+to run Hercules you must ensure this yourself.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl c Ar conffile
+Use the specified configuration file.
+By default,
+.Nm
+will first look for a file named
+.Pa hercules.conf
+in its working directory, then for the default config file,
+.Pa /usr/local/etc/hercules.conf .
+See
+.Xr hercules.conf 5
+for configuration options.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width SCION_DAEMON_ADDRESS
+.It Ev SCION_DAEMON_ADDRESS
+If the SCION daemon is listening on a non-default port,
+.Ev SCION_DAEMON_ADDRESS
+can be set to its listening address and port.
+.El
+.Sh FILES
+.Bl -tag -width Ds -compact
+.It Pa /usr/local/etc/hercules.conf
+Default configuration file
+.It Pa /var/run/herculesmon.sock
+Default Unix socket path
+.El
+.\" .Sh EXIT STATUS
+.\" .Sh DIAGNOSTICS
+.Sh SEE ALSO
+.Xr hcp 1 ,
+.Xr hercules-server 1 ,
+.Xr hercules.conf 5 ,
+.Xr hercules 7
+.Pp
+Further information about Hercules is available on
+.Lk https://github.com/netsec-ethz/hercules .
+For more information about SCION, please see
+.Lk https://scion-architecture.net .
+.Sh AUTHORS
+.An Network Security Group, ETH Zürich
+.Sh CAVEATS
+See
+.Xr hercules.conf 5 Ns s CAVEATS .
