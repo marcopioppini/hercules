@@ -16,6 +16,8 @@ import (
 	"github.com/scionproto/scion/pkg/snet"
 )
 
+var startupVersion string
+
 type apiStatus struct {
 	status      int
 	state       int
@@ -26,13 +28,20 @@ type apiStatus struct {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Printf("Usage: %s [OPTION]... SOURCE-API SOURCE-PATH DEST-ADDR DEST-PATH\n", os.Args[0])
+		fmt.Printf("This is hcp %s\nUsage: %s [OPTION]... SOURCE-API SOURCE-PATH DEST-ADDR DEST-PATH\n", startupVersion, os.Args[0])
 		flag.PrintDefaults()
 	}
 	poll_interval := flag.Duration("i", time.Second*1, "Poll frequency")
 	no_stat_file := flag.Bool("n", false, "Don't stat source file")
+	show_version := flag.Bool("version", false, "Print version and exit")
+	// TODO payload size
 
 	flag.Parse()
+
+	if *show_version {
+		fmt.Printf("This is hcp %s\n", startupVersion)
+		os.Exit(0)
+	}
 
 	if flag.NArg() != 4 {
 		flag.Usage()
@@ -116,6 +125,7 @@ func main() {
 
 		if info.state == C.SESSION_STATE_DONE {
 			finished = true
+			bar.Finish()
 			bar.Exit()
 			fmt.Println()
 			if info.error != C.SESSION_ERROR_OK {

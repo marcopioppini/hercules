@@ -1,5 +1,6 @@
 TARGET_SERVER := hercules-server
 TARGET_MONITOR := hercules-monitor
+TARGET_HCP := hcp
 
 CC := gcc
 CFLAGS = -O3 -g3 -std=gnu11 -D_GNU_SOURCE -Itomlc99
@@ -31,13 +32,14 @@ SRCS := $(wildcard *.c)
 OBJS := $(SRCS:.c=.o)
 DEPS := $(OBJS:.o=.d)
 MONITORFILES := $(wildcard monitor/*)
+HCPFILES := $(wildcard hcp/*)
 
 VERSION := $(shell (ref=$$(git describe --tags --long --dirty 2>/dev/null) && echo $$(git rev-parse --abbrev-ref HEAD)-$$ref) ||\
 					echo $$(git rev-parse --abbrev-ref HEAD)-untagged-$$(git describe --tags --dirty --always))
 CFLAGS += -DHERCULES_VERSION="\"$(VERSION)\""
 
 
-all: $(TARGET_MONITOR) $(TARGET_SERVER)
+all: $(TARGET_MONITOR) $(TARGET_SERVER) $(TARGET_HCP)
 
 install: all
 ifndef DESTDIR
@@ -53,6 +55,9 @@ $(TARGET_SERVER): $(OBJS) bpf_prgm/redirect_userspace.o bpf/src/libbpf.a tomlc99
 	@# update modification dates in assembly, so that the new version gets loaded
 	@sed -i -e "s/\(load bpf_prgm_redirect_userspace\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/redirect_userspace.c | head -c 32)/g" bpf_prgms.s
 	docker exec hercules-builder $(CC) -o $@ $(OBJS) bpf_prgms.s $(LDFLAGS)
+
+$(TARGET_HCP): $(HCPFILES) $(wildcard *.h) builder
+	docker exec -w /`basename $(PWD)`/hcp hercules-builder go build -ldflags "-X main.startupVersion=${VERSION}"
 
 %.o: %.c builder
 	docker exec hercules-builder $(CC) $(DEPFLAGS) $(CFLAGS) -c $< -o $@
