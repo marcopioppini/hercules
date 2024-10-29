@@ -3913,6 +3913,10 @@ int main(int argc, char *argv[]) {
 			fprintf(stderr, "Error parsing DropUser\n");
 			exit(1);
 		}
+		fprintf(stderr,
+				"WARNING: DropUser config option not set. Running Hercules as root is "
+				"not secure!\n"
+				"See the documentation for more information.\n");
 	}
 	// Listening address
 	toml_datum_t listen_addr = toml_string_in(conf, "ListenAddress");
