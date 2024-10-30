@@ -1,0 +1,104 @@
+.Dd October 30, 2024
+.Dt HERCULES 7
+.Os
+.Sh NAME
+.Nm Hercules
+.Nd "SCION-native fast bulk data transfers"
+.Sh DESCRIPTION
+.Nm
+is a high-speed SCION-native bulk data transfer application.
+Hercules achieves high transfer rates by combining the Linux kernel AF_XDP
+express data path and PCC congestion control with a custom data transfer
+protocol.
+Hercules can take advantage of SCION's native multipath capabilities to transfer
+data using multiple network paths simultaneously.
+Hercules supports transferring entire directories in one go.
+.Pp
+The Hercules server is intended to run on dedicated machines.
+A Hercules server installation consists of two components, i.e.,
+two separate processes that communicate via a Unix socket.
+.Bl -bullet
+.It
+The monitor is responsible for handling SCION paths and exposes a HTTP API which
+clients can use to submit new transfers, check the status of ongoing transfers,
+or cancel them.
+.It
+The server carries out the actual file transfers.
+.El
+The monitor and server processes must be started and stopped together, you
+should not restart one without also restarting the other.
+The provided systemd service files ensure this, if you use a different method
+to run Hercules you must ensure this yourself.
+.Pp
+Clients interact with Hercules via its HTTP API.
+The easiest way for users to transfer files is using the provided
+.Xr hcp 1
+command line tool.
+.Sh EXAMPLES
+The following example scenario illustrates how Hercules is intended to be used
+and how the various components interact.
+Assume we want to use Hercules to transfer data between two locations,
+from
+.Ar A
+to
+.Ar B .
+We will need to set up an instance of Hercules, ideally on a dedicated machine,
+at each location.
+Both machines need a working SCION endhost stack.
+Instructions on setting up a SCION endhost can be found at
+.Lk https://docs.scion.org/projects/scion-applications/en/latest/applications/access.html .
+Assume the SCION addresses of the two machines are
+.Ql 64-2:0:9,10.1.1.1
+and
+.Ql 64-2:0:c,10.2.2.2 ,
+respectively, and that the corresponding network interfaces on both machines are
+called
+.Ql eth0 .
+We will use SCION/UDP port 10000 for Hercules on both hosts.
+We will use the default TCP port 8000 for the HTTP API.
+With Hercules installed on both machines, we set the following configuration
+options on the two machines:
+.Pp
+On the machine at
+.Ar A :
+.Bd -literal
+ListenAddress = "64-2:0:9,10.1.1.1:10000"
+Interfaces = [ "eth0" ]
+.Ed
+.Pp
+On the machine at
+.Ar B :
+.Bd -literal
+ListenAddress = "64-2:0:c,10.2.2.2:10000"
+Interfaces = [ "eth0" ]
+.Ed
+.Pp
+We can now start the Hercules server on both machines.
+With the provided systemd files, this is done with the following command:
+.Dl # systemctl start hercules-server
+Note that this will start both the Hercules server and monitor processes.
+.Pp
+Now, we can use
+.Xr hcp 1
+to copy the file
+.Pa /tmp/hercules.in
+from
+.Ar A
+to
+.Ar B
+by running the following command on
+.Ar A :
+.Dl $ hcp localhost:8000 /tmp/hercules.in 64-2:0:c,10.2.2.2:10000 \
+/tmp/hercules.out
+.Sh SEE ALSO
+.Xr hcp 1 ,
+.Xr hercules-monitor 1 ,
+.Xr hercules-server 1 ,
+.Xr hercules.conf 5 ,
+.Pp
+Further information about Hercules is available on
+.Lk https://github.com/netsec-ethz/hercules .
+For more information about SCION, please see
+.Lk https://scion-architecture.net .
+.Sh AUTHORS
+.An Network Security Group, ETH Zürich

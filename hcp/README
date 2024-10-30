@@ -11,6 +11,8 @@ Hercules server listening on `64-2:0:9,192.168.4.2:10000`, run the following com
 
 `hcp localhost:8000 hercules.in 64-2:0:9,192.168.4.2:10000 hercules.out`
 
+See hcp(1) or hcp.1.md for more information.
+
 Building
 ==========
 `go build`
