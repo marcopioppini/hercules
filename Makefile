@@ -1,6 +1,6 @@
 TARGET_SERVER := hercules-server
 TARGET_MONITOR := hercules-monitor
-TARGET_HCP := hcp
+TARGET_HCP := hcp/hcp
 
 CC := gcc
 CFLAGS = -O3 -g3 -std=gnu11 -D_GNU_SOURCE -Itomlc99
@@ -32,7 +32,7 @@ SRCS := $(wildcard *.c)
 OBJS := $(SRCS:.c=.o)
 DEPS := $(OBJS:.o=.d)
 MONITORFILES := $(wildcard monitor/*)
-HCPFILES := $(wildcard hcp/*)
+HCPFILES := $(filter-out $(TARGET_HCP),$(wildcard hcp/*))
 
 VERSION := $(shell (ref=$$(git describe --tags --long --dirty 2>/dev/null) && echo $$(git rev-parse --abbrev-ref HEAD)-$$ref) ||\
 					echo $$(git rev-parse --abbrev-ref HEAD)-untagged-$$(git describe --tags --dirty --always))
@@ -44,10 +44,11 @@ PREFIX ?= /usr/local
 
 all: $(TARGET_MONITOR) $(TARGET_SERVER) $(TARGET_HCP)
 
-install:
+install: all
 	install -d $(DESTDIR)$(PREFIX)/bin/
 	install $(TARGET_MONITOR) $(DESTDIR)$(PREFIX)/bin/
 	install $(TARGET_SERVER) $(DESTDIR)$(PREFIX)/bin/
+	install $(TARGET_HCP) $(DESTDIR)$(PREFIX)/bin/
 
 	install -d $(DESTDIR)$(PREFIX)/etc/
 	install hercules.conf $(DESTDIR)$(PREFIX)/etc/
@@ -59,52 +60,61 @@ install:
 	install doc/hercules-server.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	install doc/hercules-monitor.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	install hcp/hcp.1 $(DESTDIR)$(PREFIX)/share/man/man1/
+	install -d $(DESTDIR)$(PREFIX)/share/man/man5/
+	install doc/hercules.conf.5 $(DESTDIR)$(PREFIX)/share/man/man5/
+	install -d $(DESTDIR)$(PREFIX)/share/man/man7/
+	install doc/hercules.7 $(DESTDIR)$(PREFIX)/share/man/man7/
+
+# Hack to allow building both in docker and natively:
+# Prefixing the target with docker_ should use the builder image.
+# e.g., make docker_all
+docker_%: builder
+	docker exec hercules-builder $(MAKE) $*
 
 # List all headers as dependency because we include a header file via cgo (which in turn may include other headers)
-$(TARGET_MONITOR): $(MONITORFILES) $(wildcard *.h) builder
-	docker exec -w /`basename $(PWD)`/monitor hercules-builder go build -o "../$@" -ldflags "-X main.startupVersion=${VERSION}"
+$(TARGET_MONITOR): $(MONITORFILES) $(wildcard *.h)
+	cd monitor && go build -o "../$@" -ldflags "-X main.startupVersion=${VERSION}"
 
-$(TARGET_SERVER): $(OBJS) bpf_prgm/redirect_userspace.o bpf/src/libbpf.a tomlc99/libtoml.a builder
+$(TARGET_SERVER): $(OBJS) bpf_prgm/redirect_userspace.o bpf/src/libbpf.a tomlc99/libtoml.a
 	@# update modification dates in assembly, so that the new version gets loaded
 	@sed -i -e "s/\(load bpf_prgm_redirect_userspace\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/redirect_userspace.c | head -c 32)/g" bpf_prgms.s
-	docker exec hercules-builder $(CC) -o $@ $(OBJS) bpf_prgms.s $(LDFLAGS)
+	$(CC) -o $@ $(OBJS) bpf_prgms.s $(LDFLAGS)
 
-$(TARGET_HCP): $(HCPFILES) $(wildcard *.h) builder
-	docker exec -w /`basename $(PWD)`/hcp hercules-builder go build -ldflags "-X main.startupVersion=${VERSION}"
+$(TARGET_HCP): $(HCPFILES) $(wildcard *.h)
+	cd hcp && go build -ldflags "-X main.startupVersion=${VERSION}"
 
-%.o: %.c builder
-	docker exec hercules-builder $(CC) $(DEPFLAGS) $(CFLAGS) -c $< -o $@
+hcp: $(TARGET_HCP)
 
-hercules: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.o bpf/src/libbpf.a
-	docker exec hercules-builder go build -ldflags "-X main.startupVersion=$${startupVersion}"
+%.o: %.c
+	$(CC) $(DEPFLAGS) $(CFLAGS) -c $< -o $@
 
 bpf_prgm/%.ll: bpf_prgm/%.c
-	docker exec hercules-builder clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -O2 -emit-llvm -c -g -o $@ $<
+	clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -O2 -emit-llvm -c -g -o $@ $<
 
 bpf_prgm/%.o: bpf_prgm/%.ll
-	docker exec hercules-builder llc -march=bpf -filetype=obj -o $@ $<
+	llc -march=bpf -filetype=obj -o $@ $<
 
 # explicitly list intermediates for dependency resolution
 bpf_prgm/redirect_userspace.ll:
 
-bpf/src/libbpf.a: builder
+bpf/src/libbpf.a:
 	@if [ ! -d bpf/src ]; then \
 		echo "Error: Need libbpf submodule"; \
 		echo "May need to run git submodule update --init"; \
 		exit 1; \
 	else \
-		docker exec -w /`basename $(PWD)`/bpf/src hercules-builder $(MAKE) all OBJDIR=.; \
+		cd bpf/src && $(MAKE) all OBJDIR=.; \
 		mkdir -p build; \
-		docker exec -w /`basename $(PWD)`/bpf/src hercules-builder $(MAKE) install_headers DESTDIR=build OBJDIR=.; \
+		cd bpf/src && $(MAKE) install_headers DESTDIR=build OBJDIR=.; \
 	fi
 
-tomlc99/libtoml.a: builder
+tomlc99/libtoml.a:
 	@if [ ! -d tomlc99 ]; then \
 		echo "Error: Need libtoml submodule"; \
 		echo "May need to run git submodule update --init"; \
 		exit 1; \
 	else \
-		docker exec -w /`basename $(PWD)`/tomlc99 hercules-builder $(MAKE) all; \
+		cd tomlc99 && $(MAKE) all; \
 	fi
 
 
@@ -125,7 +135,7 @@ builder_image:
 		docker build -t hercules-builder --build-arg UID=$(shell id -u) --build-arg GID=$(shell id -g) .
 
 clean:
-	rm -rf $(TARGET_MONITOR) $(TARGET_SERVER) $(OBJS) $(DEPS)
+	rm -rf $(TARGET_MONITOR) $(TARGET_SERVER) $(TARGET_HCP) $(OBJS) $(DEPS)
 	rm -f hercules mockules/mockules
 	docker container rm -f hercules-builder || true
 	docker rmi hercules-builder || true

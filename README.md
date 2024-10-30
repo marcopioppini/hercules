@@ -114,11 +114,23 @@ You can then build Hercules, either using Docker or natively.
 
 Hercules can be built from source using Docker and the provided `Dockerfile` which prepares the required build environment.
 
-To build Hercules using Docker, simply run `make`. This will build the server and monitor executables.
-With `sudo make install`, you can then install Hercules to your machine.
-By default, this will install Hercules to `/usr/local/`.
+To build Hercules using Docker, simply run `make docker_all`.
+This will build the server and monitor executables, as well as the `hcp` tool.
 
-### TODO Native Build
+> You may prefix any of the makefile targets with `docker_` to use Docker
+> instead of your native environment.
+
+### Native Build
+
+To build Hercules without Docker, you must have its dependencies installed.
+
+To build Hercules, run `make all`.
+This will build the server and monitor executables, as well as the `hcp` tool.
+
+## Installing
+
+Once built, you can install Hercules to your machine with `sudo make install`.
+By default, this will install Hercules to `/usr/local/`.
 
 ## Debugging and Development
 
