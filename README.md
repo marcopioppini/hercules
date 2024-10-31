@@ -122,7 +122,20 @@ This will build the server and monitor executables, as well as the `hcp` tool.
 
 ### Native Build
 
-To build Hercules without Docker, you must have its dependencies installed.
+To build Hercules without Docker, you must have the following installed:
+
++ llvm
++ clang
++ git
++ Go >= 1.22
++ libz
++ libelf
++ Linux kernel headers
++ gcc-multilib
+
+On Ubuntu you can install the required packages as follows:
+`# apt install build-essential llvm clang git golang libz-dev libelf-dev
+linux-headers-generic gcc-multilib`
 
 To build Hercules, run `make all`.
 This will build the server and monitor executables, as well as the `hcp` tool.
