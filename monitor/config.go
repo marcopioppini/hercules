@@ -121,11 +121,24 @@ const defaultMonitorHTTPS = "disabled"
 
 // Decode the config file and fill in any unspecified values with defaults.
 // Will exit if an error occours or a required value is not specified.
-func readConfig(configFile string) (MonitorConfig, PathRules) {
+func readConfig(cmdline string) (MonitorConfig, PathRules) {
 	var config MonitorConfig
-	meta, err := toml.DecodeFile(configFile, &config)
+	var meta toml.MetaData
+	var err error
+	if cmdline != "" {
+		meta, err = toml.DecodeFile(cmdline, &config)
+	} else {
+		for _, c := range []string{cwdConfigPath, defaultConfigPath} {
+			meta, err = toml.DecodeFile(c, &config)
+			if err == nil || !os.IsNotExist(err) {
+				fmt.Printf("Using configuration file %v\n", c)
+				break
+			}
+		}
+	}
+
 	if err != nil {
-		fmt.Printf("Error reading configuration file (%v): %v\n", configFile, err)
+		fmt.Printf("Error reading configuration file: %v\n", err)
 		os.Exit(1)
 	}
 	if len(meta.Undecoded()) > 0 {

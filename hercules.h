@@ -33,7 +33,10 @@
 // If you make incompatible changes to the headers or Hercules' behaviour,
 // change this version to avoid incompatible servers interacting.
 #define HERCULES_HEADER_VERSION 1
-#define HERCULES_DEFAULT_CONFIG_PATH "hercules.conf"
+// Default config file
+#define HERCULES_DEFAULT_CONFIG_PATH "/usr/local/etc/hercules.conf"
+// Config file in current working dir
+#define HERCULES_CWD_CONFIG_PATH "hercules.conf"
 #define HERCULES_MAX_HEADERLEN 256
 // NOTE: The maximum packet size is limited by the size of a single XDP frame
 // (page size - metadata overhead). This is around 3500, but the exact value

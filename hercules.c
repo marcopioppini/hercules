@@ -3875,15 +3875,24 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Open and parse config file
+	// We use the command line option, if supplied, otherwise look for
+	// the files specified by HERCULES_CWD_CONFIG_PATH,
+	// and then HERCULES_DEFAULT_CONFIG_PATH.
 	FILE *config_file;
 	char errbuf[200];
 	if (config_path != NULL) {
 		config_file = fopen(config_path, "r");
-		debug_printf("Using config file %s", config_path);
+		fprintf(stderr, "Using config file %s\n", config_path);
 	} else {
-		config_file = fopen(HERCULES_DEFAULT_CONFIG_PATH, "r");
-		debug_printf("Using default config file %s",
-					 HERCULES_DEFAULT_CONFIG_PATH);
+		char *config_paths[2] = {HERCULES_CWD_CONFIG_PATH,
+								 HERCULES_DEFAULT_CONFIG_PATH};
+		for (int p = 0; p < 2; p++) {
+			config_file = fopen(config_paths[p], "r");
+			if (config_file) {
+				fprintf(stderr, "Using config file %s\n", config_paths[p]);
+				break;
+			}
+		}
 	}
 	if (!config_file) {
 		fprintf(stderr, "Cannot open config file!\n");

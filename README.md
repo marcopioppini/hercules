@@ -183,7 +183,7 @@ See the [developer guide](doc/developers.md).
 Depending on your performance requirements and your specific bottlenecks, the following configuration options may help improve performance:
 
 - On machines with multiple NUMA nodes, it may be beneficial to bind the Hercules server process to CPU cores "closer" to the network card. 
-  To do so, install the `numactl` utility and adjust the file `/usr/local/lib/systemd/system/hercules-server.service` so it reads `ExecStart=/usr/bin/numactl -l --cpunodebind=netdev:<device> -- /home/marco/hercules-server`, replacing `<device>` with your network interface.
+  To do so, install the `numactl` utility and adjust the file `/usr/local/lib/systemd/system/hercules-server.service` so it reads `ExecStart=/usr/bin/numactl -l --cpunodebind=netdev:<device> -- /usr/local/bin/hercules-server`, replacing `<device>` with your network interface.
 
 - Setting the option `XDPZeroCopy = true` can substantially improve performance, but whether it is supported depends on the combination of network card and driver in your setup.
 

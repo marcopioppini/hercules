@@ -21,6 +21,7 @@ import "C"
 
 const HerculesMaxPktsize = C.HERCULES_MAX_PKTSIZE
 const defaultConfigPath = C.HERCULES_DEFAULT_CONFIG_PATH
+const cwdConfigPath = C.HERCULES_CWD_CONFIG_PATH
 const defaultMonitorSocket = C.HERCULES_DEFAULT_MONITOR_SOCKET
 
 // Select paths and serialize headers for a given transfer
@@ -110,7 +111,7 @@ var startupVersion string
 func main() {
 	fmt.Printf("Starting Hercules monitor [%v]\n", startupVersion)
 	var configFile string
-	flag.StringVar(&configFile, "c", defaultConfigPath, "Path to the monitor configuration file")
+	flag.StringVar(&configFile, "c", "", "Path to the configuration file")
 	flag.Parse()
 
 	config, pathRules = readConfig(configFile)
