@@ -28,6 +28,11 @@
 #include "packet.h"
 #include "errors.h"
 
+// The version is included in the packet headers.
+// We check whether the version of received packets matches ours.
+// If you make incompatible changes to the headers or Hercules' behaviour,
+// change this version to avoid incompatible servers interacting.
+#define HERCULES_HEADER_VERSION 1
 #define HERCULES_DEFAULT_CONFIG_PATH "hercules.conf"
 #define HERCULES_MAX_HEADERLEN 256
 // NOTE: The maximum packet size is limited by the size of a single XDP frame
