@@ -4,8 +4,8 @@ BindsTo=hercules-monitor.service
 After=hercules-monitor.service
 
 [Service]
-ExecStart=/home/marco/hercules-server
+ExecStart=/usr/local/bin/hercules-server
 StandardOutput=syslog
 StandardError=syslog
-WorkingDirectory=/home/marco
+WorkingDirectory=/tmp/
 TimeoutSec=5
