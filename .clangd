@@ -1,0 +1,2 @@
+Diagnostics:
+    Suppress: atomic_op_needs_atomic
