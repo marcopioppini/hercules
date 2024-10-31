@@ -25,10 +25,10 @@
 
 /** Simple bit-set that keeps track of number of elements in the set. */
 struct bitset {
-	unsigned int *bitmap;
+	_Atomic unsigned int *bitmap;
 	u32 num;
-	u32 num_set;
-	u32 max_set;
+	_Atomic u32 num_set;
+	_Atomic u32 max_set;
 	pthread_spinlock_t lock;
 };
 

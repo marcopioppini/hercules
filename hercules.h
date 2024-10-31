@@ -67,7 +67,7 @@ struct receiver_state_per_path {
 	struct bitset seq_rcvd;
 	sequence_number nack_end;
 	sequence_number prev_nack_end;
-	u64 rx_npkts;
+	_Atomic u64 rx_npkts;
 };
 
 // Information specific to the receiving side of a session
@@ -101,7 +101,7 @@ struct receiver_state {
 	u32 ack_nr;
 	u64 next_nack_round_start;
 	u64 next_ack_round_start;
-	u8 num_tracked_paths;
+	_Atomic u8 num_tracked_paths;
 	bool is_pcc_benchmark;
 	struct receiver_state_per_path path_state[256];
 	u16 src_port;	 // The UDP/SCION port to use when sending packets (LE)
@@ -191,15 +191,15 @@ struct hercules_session {
 	struct send_queue *send_queue;
 
 	u64 last_pkt_sent;		//< Used for HS retransmit interval
-	u64 last_pkt_rcvd;		//< Used for timeout detection
-	u64 last_new_pkt_rcvd;	//< If we only receive packets containing
+	_Atomic u64 last_pkt_rcvd;		//< Used for timeout detection
+	_Atomic u64 last_new_pkt_rcvd;	//< If we only receive packets containing
 							// already-seen chunks for a while something is
 							// probably wrong. (Only used by receiver)
 	u64 last_path_update;
 	u64 last_monitor_update;
 
-	size_t rx_npkts;  // Number of sent/received packets (for stats)
-	size_t tx_npkts;
+	_Atomic size_t rx_npkts;  // Number of sent/received packets (for stats)
+	_Atomic size_t tx_npkts;
 
 	struct hercules_app_addr peer;	//< UDP/SCION address of peer (big endian)
 	u64 jobid;						//< The monitor's ID for this job

@@ -36,8 +36,8 @@ _Static_assert(sizeof(struct send_queue_unit) == 64, "struct send_queue_unit sho
 struct send_queue {
 	struct send_queue_unit *units;
 	u32 size;
-	u32 head;
-	u32 tail;
+	_Atomic u32 head;
+	_Atomic u32 tail;
 	void *units_base;
 };
 
@@ -60,6 +60,6 @@ bool send_queue_pop(struct send_queue *queue, struct send_queue_unit *unit);
 // Pops a send_queue_unit off the queue and fills it into *unit.
 // If the queue is empty and block is true, this function blocks until some send_queue_unit is available.
 // As soon as *block is false, send_queue_pop_wait stops blocking.
-void send_queue_pop_wait(struct send_queue *queue, struct send_queue_unit *unit, bool *block);
+void send_queue_pop_wait(struct send_queue *queue, struct send_queue_unit *unit, _Atomic bool *block);
 
 #endif //__HERCULES_SEND_QUEUE_H__

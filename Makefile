@@ -2,10 +2,10 @@ TARGET_SERVER := hercules-server
 TARGET_MONITOR := hercules-monitor
 TARGET_HCP := hcp/hcp
 
-CC := gcc
+CC := clang
 CFLAGS = -O3 -g3 -std=gnu11 -D_GNU_SOURCE -Itomlc99
 # CFLAGS += -DNDEBUG
-# CFLAGS += -Wall -Wextra
+CFLAGS += -Wall -Wextra
 
 ## Options:
 # Print rx/tx session stats

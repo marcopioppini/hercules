@@ -76,7 +76,7 @@ bool send_queue_pop(struct send_queue *queue, struct send_queue_unit *unit)
 }
 
 // blocks if queue empty
-void send_queue_pop_wait(struct send_queue *queue, struct send_queue_unit *unit, bool *block)
+void send_queue_pop_wait(struct send_queue *queue, struct send_queue_unit *unit, _Atomic bool *block)
 {
 	while(!send_queue_pop(queue, unit)) {
 		if(block && !atomic_load(block)) {

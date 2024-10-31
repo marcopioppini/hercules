@@ -1898,7 +1898,7 @@ static char *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_id
 }
 
 #ifdef RANDOMIZE_FLOWID
-static short flowIdCtr = 0;
+static _Atomic short flowIdCtr = 0;
 #endif
 #ifdef RANDOMIZE_UNDERLAY_SRC
 static short src_port_ctr = 0;
@@ -2572,7 +2572,7 @@ static char *tx_mmap(char *fname, char *dstname, size_t *filesize,
 
 /// PCC
 #define NACK_TRACE_SIZE (1024*1024)
-static u32 nack_trace_count = 0;
+static _Atomic u32 nack_trace_count = 0;
 static struct {
 	long long sender_timestamp;
 	long long receiver_timestamp;
@@ -2592,7 +2592,7 @@ static void nack_trace_push(u64 timestamp, u32 nr) {
 }
 
 #define PCC_TRACE_SIZE (1024*1024)
-static u32 pcc_trace_count = 0;
+static _Atomic u32 pcc_trace_count = 0;
 static struct {
 	u64 time;
 	sequence_number range_start, range_end, mi_min, mi_max;

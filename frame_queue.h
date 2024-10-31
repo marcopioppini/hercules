@@ -22,8 +22,8 @@
 struct frame_queue {
 	// reduce the memory footprint by using 16 bit ints instead of full 64 bits
 	u16 *addrs;
-	u64 prod;
-	u64 cons;
+	_Atomic u64 prod;
+	_Atomic u64 cons;
 	u16 size;
 	u16 index_mask;
 };
