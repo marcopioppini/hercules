@@ -7,6 +7,10 @@ FROM ubuntu:focal
 ARG UID=1001
 ARG GID=1001
 
+# to avoid interactive timezone query
+ENV TZ Europe/Zürich
+ENV DEBIAN_FRONTEND noninteractive
+
 # install cgo-related dependencies
 RUN set -eux; \
 	apt-get update; \
@@ -31,10 +35,15 @@ RUN set -eux; \
 		libpcap-dev \
 		gcc-multilib \
 		build-essential \
+        ruby \
+        rpm \
 	; \
 	rm -rf /var/lib/apt/lists/*
 
 ENV PATH /usr/local/go/bin:$PATH
+
+RUN gem install dotenv -v 2.8.1
+RUN gem install fpm
 
 ENV GOLANG_VERSION 1.22.8
 

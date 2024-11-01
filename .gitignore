@@ -6,3 +6,7 @@ hercules-monitor
 *.d
 monitor/monitor
 mockules/mockules
+pkgroot
+*.deb
+*.rpm
+*.tar

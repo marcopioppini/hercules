@@ -56,6 +56,10 @@ install: all
 	install -d $(DESTDIR)$(PREFIX)/share/doc/hercules/
 	install hercules.conf.sample $(DESTDIR)$(PREFIX)/share/doc/hercules/
 
+	install -d $(DESTDIR)$(PREFIX)/lib/systemd/system/
+	install dist/hercules-monitor.service $(DESTDIR)$(PREFIX)/lib/systemd/system/
+	install dist/hercules-server.service $(DESTDIR)$(PREFIX)/lib/systemd/system/
+
 	install -d $(DESTDIR)$(PREFIX)/share/man/man1/
 	install doc/hercules-server.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	install doc/hercules-monitor.1 $(DESTDIR)$(PREFIX)/share/man/man1/
@@ -134,11 +138,6 @@ builder_image:
 	@docker images | grep hercules-builder -q || \
 		docker build -t hercules-builder --build-arg UID=$(shell id -u) --build-arg GID=$(shell id -g) .
 
-clean:
-	rm -rf $(TARGET_MONITOR) $(TARGET_SERVER) $(TARGET_HCP) $(OBJS) $(DEPS)
-	rm -f hercules mockules/mockules
-	docker container rm -f hercules-builder || true
-	docker rmi hercules-builder || true
 
 MANFILES := $(wildcard doc/*.[157]) hcp/hcp.1
 MDFILES := $(addsuffix .md,$(MANFILES))
@@ -149,5 +148,43 @@ MDFILES := $(addsuffix .md,$(MANFILES))
 	mandoc -T markdown -W warning,stop $< > $@
 
 docs: $(MDFILES)
+
+# Packages
+# Relies on the fpm tool to build packages.
+# More arguments to fpm are specified in the file .fpm
+# The package is called hercules-server, because there is already
+# one named hercules in Ubuntu's default repos.
+PKG_VERSION ?= $(shell git describe --tags 2>/dev/null)
+
+.PHONY: packages pkg_deb pkg_rpm pkg_tar
+packages: pkg_deb pkg_rpm pkg_tar
+pkg_deb:
+	@$(if $(PKG_VERSION),,$(error PKG_VERSION not set and no git tag!))
+	@echo Packaging version $(PKG_VERSION)
+	mkdir pkgroot
+	DESTDIR=pkgroot $(MAKE) install
+	fpm -t deb --version $(PKG_VERSION)
+	rm -rf pkgroot
+pkg_rpm:
+	@$(if $(PKG_VERSION),,$(error PKG_VERSION not set and no git tag!))
+	@echo Packaging version $(PKG_VERSION)
+	mkdir pkgroot
+	DESTDIR=pkgroot $(MAKE) install
+	fpm -t rpm --version $(PKG_VERSION)
+	rm -rf pkgroot
+pkg_tar:
+	@$(if $(PKG_VERSION),,$(error PKG_VERSION not set and no git tag!))
+	@echo Packaging version $(PKG_VERSION)
+	mkdir pkgroot
+	DESTDIR=pkgroot $(MAKE) install
+	fpm -t tar --version $(PKG_VERSION)
+	rm -rf pkgroot
+
+clean:
+	rm -rf $(TARGET_MONITOR) $(TARGET_SERVER) $(TARGET_HCP) $(OBJS) $(DEPS)
+	rm -rf pkgroot *.deb *.rpm *.tar
+	rm -f hercules mockules/mockules
+	docker container rm -f hercules-builder || true
+	docker rmi hercules-builder || true
 
 -include $(DEPS)

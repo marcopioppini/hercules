@@ -27,8 +27,15 @@ See the main readme for how to build Hercules from source.
 - The `xdpdump` tool
   (<https://github.com/xdp-project/xdp-tools/tree/master/xdp-dump>) is useful
   for seeing packets received via XDP. Similar to `tcpdump`, but for XDP.
+  
+# Packaging
 
-## Docs
+The `fpm` tool is used to create packages.
+You will need to install ruby and `gem install fpm`.
+Then, to create `deb`, `rpm`, and `tar` files: `make packages`
+(or `make docker_packages` to use the Docker environment)
+
+# Docs
 Documentation pertaining to the server is located in the `doc/` directory, and
 in `hcp/` for `hcp`.
 If you make changes to the manual files, run `make docs` to rebuild the

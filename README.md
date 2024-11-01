@@ -148,6 +148,7 @@ By default, this will install Hercules to `/usr/local/`.
 ## Debugging and Development
 
 See the [developer guide](doc/developers.md).
+The file also contains instructions on how to build packages.
 
 ## Troubleshooting
 

@@ -1,0 +1,6 @@
+-s dir
+--name hercules-server
+--description "Hercules file transfer server"
+--url "https://github.com/netsec-ethz/hercules"
+--maintainer "Network Security Group, ETH Zuerich"
+-C pkgroot
