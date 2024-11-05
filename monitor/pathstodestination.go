@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	log "github.com/inconshreveable/log15"
 	"github.com/scionproto/scion/pkg/snet"
@@ -106,7 +107,7 @@ func (ptd *PathsToDestination) choosePaths() bool {
 		maxPayloadlen := HerculesMaxPktsize
 		for _, path := range ptd.paths {
 			if !path.enabled {
-				continue;
+				continue
 			}
 			pathMTU := int(path.path.Metadata().MTU)
 			underlayHeaderLen, scionHeaderLen := getPathHeaderlen(path.path)
@@ -138,29 +139,45 @@ func (ptd *PathsToDestination) choosePaths() bool {
 func (ptd *PathsToDestination) chooseNewPaths(availablePaths []PathWithInterface) bool {
 	updated := false
 
-	// pick paths
-	picker := makePathPicker(ptd.dst.pathSpec, availablePaths, ptd.dst.numPaths)
+	// Because this path selection takes too long when many paths are available
+	// (tens of seconds), we run it with a timeout and fall back to using the
+	// first few paths if it takes too long.
+	ch := make(chan int, 1)
+	timeout, cancel := context.WithTimeout(context.Background(), time.Second*1)
+	defer cancel()
+
 	var pathSet []PathWithInterface
-	disjointness := 0 // negative number denoting how many network interfaces are shared among paths (to be maximized)
-	maxRuleIdx := 0   // the highest index of a PathSpec that is used (to be minimized)
-	for i := ptd.dst.numPaths; i > 0; i-- {
-		picker.reset(i)
-		for picker.nextRuleSet() { // iterate through different choices of PathSpecs to use
-			if pathSet != nil && maxRuleIdx < picker.maxRuleIdx() { // ignore rule set, if path set with lower maxRuleIndex is known
-				continue // due to the iteration order, we cannot break here
-			}
-			for picker.nextPick() { // iterate through different choices of paths obeying the rules of the current set of PathSpecs
-				curDisjointness := picker.disjointnessScore()
-				if pathSet == nil || disjointness < curDisjointness { // maximize disjointness
-					disjointness = curDisjointness
-					maxRuleIdx = picker.maxRuleIdx()
-					pathSet = picker.getPaths()
+	go func() { // pick paths
+		picker := makePathPicker(ptd.dst.pathSpec, availablePaths, ptd.dst.numPaths)
+		disjointness := 0 // negative number denoting how many network interfaces are shared among paths (to be maximized)
+		maxRuleIdx := 0   // the highest index of a PathSpec that is used (to be minimized)
+		for i := ptd.dst.numPaths; i > 0; i-- {
+			picker.reset(i)
+			for picker.nextRuleSet() { // iterate through different choices of PathSpecs to use
+				if pathSet != nil && maxRuleIdx < picker.maxRuleIdx() { // ignore rule set, if path set with lower maxRuleIndex is known
+					continue // due to the iteration order, we cannot break here
+				}
+				for picker.nextPick() { // iterate through different choices of paths obeying the rules of the current set of PathSpecs
+					curDisjointness := picker.disjointnessScore()
+					if pathSet == nil || disjointness < curDisjointness { // maximize disjointness
+						disjointness = curDisjointness
+						maxRuleIdx = picker.maxRuleIdx()
+						pathSet = picker.getPaths()
+					}
 				}
 			}
+			if pathSet != nil { // if no path set of size i found, try with i-1
+				break
+			}
 		}
-		if pathSet != nil { // if no path set of size i found, try with i-1
-			break
-		}
+		ch <- 1
+	}()
+
+	select {
+	case <-timeout.Done():
+		log.Warn(fmt.Sprintf("[Destination %s] Path selection took too long! Using first few paths", ptd.dst.hostAddr.IA))
+		pathSet = availablePaths
+	case <-ch:
 	}
 
 	log.Info(fmt.Sprintf("[Destination %s] using %d paths:", ptd.dst.hostAddr.IA, len(pathSet)))
