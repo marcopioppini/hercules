@@ -51,6 +51,14 @@ The options are as follows:
 > *1s*,
 > that is, poll every second.
 
+**-l** *payload\_length*
+
+> Manually set the payload size to use for this transfer.
+> This is useful if Hercules' automatic selection does not work, for example,
+> if a path advertises a MTU larger than what it really supports.
+> Note that the packet length includes the headers in addition to the payload,
+> so the payload length must set to a value smaller than the MTU.
+
 **-n**
 
 > Do not ask the server for the file's total size before submitting the transfer.

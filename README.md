@@ -177,7 +177,7 @@ The file also contains instructions on how to build packages.
 
   Hercules attempts to automatically pick the right packet size based on the MTU in the SCION path metadata and the sending interface.
   In some cases, however, this information is not accurate and the really supported MTU is smaller.
-  To work around this, you can manually specify the payload size to be used, e.g., by supplying the `TODO` option to `hcp`, or by specifying the payload on a per-destination basis in the configuration file.
+  To work around this, you can manually specify the payload size to be used, e.g., by supplying the `-l` option to `hcp`, or by specifying the payload length on a per-destination basis in the configuration file.
   
 ## Performance Configuration
 

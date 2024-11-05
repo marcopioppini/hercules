@@ -48,6 +48,12 @@ The argument is a go duration string.
 The default polling frequency is
 .Ar 1s ,
 that is, poll every second.
+.It Fl l Ar payload_length
+Manually set the payload size to use for this transfer.
+This is useful if Hercules' automatic selection does not work, for example,
+if a path advertises a MTU larger than what it really supports.
+Note that the packet length includes the headers in addition to the payload,
+so the payload length must set to a value smaller than the MTU.
 .It Fl n
 Do not ask the server for the file's total size before submitting the transfer.
 With this option set, the progress bar and time estimates are not shown.

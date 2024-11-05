@@ -34,7 +34,7 @@ func main() {
 	poll_interval := flag.Duration("i", time.Second*1, "Poll frequency")
 	no_stat_file := flag.Bool("n", false, "Don't stat source file")
 	show_version := flag.Bool("version", false, "Print version and exit")
-	// TODO payload size
+	payload_len := flag.Int("l", 0, "Manually set payload length")
 
 	flag.Parse()
 
@@ -72,7 +72,7 @@ func main() {
 	signal.Notify(cancelChan, os.Kill)
 	signal.Notify(cancelChan, os.Interrupt)
 
-	job_id, err := submit(src_api, src_path, dst_addr, dst_path)
+	job_id, err := submit(src_api, src_path, dst_addr, dst_path, *payload_len)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(2)
@@ -125,7 +125,9 @@ func main() {
 
 		if info.state == C.SESSION_STATE_DONE {
 			finished = true
-			bar.Finish()
+			if info.error == C.SESSION_ERROR_OK {
+				bar.Finish()
+			}
 			bar.Exit()
 			fmt.Println()
 			if info.error != C.SESSION_ERROR_OK {
@@ -137,8 +139,11 @@ func main() {
 
 }
 
-func submit(src_api, src_path, dst_addr, dst_path string) (int, error) {
+func submit(src_api, src_path, dst_addr, dst_path string, payload_len int) (int, error) {
 	submit_url := fmt.Sprintf("http://%s/submit?file=%s&dest=%s&destfile=%s", src_api, src_path, dst_addr, dst_path)
+	if payload_len != 0 {
+		submit_url += fmt.Sprintf("&payloadlen=%d", payload_len)
+	}
 	submit_response, err := http.Get(submit_url)
 	if err != nil {
 		return 0, err
