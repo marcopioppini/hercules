@@ -70,6 +70,7 @@ type MonitorConfig struct {
 	// The following are not used by the monitor, they are listed here for completeness
 	ServerSocket    string
 	DropUser        string
+	ChrootDir		string
 	XDPZeroCopy     bool
 	Queue           int
 	ConfigureQueues bool

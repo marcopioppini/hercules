@@ -23,6 +23,12 @@ MonitorHTTPS = "disabled"
 # Drop privileges to the specified user after startup
 DropUser = "_hercules"
 
+# Chroot to the specified path after startup
+# If set, the working directory will also be set to this path.
+# Note that this means that the file paths supplied by users when submitting
+# transfers will be interpreted relative to this directory.
+ChrootDir = "/mnt/data/hercules"
+
 # Path to the server's certificate and key for TLS
 TLSCert = "cert.pem"
 TLSKey = "key.pem"

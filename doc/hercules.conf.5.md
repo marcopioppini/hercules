@@ -36,7 +36,9 @@ It is
 *strongly*
 recommended to also set the
 **DropUser**
-option, described below.
+and/or
+**ChrootDir**
+options, described below.
 See
 *CAVEATS*
 for more information.
@@ -89,6 +91,19 @@ The following general configuration options are available:
 > for more information.
 
 > Example: DropUser = "\_hercules"
+
+**ChrootDir**=*str*
+
+> If specified, the server process' root directory and working directory will be
+> set to this path after startup.
+> Note that it is possible to escape from a chroot under some circumstances;
+> see
+> chroot(2)
+> for more information.
+> When setting this option, note that the file paths supplied by users will be
+> interpreted relative to this new directory.
+
+> Example: DropUser = "/mnt/data/"
 
 **EnablePCC**=*bool*
 
@@ -293,6 +308,8 @@ file specified by the user and no authentication of the user is performed,
 a user may copy arbitrary system files to the destination server.
 To mitigate these issues, it is recommended that you set the
 **DropUser**
-option described above.
+and/or
+**ChrootDir**
+options described above.
 
 Void Linux - October 29, 2024

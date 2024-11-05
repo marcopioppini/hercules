@@ -3781,6 +3781,20 @@ void hercules_main(struct hercules_server *server) {
 	  exit(1);
   }
 
+  // Chroot
+  if (server->config.chroot_dir){
+	  ret = chroot(server->config.chroot_dir);
+	  if (ret != 0) {
+		  fprintf(stderr, "Error in chroot\n");
+		  exit(1);
+	  }
+	  ret = chdir("/");
+	  if (ret != 0) {
+		  fprintf(stderr, "Error changing to chroot dir\n");
+		  exit(1);
+	  }
+  }
+
   // Drop privileges
   ret = setgid(server->config.drop_gid);
   if (ret != 0) {
@@ -3946,6 +3960,17 @@ int main(int argc, char *argv[]) {
 				"not secure!\n"
 				"See the documentation for more information.\n");
 	}
+
+	toml_datum_t chroot_dir = toml_string_in(conf, "ChrootDir");
+	if (chroot_dir.ok) {
+		config.chroot_dir = chroot_dir.u.s;
+	} else {
+		if (toml_key_exists(conf, "ChrootDir")) {
+			fprintf(stderr, "Error parsing ChrootDir\n");
+			exit(1);
+		}
+	}
+
 	// Listening address
 	toml_datum_t listen_addr = toml_string_in(conf, "ListenAddress");
 	if (!listen_addr.ok) {

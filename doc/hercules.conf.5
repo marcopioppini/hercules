@@ -35,7 +35,9 @@ It is
 .Em strongly
 recommended to also set the
 .Ic DropUser
-option, described below.
+and/or
+.Ic ChrootDir
+options, described below.
 See
 .Sx CAVEATS
 for more information.
@@ -77,6 +79,17 @@ See
 for more information.
 .Pp
 Example: DropUser = "_hercules"
+.It Ic ChrootDir Ns = Ns Ar str
+If specified, the server process' root directory and working directory will be
+set to this path after startup.
+Note that it is possible to escape from a chroot under some circumstances;
+see
+.Xr chroot 2
+for more information.
+When setting this option, note that the file paths supplied by users will be
+interpreted relative to this new directory.
+.Pp
+Example: DropUser = "/mnt/data/"
 .It Ic EnablePCC Ns = Ns Ar bool
 Setting this option to
 .Ar false
@@ -260,4 +273,6 @@ file specified by the user and no authentication of the user is performed,
 a user may copy arbitrary system files to the destination server.
 To mitigate these issues, it is recommended that you set the
 .Ic DropUser
-option described above.
+and/or
+.Ic ChrootDir
+options described above.

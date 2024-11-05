@@ -234,6 +234,7 @@ struct hercules_config {
 	char *server_socket;
 	uid_t drop_uid;
 	gid_t drop_gid;
+	char *chroot_dir;
 	u32 xdp_flags;
 	int xdp_mode;
 	int queue;

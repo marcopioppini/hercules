@@ -64,8 +64,8 @@ To get started, filling in the following information is required:
 
 In both cases you should replace the entire string, including the `replaceme//` markers.
 
-While the above two settings are sufficient to run Hercules, we **strongly recommend** additionally setting the option `DropUser`.
-Hercules will then drop its privileges to the specified user after startup and thus use the provided user's permissions for filesystem access.
+While the above two settings are sufficient to run Hercules, we **strongly recommend** additionally setting the options `DropUser` and/or `ChrootDir`.
+Hercules will then drop its privileges to the specified user after startup and thus use the provided user's permissions and path to restrict filesystem access.
 Hence, you should ensure the specified user has the appropriate read/write permissions on the paths you intend to send from/receive to.
 If you omit this option, Hercules will run as root.
 See [the configuration documentation](doc/hercules.conf.5.md#CAVEATS) for a discussion of the security implications.
