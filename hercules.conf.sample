@@ -67,6 +67,12 @@ RateLimit = 100000
 # The number of RX/TX worker threads to use
 NumThreads = 2
 
+# Run the server in receive-only mode, do not start the TX threads.
+RxOnly = true
+
+# Run the server in send-only mode, do not start the RX threads.
+TxOnly = true
+
 # The number and choice of paths can be overridden on a destination-host
 # or destination-AS basis. In case both an AS and Host rule match, the Host
 # rule takes precedence.

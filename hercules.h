@@ -236,6 +236,8 @@ struct hercules_config {
 	bool configure_queues;
 	bool enable_pcc;
 	int rate_limit;	 // Sending rate limit, only used when PCC is enabled
+	bool tx_only;	 // Run in send-only mode, do not start RX threads.
+	bool rx_only;	 // Run in receive-only mode, do not start TX threads.
 	int n_threads;	 // Number of RX/TX worker threads
 	struct hercules_app_addr local_addr;
 	u16 port_min;  // Lowest port on which to accept packets (in HOST

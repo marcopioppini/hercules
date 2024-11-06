@@ -190,3 +190,5 @@ Depending on your performance requirements and your specific bottlenecks, the fo
 
 - Increasing the number of worker threads via the option `NumThreads` can also improve performance.
 
+- Especially on machines with few CPU cores the options `TxOnly` and `RxOnly` will improve performance.
+

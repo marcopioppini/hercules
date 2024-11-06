@@ -98,6 +98,7 @@ func main() {
 		case <-cancelChan:
 			fmt.Println("Cancelling transfer, C-c again to quit without waiting")
 			cancel(src_api, job_id)
+			bar.Describe("Waiting for server to confirm cancellation")
 			signal.Reset()
 		default:
 		}

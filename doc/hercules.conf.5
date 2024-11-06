@@ -116,6 +116,14 @@ Hercules spawns other threads, too, so this is
 the total number of threads used by Hercules.
 The default value is
 .Ar 1 .
+.It Ic RxOnly Ns = Ns Ar bool
+Run the server in receive-only mode, do not start the TX threads.
+The default value is
+.Ar false .
+.It Ic TxOnly Ns = Ns Ar bool
+Run the server in send-only mode, do not start the RX threads.
+The default value is
+.Ar false .
 .It Ic XDPZeroCopy Ns = Ns Ar bool
 If your combination of NIC/drivers supports XDP in zero-copy mode,
 enabling it here will likely improve performance.

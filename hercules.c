@@ -3789,41 +3789,56 @@ void hercules_main(struct hercules_server *server) {
     fprintf(stderr, "Error in setuid\n%s\n", strerror(errno));
     exit(1);
   }
-  // Start the NACK sender thread
-  debug_printf("starting NACK trickle thread");
-  pthread_t trickle_nacks = start_thread(NULL, rx_trickle_nacks, server);
 
-  // Start the ACK sender thread
-  debug_printf("starting ACK trickle thread");
-  pthread_t trickle_acks = start_thread(NULL, rx_trickle_acks, server);
-
-
-  // Start the RX worker threads
+  pthread_t trickle_nacks;
+  pthread_t trickle_acks;
   pthread_t rx_workers[server->config.n_threads];
-  for (int i = 0; i < server->config.n_threads; i++) {
-    debug_printf("starting thread rx_p %d", i);
-    rx_workers[i] = start_thread(NULL, rx_p, server->worker_args[i]);
+  if (!server->config.tx_only) {
+	  // Start the NACK sender thread
+	  debug_printf("starting NACK trickle thread");
+	  trickle_nacks = start_thread(NULL, rx_trickle_nacks, server);
+
+	  // Start the ACK sender thread
+	  debug_printf("starting ACK trickle thread");
+	  trickle_acks = start_thread(NULL, rx_trickle_acks, server);
+
+	  // Start the RX worker threads
+	  for (int i = 0; i < server->config.n_threads; i++) {
+		  debug_printf("starting thread rx_p %d", i);
+		  rx_workers[i] = start_thread(NULL, rx_p, server->worker_args[i]);
+	  }
   }
 
-  // Start the TX worker threads
+  pthread_t tx_p_thread;
   pthread_t tx_workers[server->config.n_threads];
-  for (int i = 0; i < server->config.n_threads; i++) {
-    debug_printf("starting thread tx_send_p %d", i);
-    tx_workers[i] = start_thread(NULL, tx_send_p, server->worker_args[i]);
-  }
+  if (!server->config.rx_only) {
+	  // Start the TX worker threads
+	  for (int i = 0; i < server->config.n_threads; i++) {
+		  debug_printf("starting thread tx_send_p %d", i);
+		  tx_workers[i] = start_thread(NULL, tx_send_p, server->worker_args[i]);
+	  }
 
-  // Start the TX scheduler thread
-  debug_printf("starting thread tx_p");
-  pthread_t tx_p_thread = start_thread(NULL, tx_p, server);
+	  // Start the TX scheduler thread
+	  debug_printf("starting thread tx_p");
+	  tx_p_thread = start_thread(NULL, tx_p, server);
+  }
 
   events_p(server);
 
-  join_thread(server, trickle_acks);
-  join_thread(server, trickle_nacks);
-  join_thread(server, tx_p_thread);
-  for (int i = 0; i < server->config.n_threads; i++){
-	  join_thread(server, rx_workers[i]);
-	  join_thread(server, tx_workers[i]);
+  if (!server->config.tx_only) {
+	  join_thread(server, trickle_acks);
+	  join_thread(server, trickle_nacks);
+  }
+  if (!server->config.rx_only) {
+	  join_thread(server, tx_p_thread);
+  }
+  for (int i = 0; i < server->config.n_threads; i++) {
+	  if (!server->config.tx_only) {
+		  join_thread(server, rx_workers[i]);
+	  }
+	  if (!server->config.rx_only) {
+		  join_thread(server, tx_workers[i]);
+	  }
   }
 
   xdp_teardown(server);
@@ -4024,6 +4039,30 @@ int main(int argc, char *argv[]) {
 			fprintf(stderr, "Error parsing XDPZeroCopy\n");
 			exit(1);
 		}
+	}
+
+	// RX/TX only
+	toml_datum_t tx_only = toml_bool_in(conf, "TxOnly");
+	if (tx_only.ok) {
+		config.tx_only = tx_only.u.b;
+	} else {
+		if (toml_key_exists(conf, "TxOnly")) {
+			fprintf(stderr, "Error parsing TxOnly\n");
+			exit(1);
+		}
+	}
+	toml_datum_t rx_only = toml_bool_in(conf, "RxOnly");
+	if (rx_only.ok) {
+		config.rx_only = rx_only.u.b;
+	} else {
+		if (toml_key_exists(conf, "RxOnly")) {
+			fprintf(stderr, "Error parsing RxOnly\n");
+			exit(1);
+		}
+	}
+	if (config.tx_only && config.rx_only) {
+		fprintf(stderr, "Error: Both TxOnly and RxOnly set");
+		exit(1);
 	}
 
 	// Worker threads

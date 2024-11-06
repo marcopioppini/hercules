@@ -137,6 +137,18 @@ The following general configuration options are available:
 > The default value is
 > *1*.
 
+**RxOnly**=*bool*
+
+> Run the server in receive-only mode, do not start the TX threads.
+> The default value is
+> *false*.
+
+**TxOnly**=*bool*
+
+> Run the server in send-only mode, do not start the RX threads.
+> The default value is
+> *false*.
+
 **XDPZeroCopy**=*bool*
 
 > If your combination of NIC/drivers supports XDP in zero-copy mode,
