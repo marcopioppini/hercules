@@ -1191,7 +1191,8 @@ static char *rx_mmap(char *index, size_t index_size, size_t total_filesize) {
 				f = open((char *)entry->path, O_RDWR);
 			}
 			if (f == -1) {
-				fprintf(stderr, "Error opening %s\n", (char *)entry->path);
+				fprintf(stderr, "Error opening %s: %s\n", (char *)entry->path,
+						strerror(errno));
 				encountered_err = true;
 				break;
 			}
@@ -1236,7 +1237,7 @@ static char *rx_mmap(char *index, size_t index_size, size_t total_filesize) {
 					fprintf(stderr, "!> Directory already exists: %s\n",
 							(char *)entry->path);
 				} else {
-					debug_printf("mkdir err");
+					debug_printf("mkdir err: %s", strerror(errno));
 					encountered_err = true;
 					break;
 				}
@@ -2394,7 +2395,7 @@ static char *prepare_dir_index(char *fname, u64 *index_size_o,
 	char *fts_arg[2] = {fname, NULL};
 	fts = fts_open(fts_arg, FTS_PHYSICAL, NULL);  // Don't follow symlinks
 	if (fts == NULL) {
-		fprintf(stderr, "Error opening %s\n", fname);
+		fprintf(stderr, "Error opening %s: %s\n", fname, strerror(errno));
 		return NULL;
 	}
 
@@ -2545,7 +2546,8 @@ static char *tx_mmap(char *fname, char *dstname, size_t *filesize,
 		if (entry->type == INDEX_TYPE_FILE) {
 			int f = open((char *)entry->path, O_RDONLY);
 			if (f == -1) {
-				fprintf(stderr, "Error opening %s\n", (char *)entry->path);
+				fprintf(stderr, "Error opening %s: %s\n", (char *)entry->path,
+						strerror(errno));
 				encountered_err = true;
 				break;
 			}
@@ -3777,7 +3779,7 @@ void hercules_main(struct hercules_server *server) {
 
   int ret = xdp_setup(server);
   if (ret != 0){
-	  fprintf(stderr, "Error in XDP setup!\n");
+	  fprintf(stderr, "Error in XDP setup!\n%s\n", strerror(errno));
 	  exit(1);
   }
 
@@ -3785,12 +3787,12 @@ void hercules_main(struct hercules_server *server) {
   if (server->config.chroot_dir){
 	  ret = chroot(server->config.chroot_dir);
 	  if (ret != 0) {
-		  fprintf(stderr, "Error in chroot\n");
+		  fprintf(stderr, "Error in chroot\n%s\n", strerror(errno));
 		  exit(1);
 	  }
 	  ret = chdir("/");
 	  if (ret != 0) {
-		  fprintf(stderr, "Error changing to chroot dir\n");
+		  fprintf(stderr, "Error changing to chroot dir\n%s\n", strerror(errno));
 		  exit(1);
 	  }
   }
@@ -3798,12 +3800,12 @@ void hercules_main(struct hercules_server *server) {
   // Drop privileges
   ret = setgid(server->config.drop_gid);
   if (ret != 0) {
-    fprintf(stderr, "Error in setgid\n");
+    fprintf(stderr, "Error in setgid\n%s\n", strerror(errno));
     exit(1);
   }
   ret = setuid(server->config.drop_uid);
   if (ret != 0) {
-    fprintf(stderr, "Error in setuid\n");
+    fprintf(stderr, "Error in setuid\n%s\n", strerror(errno));
     exit(1);
   }
   // Start the NACK sender thread
@@ -3955,10 +3957,6 @@ int main(int argc, char *argv[]) {
 			fprintf(stderr, "Error parsing DropUser\n");
 			exit(1);
 		}
-		fprintf(stderr,
-				"WARNING: DropUser config option not set. Running Hercules as root is "
-				"not secure!\n"
-				"See the documentation for more information.\n");
 	}
 
 	toml_datum_t chroot_dir = toml_string_in(conf, "ChrootDir");
@@ -3969,6 +3967,13 @@ int main(int argc, char *argv[]) {
 			fprintf(stderr, "Error parsing ChrootDir\n");
 			exit(1);
 		}
+	}
+
+	if (config.drop_uid == 0 && config.chroot_dir == NULL) {
+		fprintf(stderr,
+				"WARNING: DropUser or ChrootDir config option not set."
+				"Running Hercules as root is not secure!\n"
+				"See the documentation for more information.\n");
 	}
 
 	// Listening address
@@ -4119,12 +4124,12 @@ int main(int argc, char *argv[]) {
 	act.sa_flags = SA_RESETHAND;
 	ret = sigaction(SIGINT, &act, NULL);
 	if (ret == -1) {
-		fprintf(stderr, "Error registering signal handler\n");
+		fprintf(stderr, "Error registering signal handler\n%s\n", strerror(errno));
 		exit(1);
 	}
 	ret = sigaction(SIGTERM, &act, NULL);
 	if (ret == -1) {
-		fprintf(stderr, "Error registering signal handler\n");
+		fprintf(stderr, "Error registering signal handler\n%s\n", strerror(errno));
 		exit(1);
 	}
 
