@@ -146,7 +146,7 @@ func (ptd *PathsToDestination) chooseNewPaths(availablePaths []PathWithInterface
 	timeout, cancel := context.WithTimeout(context.Background(), time.Second*1)
 	defer cancel()
 
-	var pathSet []PathWithInterface
+	var computedPathSet []PathWithInterface
 	go func() { // pick paths
 		picker := makePathPicker(ptd.dst.pathSpec, availablePaths, ptd.dst.numPaths)
 		disjointness := 0 // negative number denoting how many network interfaces are shared among paths (to be maximized)
@@ -154,30 +154,32 @@ func (ptd *PathsToDestination) chooseNewPaths(availablePaths []PathWithInterface
 		for i := ptd.dst.numPaths; i > 0; i-- {
 			picker.reset(i)
 			for picker.nextRuleSet() { // iterate through different choices of PathSpecs to use
-				if pathSet != nil && maxRuleIdx < picker.maxRuleIdx() { // ignore rule set, if path set with lower maxRuleIndex is known
+				if computedPathSet != nil && maxRuleIdx < picker.maxRuleIdx() { // ignore rule set, if path set with lower maxRuleIndex is known
 					continue // due to the iteration order, we cannot break here
 				}
 				for picker.nextPick() { // iterate through different choices of paths obeying the rules of the current set of PathSpecs
 					curDisjointness := picker.disjointnessScore()
-					if pathSet == nil || disjointness < curDisjointness { // maximize disjointness
+					if computedPathSet == nil || disjointness < curDisjointness { // maximize disjointness
 						disjointness = curDisjointness
 						maxRuleIdx = picker.maxRuleIdx()
-						pathSet = picker.getPaths()
+						computedPathSet = picker.getPaths()
 					}
 				}
 			}
-			if pathSet != nil { // if no path set of size i found, try with i-1
+			if computedPathSet != nil { // if no path set of size i found, try with i-1
 				break
 			}
 		}
 		ch <- 1
 	}()
 
+	var pathSet []PathWithInterface
 	select {
 	case <-timeout.Done():
 		log.Warn(fmt.Sprintf("[Destination %s] Path selection took too long! Using first few paths", ptd.dst.hostAddr.IA))
-		pathSet = availablePaths
+		pathSet = availablePaths[:min(len(availablePaths), ptd.dst.numPaths)]
 	case <-ch:
+		pathSet = computedPathSet
 	}
 
 	log.Info(fmt.Sprintf("[Destination %s] using %d paths:", ptd.dst.hostAddr.IA, len(pathSet)))
