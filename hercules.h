@@ -28,11 +28,6 @@
 #include "packet.h"
 #include "errors.h"
 
-// The version is included in the packet headers.
-// We check whether the version of received packets matches ours.
-// If you make incompatible changes to the headers or Hercules' behaviour,
-// change this version to avoid incompatible servers interacting.
-#define HERCULES_HEADER_VERSION 1
 // Default config file
 #define HERCULES_DEFAULT_CONFIG_PATH "/usr/local/etc/hercules.conf"
 // Config file in current working dir

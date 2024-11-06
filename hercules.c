@@ -851,7 +851,6 @@ static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx, u8 flags
 						   sequence_number seqnr, const char *data, size_t n,
 						   size_t payloadlen) {
 	struct hercules_header *hdr = (struct hercules_header *)rbudp_pkt;
-	hdr->version = HERCULES_HEADER_VERSION;
 	hdr->chunk_idx = chunk_idx;
 	hdr->path = path_idx;
 	hdr->flags = flags;
@@ -900,21 +899,12 @@ static bool rx_received_all(const struct receiver_state *rx_state,
 
 static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *pkt, size_t length)
 {
-	struct hercules_header *hdr = (struct hercules_header *)pkt;
-	if (length < sizeof(u8)) {
-		debug_printf("packet too short!");
-		return false;
-	}
-	if (hdr->version != HERCULES_HEADER_VERSION) {
-		debug_printf("Hercules version mismatch: received %u, expected %u",
-					 hdr->version, HERCULES_HEADER_VERSION);
-		return false;
-	}
 	if(length < rbudp_headerlen + rx_state->chunklen) {
 		debug_printf("packet too short: have %lu, expect %d", length, rbudp_headerlen + rx_state->chunklen );
 		return false;
 	}
 
+	struct hercules_header *hdr = (struct hercules_header *)pkt;
 	bool is_index_transfer = hdr->flags & PKT_FLAG_IS_INDEX;
 
 	u32 chunk_idx = hdr->chunk_idx;
@@ -3562,23 +3552,13 @@ static void events_p(void *arg) {
 												   .ia = scionaddrhdr->src_ia};
 
 			const size_t rbudp_len = len - (rbudp_pkt - buf);
-			if (rbudp_len < sizeof(u8)){
-				debug_printf("Ignoring, length too short");
-				continue;
-			}
-			u8 pkt_version = *rbudp_pkt;
-			if (pkt_version != HERCULES_HEADER_VERSION) {
-				debug_printf("Hercules version mismatch: received %u, expected %u",
-								pkt_version, HERCULES_HEADER_VERSION);
-				continue;
-			}
-			if (rbudp_len < rbudp_headerlen) {
+			if (rbudp_len < sizeof(u32)) {
 				debug_printf("Ignoring, length too short");
 				continue;
 			}
 
-			struct hercules_header *h = (struct hercules_header *)rbudp_pkt;
-			u32 chunk_idx = h->chunk_idx;
+			u32 chunk_idx;
+			memcpy(&chunk_idx, rbudp_pkt, sizeof(u32));
 			if (chunk_idx != UINT_MAX) {
 				// Only data packets can have another value and we don't handle
 				// them here
@@ -3590,6 +3570,7 @@ static void events_p(void *arg) {
 
 			debug_print_rbudp_pkt(rbudp_pkt, true);
 
+			struct hercules_header *h = (struct hercules_header *)rbudp_pkt;
 			const char *pl = rbudp_pkt + rbudp_headerlen;
 			struct hercules_control_packet *cp =
 				(struct hercules_control_packet *)pl;

@@ -101,7 +101,6 @@ struct scmp_message {
 
 // The header used by both control and data packets
 struct hercules_header {
-	__u8 version;
 	__u32 chunk_idx;
 	__u8 path;
 	__u8 flags;
