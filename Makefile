@@ -109,7 +109,7 @@ bpf/src/libbpf.a:
 	else \
 		cd bpf/src && $(MAKE) all OBJDIR=.; \
 		mkdir -p build; \
-		cd bpf/src && $(MAKE) install_headers DESTDIR=build OBJDIR=.; \
+		$(MAKE) install_headers DESTDIR=build OBJDIR=.; \
 	fi
 
 tomlc99/libtoml.a:
@@ -122,7 +122,7 @@ tomlc99/libtoml.a:
 	fi
 
 
-.PHONY: builder builder_image clean
+.PHONY: builder builder_image
 
 # mockules: builder mockules/main.go mockules/network.go
 # 	docker exec -w /`basename $(PWD)`/mockules hercules-builder go build
@@ -180,11 +180,16 @@ pkg_tar:
 	fpm -t tar --version $(PKG_VERSION)
 	rm -rf pkgroot
 
-clean:
+.PHONY: clean clean-small
+# Clean files only, but don't remove the docker container.
+clean-small:
 	rm -rf $(TARGET_MONITOR) $(TARGET_SERVER) $(TARGET_HCP) $(OBJS) $(DEPS)
 	rm -rf pkgroot *.deb *.rpm *.tar
+
+clean: clean-small
 	rm -f hercules mockules/mockules
 	docker container rm -f hercules-builder || true
 	docker rmi hercules-builder || true
+
 
 -include $(DEPS)

@@ -9,3 +9,4 @@ StandardOutput=syslog
 StandardError=syslog
 WorkingDirectory=/tmp/
 TimeoutSec=5
+LimitCORE=infinity

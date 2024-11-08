@@ -569,11 +569,13 @@ static u8 parse_scmp_packet(const struct scmp_message *scmp, size_t length,
 			break;
 		case SCMP_EXT_IF_DOWN:
 			pkt = (const char *)scmp->msg.ext_down.offending_packet;
+			debug_printf("extifdown: src ia 0x%llx", scmp->msg.ext_down.ia);
 			offset +=
 				offsetof(struct scmp_message, msg.ext_down.offending_packet);
 			break;
 		case SCMP_INT_CONN_DOWN:
 			pkt = (const char *)scmp->msg.int_down.offending_packet;
+			debug_printf("intdown: src ia 0x%llx", scmp->msg.int_down.ia);
 			offset +=
 				offsetof(struct scmp_message, msg.int_down.offending_packet);
 			break;
@@ -747,7 +749,7 @@ static const char *parse_pkt(const struct hercules_server *server,
 		*scmp_offending_path_o = parse_scmp_packet(scmp_msg, length - next_offset,
 												   scmp_offending_dst_port_o);
 #else
-		debug_printf("Received SCMP error, ignoring");
+		/* debug_printf("Received SCMP error, ignoring"); */
 #endif
 	  } else {
 		debug_printf("unknown SCION L4: %u", next_header);
@@ -1902,7 +1904,7 @@ static char *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_id
 static _Atomic short flowIdCtr = 0;
 #endif
 #ifdef RANDOMIZE_UNDERLAY_SRC
-static short src_port_ctr = 0;
+static _Atomic short src_port_ctr = 0;
 #endif
 
 static inline void tx_handle_send_queue_unit_for_iface(
