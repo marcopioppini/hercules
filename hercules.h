@@ -104,6 +104,7 @@ struct receiver_state {
 	u32 ack_nr;
 	u64 next_nack_round_start;
 	u64 next_ack_round_start;
+	u32 next_chunk_to_ack;
 	_Atomic u8 num_tracked_paths;
 	bool is_pcc_benchmark;
 	struct receiver_state_per_path path_state[256];

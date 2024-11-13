@@ -1536,13 +1536,27 @@ static void rx_send_acks(struct hercules_server *server, struct receiver_state *
 	const size_t max_entries = ack__max_num_entries(path.payloadlen - rbudp_headerlen - sizeof(control_pkt.type));
 
 	// send an empty ACK to keep connection alive until first packet arrives
-	u32 curr = fill_ack_pkt(rx_state, 0, &control_pkt.payload.ack, max_entries, is_index_transfer);
-	send_control_pkt(server, rx_state->session, &control_pkt, &path, rx_state->src_port, is_index_transfer);
-	for(; curr < rx_state->total_chunks;) {
-		curr = fill_ack_pkt(rx_state, curr, &control_pkt.payload.ack, max_entries, is_index_transfer);
-		if(control_pkt.payload.ack.num_acks == 0) break;
-		send_control_pkt(server, rx_state->session, &control_pkt, &path, rx_state->src_port, is_index_transfer);
+	debug_printf("starting ack at %u", rx_state->next_chunk_to_ack);
+	u32 curr =
+		fill_ack_pkt(rx_state, rx_state->next_chunk_to_ack,
+					 &control_pkt.payload.ack, max_entries, is_index_transfer);
+	send_control_pkt(server, rx_state->session, &control_pkt, &path,
+					 rx_state->src_port, is_index_transfer);
+	unsigned pkts = 1;
+	for (; curr < rx_state->total_chunks && pkts < 5;) {
+		curr = fill_ack_pkt(rx_state, curr, &control_pkt.payload.ack, max_entries,
+							is_index_transfer);
+		if (control_pkt.payload.ack.num_acks == 0) break;
+		send_control_pkt(server, rx_state->session, &control_pkt, &path,
+						 rx_state->src_port, is_index_transfer);
+		pkts++;
 	}
+	rx_state->next_chunk_to_ack = curr;
+	if (control_pkt.payload.ack.num_acks == 0 ||
+		curr > rx_state->received_chunks.max_set) {
+		rx_state->next_chunk_to_ack = 0;
+	}
+	debug_printf("packets in ack batch: %u", pkts);
 }
 
 
@@ -2825,7 +2839,7 @@ static void rx_trickle_acks(void *arg) {
 					quit_session(session_rx, SESSION_ERROR_OK);
 				}
 			}
-			rx_state->next_ack_round_start = now + ACK_RATE_TIME_MS * 1e6;
+			rx_state->next_ack_round_start = get_nsecs() + ACK_RATE_TIME_MS * 1e6;
 		}
 	}
 }
