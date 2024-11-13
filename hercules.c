@@ -345,8 +345,10 @@ static void destroy_session_tx(struct hercules_server *server,
 
 	struct path_set *pathset = session->tx_state->pathset;
 	for (u32 i = 0; i < pathset->n_paths; i++) {
-		destroy_ccontrol_state(pathset->paths[i].cc_state);
-		pathset->paths[i].cc_state = NULL;
+		if (pathset->paths[i].cc_state) {
+			destroy_ccontrol_state(pathset->paths[i].cc_state);
+			pathset->paths[i].cc_state = NULL;
+		}
 	}
 	FREE_NULL(session->tx_state->pathset);
 
