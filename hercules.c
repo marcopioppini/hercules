@@ -148,7 +148,11 @@ static inline struct hercules_interface *get_interface_by_id(struct hercules_ser
 // by the events_p thread.
 static inline void quit_session(struct hercules_session *s,
 								enum session_error err) {
-	s->error = err;
+	enum session_error none = SESSION_ERROR_NONE;
+	int ret = atomic_compare_exchange_strong(&s->error, &none, err);
+	if (ret) {
+		debug_printf("Stopping session with error: %s", hercules_strerror(err));
+	}
 }
 
 static u32 ack__max_num_entries(u32 len)
@@ -252,6 +256,10 @@ void debug_print_rbudp_pkt(const char *pkt, bool recv) {
 				break;
 			case CONTROL_PACKET_TYPE_RTT:
 				printf("%s   RTT\n", prefix);
+				break;
+			case CONTROL_PACKET_TYPE_ERR:
+				printf("%s   ERROR: %llu (%s)\n", prefix, cp->payload.err.hercules_error,
+					   hercules_strerror(cp->payload.err.hercules_error));
 				break;
 			default:
 				printf("%s   ?? UNKNOWN CONTROL PACKET TYPE", prefix);
@@ -1096,6 +1104,9 @@ static void rx_receive_batch(struct hercules_server *server,
 
 		struct hercules_session *session_rx =
 			lookup_session_rx(server, pkt_dst_port);
+		if (session_rx && session_rx->state == SESSION_STATE_DONE){
+			session_rx->rx_state->send_err = true;
+		}
 		if (session_rx == NULL ||
 			!session_state_is_running(session_rx->state)) {
 			continue;
@@ -1538,7 +1549,7 @@ static void rx_send_acks(struct hercules_server *server, struct receiver_state *
 	const size_t max_entries = ack__max_num_entries(path.payloadlen - rbudp_headerlen - sizeof(control_pkt.type));
 
 	// send an empty ACK to keep connection alive until first packet arrives
-	debug_printf("starting ack at %u", rx_state->next_chunk_to_ack);
+	/* debug_printf("starting ack at %u", rx_state->next_chunk_to_ack); */
 	u32 curr =
 		fill_ack_pkt(rx_state, rx_state->next_chunk_to_ack,
 					 &control_pkt.payload.ack, max_entries, is_index_transfer);
@@ -1558,7 +1569,7 @@ static void rx_send_acks(struct hercules_server *server, struct receiver_state *
 		curr > rx_state->received_chunks.max_set) {
 		rx_state->next_chunk_to_ack = 0;
 	}
-	debug_printf("packets in ack batch: %u", pkts);
+	/* debug_printf("packets in ack batch: %u", pkts); */
 }
 
 
@@ -1845,6 +1856,62 @@ static void tx_send_rtt(struct hercules_server *server,
 	send_eth_frame(server, path, buf);
 	atomic_fetch_add(&session->tx_npkts, 1);
 	session->last_pkt_sent = timestamp;
+}
+
+static void tx_send_error(struct hercules_server *server,
+						struct hercules_session *session) {
+	/* debug_printf("Sending error packet"); */
+	if (!session->tx_state || !session->tx_state->pathset || session->tx_state->pathset->n_paths == 0) {
+		return;
+	}
+	/* debug_printf("Current state: %d, err %d", session->state, session->error); */
+	const struct hercules_path *path = &session->tx_state->pathset->paths[0];
+
+	char buf[HERCULES_MAX_PKTSIZE];
+	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
+
+	struct hercules_control_packet pld = {
+		.type = CONTROL_PACKET_TYPE_ERR,
+		.payload.err = {session->error},
+	};
+
+	stitch_src_port(path, session->tx_state->src_port, buf);
+	stitch_dst_port(path, session->peer.port, buf);
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, 0, (char *)&pld,
+				   sizeof(pld), path->payloadlen);
+	stitch_checksum_with_dst(path, path->header.checksum, buf);
+
+	send_eth_frame(server, path, buf);
+	atomic_fetch_add(&session->tx_npkts, 1);
+}
+
+static void rx_send_error(struct hercules_server *server,
+						struct hercules_session *session) {
+	/* debug_printf("Sending error packet"); */
+	if (!session->rx_state) {
+		return;
+	}
+	struct hercules_path path;
+	if(!rx_get_reply_path(session->rx_state, &path)) {
+		debug_printf("no reply path");
+		return;
+	}
+
+	char buf[HERCULES_MAX_PKTSIZE];
+	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
+
+	struct hercules_control_packet pld = {
+		.type = CONTROL_PACKET_TYPE_ERR,
+		.payload.err = {session->error},
+	};
+
+	stitch_src_port(&path, session->rx_state->src_port, buf);
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, 0, (char *)&pld,
+				   sizeof(pld), path.payloadlen);
+	stitch_checksum(&path, path.header.checksum, buf);
+
+	send_eth_frame(server, &path, buf);
+	atomic_fetch_add(&session->tx_npkts, 1);
 }
 
 static void rate_limit_tx(struct sender_state *tx_state)
@@ -3438,6 +3505,18 @@ static void rx_send_cts(struct hercules_server *server, int s) {
 	}
 }
 
+// Send an error if rx_p has received a packet for a closed session.
+static void rx_send_err(struct hercules_server *server, int s) {
+	struct hercules_session *session_rx = server->sessions_rx[s];
+	if (session_rx != NULL && session_rx->state == SESSION_STATE_DONE) {
+		struct receiver_state *rx_state = session_rx->rx_state;
+		if (rx_state->send_err) {
+			rx_send_error(server, session_rx);
+			rx_state->send_err = false;
+		}
+	}
+}
+
 // To stop a session, any thread may set its error to something other than
 // ERROR_NONE (generally via quit_session()). If the error is set, this changes
 // the sessions state to DONE. The state update needs to happen in the events_p
@@ -3501,6 +3580,7 @@ static void events_p(void *arg) {
 		new_tx_if_available(server);
 		tx_retransmit_initial(server, current_slot, now);
 		rx_send_cts(server, current_slot);
+		rx_send_err(server, current_slot);
 #ifdef PRINT_STATS
 		if (now > lastprint + print_stats_interval) {
 			print_session_stats(server, now, tx_stats, rx_stats);
@@ -3600,6 +3680,15 @@ static void events_p(void *arg) {
 				lookup_session_rx(server, pkt_dst_port);
 			struct hercules_session *session_tx =
 				lookup_session_tx(server, pkt_dst_port);
+			if (session_rx != NULL && session_rx->state == SESSION_STATE_DONE &&
+				cp->type != CONTROL_PACKET_TYPE_ERR) {
+				rx_send_error(server, session_rx);
+			}
+			if (session_tx != NULL && session_tx->state == SESSION_STATE_DONE &&
+				cp->type != CONTROL_PACKET_TYPE_ERR) {
+				tx_send_error(server, session_tx);
+				continue;
+			}
 
 			switch (cp->type) {
 				case CONTROL_PACKET_TYPE_INITIAL:;
@@ -3743,6 +3832,19 @@ static void events_p(void *arg) {
 						// receiver in this packet, instead of computing it
 						debug_printf("Updating RTT to %fs",
 									 rx_state->handshake_rtt / 1e9);
+					}
+					break;
+
+				case CONTROL_PACKET_TYPE_ERR:
+					debug_printf("ERR received");
+					debug_print_rbudp_pkt(rbudp_pkt, true);
+					if (session_rx && src_matches_address(session_rx, &pkt_source)) {
+						quit_session(session_rx, cp->payload.err.hercules_error);
+						count_received_pkt(session_rx, h->path);
+					}
+					if (session_tx && src_matches_address(session_tx, &pkt_source)) {
+						quit_session(session_tx, cp->payload.err.hercules_error);
+						count_received_pkt(session_tx, h->path);
 					}
 					break;
 

@@ -158,16 +158,29 @@ struct rbudp_ack_pkt {
 	} acks[256];	  //!< list of ranges that are ACKed
 };
 
+// Packets used to communicate errors to peer
+// When a packet is received that is destined to a session
+// which is in state SESSION_STATE_DONE, an error control packet containing the
+// session's error is sent in reply.
+// Upon reception of an error packet, the error is extracted, applied to the
+// originating session and the session stopped.
+// No error packets are sent in reply to received error packets.
+struct rbudp_err_pkt {
+	__u64 hercules_error;
+};
+
 #define CONTROL_PACKET_TYPE_INITIAL 0
 #define CONTROL_PACKET_TYPE_ACK 1
 #define CONTROL_PACKET_TYPE_NACK 2
 #define CONTROL_PACKET_TYPE_RTT 3
+#define CONTROL_PACKET_TYPE_ERR 4
 
 struct hercules_control_packet {
 	__u8 type;
 	union {
 		struct rbudp_initial_pkt initial;
 		struct rbudp_ack_pkt ack;
+		struct rbudp_err_pkt err;
 	} payload;
 };
 

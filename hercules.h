@@ -112,6 +112,9 @@ struct receiver_state {
 	u64 start_time;	 // Start/end time of the current transfer
 	u64 end_time;
 	u64 sent_initial_at;
+	_Atomic bool send_err;	// Whether the control thread should send an error. Set
+							// by the receive thread when it receives a packet for
+							// an already stopped session.
 };
 
 /// SENDER
