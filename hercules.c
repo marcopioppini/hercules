@@ -2047,6 +2047,9 @@ static void produce_batch(struct hercules_server *server,
 	u32 num_chunks_in_unit;
 	struct send_queue_unit *unit = NULL;
 	for(chk = 0; chk < num_chunks; chk++) {
+		if (!(session_state_is_running(session->state))){
+			return;
+		}
 		if(unit == NULL) {
 			unit = send_queue_reserve(session->send_queue);
 			num_chunks_in_unit = 0;
