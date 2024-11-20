@@ -3,6 +3,7 @@
 // Copyright(c) 2019 ETH Zurich.
 
 #include "hercules.h"
+#include <xdp/xsk.h>
 #include "packet.h"
 #include <stdatomic.h>
 #include <assert.h>
@@ -38,9 +39,8 @@
 #include <arpa/inet.h>
 #include "linux/bpf_util.h"
 
-#include "bpf/src/libbpf.h"
-#include "bpf/src/bpf.h"
-#include "bpf/src/xsk.h"
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 #include "linux/filter.h" // actually linux/tools/include/linux/filter.h
 
 #include "toml.h"
@@ -1594,7 +1594,7 @@ static void rx_send_path_nacks(struct hercules_server *server, struct receiver_s
 	//sequence_number start = nack_end;
 	bool sent = false;
 	pthread_spin_lock(&path_state->seq_rcvd.lock);
-	libbpf_smp_rmb();
+	asm volatile("":::"memory"); // XXX why is this here?
 	for(u32 curr = path_state->nack_end; curr < path_state->seq_rcvd.num;) {
 		// Data to send
 		curr = fill_nack_pkt(curr, &control_pkt.payload.ack, max_entries, &path_state->seq_rcvd);
@@ -1624,7 +1624,7 @@ static void rx_send_path_nacks(struct hercules_server *server, struct receiver_s
 		send_eth_frame(server, &path, buf);
 		atomic_fetch_add(&rx_state->session->tx_npkts, 1);
 	}
-	libbpf_smp_wmb();
+	asm volatile("":::"memory"); // XXX why is this here?
 	pthread_spin_unlock(&path_state->seq_rcvd.lock);
 	path_state->nack_end = nack_end;
 }
@@ -1707,11 +1707,11 @@ static void tx_register_acks_index(const struct rbudp_ack_pkt *ack, struct sende
 static void pop_completion_ring(struct hercules_server *server, struct xsk_umem_info *umem)
 {
 	u32 idx;
-	size_t entries = xsk_ring_cons__peek(&umem->cq, SIZE_MAX, &idx);
+	u32 entries = xsk_ring_cons__peek(&umem->cq, INT32_MAX, &idx);
 	if(entries > 0) {
 		u16 num = frame_queue__prod_reserve(&umem->available_frames, entries);
 		if(num < entries) { // there are less frames in the loop than the number of slots in frame_queue
-			debug_printf("trying to push %ld frames, only got %d slots in frame_queue", entries, num);
+			debug_printf("trying to push %u frames, only got %d slots in frame_queue", entries, num);
 			exit_with_error(server, EINVAL);
 		}
 		for(u16 i = 0; i < num; i++) {

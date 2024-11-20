@@ -2,26 +2,34 @@
 
 #include <asm-generic/errno-base.h>
 #include <unistd.h>
+#include <xdp/libxdp.h>
 
-#include "bpf/src/bpf.h"
+#include "utils.h"
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 #include "bpf_prgms.h"
 #include "hercules.h"
 
 void remove_xdp_program(struct hercules_server *server) {
 	for (int i = 0; i < server->num_ifaces; i++) {
-		u32 curr_prog_id = 0;
-		if (bpf_get_link_xdp_id(server->ifaces[i].ifid, &curr_prog_id,
-								server->config.xdp_flags)) {
-			printf("bpf_get_link_xdp_id failed\n");
-			exit(EXIT_FAILURE);
+		enum xdp_attach_mode mode = xdp_program__is_attached(
+			server->ifaces[i].xdp_prog, server->ifaces[i].ifid);
+		if (!mode) {
+			fprintf(stderr, "Program not attached on %s?\n",
+					server->ifaces[i].ifname);
+			continue;
 		}
-		if (server->ifaces[i].prog_id == curr_prog_id)
-			bpf_set_link_xdp_fd(server->ifaces[i].ifid, -1,
-								server->config.xdp_flags);
-		else if (!curr_prog_id)
-			printf("couldn't find a prog id on a given interface\n");
-		else
-			printf("program on interface changed, not removing\n");
+		int err = xdp_program__detach(server->ifaces[i].xdp_prog,
+									  server->ifaces[i].ifid, mode, 0);
+		char errmsg[1024];
+		if (err) {
+			libxdp_strerror(err, errmsg, sizeof(errmsg));
+			fprintf(stderr, "Error detaching XDP program from %s: %s\n",
+					server->ifaces[i].ifname, errmsg);
+			continue;
+		}
+		xdp_program__close(server->ifaces[i].xdp_prog);
+		server->ifaces[i].xdp_prog = NULL;
 	}
 }
 
@@ -190,11 +198,7 @@ int unconfigure_rx_queues(struct hercules_server *server) {
 	return error;
 }
 
-int load_bpf(const void *prgm, ssize_t prgm_size, struct bpf_object **obj) {
-	static const int log_buf_size = 16 * 1024;
-	char log_buf[log_buf_size];
-	int prog_fd;
-
+int load_bpf(const void *prgm, ssize_t prgm_size, struct xdp_program **prog_o) {
 	char tmp_file[] = "/tmp/hrcbpfXXXXXX";
 	int fd = mkstemp(tmp_file);
 	if (fd < 0) {
@@ -205,38 +209,22 @@ int load_bpf(const void *prgm, ssize_t prgm_size, struct bpf_object **obj) {
 		return -EXIT_FAILURE;
 	}
 
-	struct bpf_object *_obj;
-	if (obj == NULL) {
-		obj = &_obj;
+	struct xdp_program *prog = xdp_program__open_file(tmp_file, "xdp", NULL);
+	int err = libxdp_get_error(prog);
+	char errmsg[1024];
+	if (err) {
+		libxdp_strerror(err, errmsg, sizeof(errmsg));
+		debug_printf("aaa prog %s", errmsg);
+		fprintf(stderr, "Error loading XDP program: %s\n", errmsg);
+		return 1;
 	}
-	int ret = bpf_prog_load(tmp_file, BPF_PROG_TYPE_XDP, obj, &prog_fd);
-	debug_printf("error loading file(%s): %d %s", tmp_file, -ret,
-				 strerror(-ret));
+
 	int unlink_ret = unlink(tmp_file);
 	if (0 != unlink_ret) {
 		fprintf(stderr, "Could not remove temporary file, error: %d",
 				unlink_ret);
 	}
-	if (ret != 0) {
-		printf("BPF log buffer:\n%s", log_buf);
-		return ret;
-	}
-	return prog_fd;
-}
-
-int set_bpf_prgm_active(struct hercules_server *server,
-						struct hercules_interface *iface, int prog_fd) {
-	int err =
-		bpf_set_link_xdp_fd(iface->ifid, prog_fd, server->config.xdp_flags);
-	if (err) {
-		return 1;
-	}
-
-	int ret = bpf_get_link_xdp_id(iface->ifid, &iface->prog_id,
-								  server->config.xdp_flags);
-	if (ret) {
-		return 1;
-	}
+	*prog_o = prog;
 	return 0;
 }
 
@@ -260,15 +248,73 @@ int load_xsk_redirect_userspace(struct hercules_server *server,
 								struct worker_args *args[], int num_threads) {
 	debug_printf("Loading XDP program for redirection");
 	for (int i = 0; i < server->num_ifaces; i++) {
-		struct bpf_object *obj;
-		int prog_fd = load_bpf(bpf_prgm_redirect_userspace,
-							   bpf_prgm_redirect_userspace_size, &obj);
-		if (prog_fd < 0) {
+		int err;
+		char errmsg[1024];
+		struct xdp_program *prog;
+		int ret = load_bpf(bpf_prgm_redirect_userspace,
+						   bpf_prgm_redirect_userspace_size, &prog);
+		if (ret) {
 			return 1;
 		}
 
+		// Check if there's already xdp programs on the interface.
+		// If possible, the program is added to the list of loaded programs.
+		// If our redirect program is already present (eg. because we crashed and thus
+		// didn't remove it), we try to replace it.
+		struct xdp_multiprog *multi =
+			xdp_multiprog__get_from_ifindex(server->ifaces[i].ifid);
+		if (xdp_multiprog__is_legacy(multi)) {
+			// In this case we cannot add ours and we don't know if it's safe to remove
+			// the other program
+			fprintf(stderr,
+					"Error: A legacy XDP program is already loaded on interface %s\n",
+					server->ifaces[i].ifname);
+			return 1;
+		}
+		for (struct xdp_program *ifprog = xdp_multiprog__next_prog(NULL, multi);
+			 ifprog != NULL; ifprog = xdp_multiprog__next_prog(ifprog, multi)) {
+			debug_printf("iface program: %s, prio %u", xdp_program__name(ifprog),
+						 xdp_program__run_prio(ifprog));
+			if (!strcmp(xdp_program__name(ifprog), "hercules_redirect_userspace")) {
+				// If our redirect program is already loaded, we replace it
+				// XXX Relies on nobody else naming a program
+				// hercules_redirect_userspace, so multiple Hercules instances per
+				// machine are not possible. That could be solved with priorities, for
+				// example.
+				fprintf(stderr,
+						">>> Hercules XDP program already loaded on interface, "
+						"replacing.\n");
+				err = xdp_program__detach(ifprog, server->ifaces[i].ifid,
+										  XDP_MODE_UNSPEC, 0);
+				if (err) {
+					libxdp_strerror(err, errmsg, sizeof(errmsg));
+					fprintf(stderr,
+							"Error detaching XDP program from interface %s: %s\n",
+							server->ifaces[i].ifname, errmsg);
+					return 1;
+				}
+				ifprog = xdp_multiprog__next_prog(NULL, multi);
+			}
+		}
+
+		err = xdp_program__attach(prog, server->ifaces[i].ifid, XDP_MODE_UNSPEC, 0);
+		if (err) {
+			libxdp_strerror(err, errmsg, sizeof(errmsg));
+			fprintf(stderr, "Error attaching XDP program to interface %s: %s\n",
+					server->ifaces[i].ifname, errmsg);
+			return 1;
+		}
+		enum xdp_attach_mode mode =
+			xdp_program__is_attached(prog, server->ifaces[i].ifid);
+		if (!mode) {
+			fprintf(stderr, "Program not attached?\n");
+			return 1;
+		}
+		fprintf(stderr, "XDP program attached in mode: %d\n", mode);
+		server->ifaces[i].xdp_prog = prog;
+
 		// push XSKs
-		int xsks_map_fd = bpf_object__find_map_fd_by_name(obj, "xsks_map");
+		int xsks_map_fd = bpf_object__find_map_fd_by_name(xdp_program__bpf_obj(prog), "xsks_map");
 		if (xsks_map_fd < 0) {
 			return 1;
 		}
@@ -282,28 +328,23 @@ int load_xsk_redirect_userspace(struct hercules_server *server,
 
 		// push XSKs meta
 		int zero = 0;
-		int num_xsks_fd = bpf_object__find_map_fd_by_name(obj, "num_xsks");
+		int num_xsks_fd = bpf_object__find_map_fd_by_name(xdp_program__bpf_obj(prog), "num_xsks");
 		if (num_xsks_fd < 0) {
 			return 1;
 		}
-		int ret = bpf_map_update_elem(num_xsks_fd, &zero, &num_threads, 0);
+		ret = bpf_map_update_elem(num_xsks_fd, &zero, &num_threads, 0);
 		if (ret == -1) {
 			return 1;
 		}
 
 		// push local address
-		int local_addr_fd = bpf_object__find_map_fd_by_name(obj, "local_addr");
+		int local_addr_fd = bpf_object__find_map_fd_by_name(xdp_program__bpf_obj(prog), "local_addr");
 		if (local_addr_fd < 0) {
 			return 1;
 		}
 		ret = bpf_map_update_elem(local_addr_fd, &zero,
 								  &server->config.local_addr, 0);
 		if (ret == -1) {
-			return 1;
-		}
-
-		ret = set_bpf_prgm_active(server, &server->ifaces[i], prog_fd);
-		if (ret) {
 			return 1;
 		}
 	}
@@ -373,14 +414,15 @@ int xdp_setup(struct hercules_server *server) {
 				&xsk->xsk, server->ifaces[i].ifname, server->config.queue,
 				umem->umem, &xsk->rx, &xsk->tx, &umem->fq, &umem->cq, &cfg);
 			if (ret) {
+				fprintf(stderr, "Error creating XDP socket\n");
 				return -ret;
 			}
-			ret = bpf_get_link_xdp_id(server->ifaces[i].ifid,
-									  &server->ifaces[i].prog_id,
-									  server->config.xdp_flags);
-			if (ret) {
-				return -ret;
-			}
+			/* ret = bpf_get_link_xdp_id(server->ifaces[i].ifid, */
+			/* 						  &server->ifaces[i].prog_id, */
+			/* 						  server->config.xdp_flags); */
+			/* if (ret) { */
+			/* 	return -ret; */
+			/* } */
 			server->ifaces[i].xsks[t] = xsk;
 		}
 		server->ifaces[i].num_sockets = server->config.n_threads;

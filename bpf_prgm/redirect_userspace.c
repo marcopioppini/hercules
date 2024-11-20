@@ -8,37 +8,37 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <stddef.h>
-#include "packet.h"
+#include "../packet.h"
 
-#include <bpf/src/bpf_helpers.h>
+#include <bpf/bpf_helpers.h>
 
 
-struct bpf_map_def SEC("maps") xsks_map = {
-		.type        = BPF_MAP_TYPE_XSKMAP,
-		.key_size    = sizeof(__u32),
-		.value_size  = sizeof(__u32),
-		.max_entries = MAX_NUM_SOCKETS,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_XSKMAP);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, MAX_NUM_SOCKETS);
+} xsks_map SEC(".maps");
 
-struct bpf_map_def SEC("maps") num_xsks = {
-		.type        = BPF_MAP_TYPE_ARRAY,
-		.key_size    = sizeof(__u32),
-		.value_size  = sizeof(__u32),
-		.max_entries = 1,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 1);
+} num_xsks SEC(".maps");
 
-struct bpf_map_def SEC("maps") local_addr = {
-		.type        = BPF_MAP_TYPE_ARRAY,
-		.key_size    = sizeof(__u32),
-		.value_size  = sizeof(struct hercules_app_addr),
-		.max_entries = 1,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct hercules_app_addr);
+	__uint(max_entries, 1);
+} local_addr SEC(".maps");
 
 static int redirect_count = 0;
 static __u32 zero = 0;
 
 SEC("xdp")
-int xdp_prog_redirect_userspace(struct xdp_md *ctx)
+int hercules_redirect_userspace(struct xdp_md *ctx)
 {
 	void *data = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;

@@ -22,7 +22,8 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#include "bpf/src/xsk.h"
+#include <xdp/libxdp.h>
+#include <xdp/xsk.h>
 #include "congestion_control.h"
 #include "frame_queue.h"
 #include "packet.h"
@@ -220,7 +221,7 @@ struct hercules_interface {
 	char ifname[IFNAMSIZ];
 	int ifid;
 	int queue;
-	u32 prog_id;
+	struct xdp_program *xdp_prog;
 	int ethtool_rule;
 	u32 num_sockets;
 	struct xsk_umem_info *umem;

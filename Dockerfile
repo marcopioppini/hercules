@@ -29,7 +29,7 @@ RUN set -eux; \
 		gpg \
 		gpg-agent \
 		dirmngr \
-		clang \
+		clang-12 \
 		llvm \
 		libelf-dev \
 		libpcap-dev \
@@ -37,10 +37,13 @@ RUN set -eux; \
 		build-essential \
         ruby \
         rpm \
+        m4 \
 	; \
 	rm -rf /var/lib/apt/lists/*
 
 ENV PATH /usr/local/go/bin:$PATH
+
+RUN ln -s /usr/bin/clang-12 /usr/bin/clang
 
 RUN gem install dotenv -v 2.8.1
 RUN gem install fpm
@@ -80,6 +83,8 @@ RUN set -eux; \
 # don't auto-upgrade the gotoolchain
 # https://github.com/docker-library/golang/issues/472
 ENV GOTOOLCHAIN=local
+
+RUN git config --global --add safe.directory "*"
 
 RUN groupadd --gid $GID --non-unique buildboy
 RUN useradd buildboy --create-home --shell /bin/bash --non-unique --uid $UID --gid $GID
