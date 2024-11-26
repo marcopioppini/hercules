@@ -39,7 +39,11 @@
 // depends on the driver. We're being conservative here. Support for larger
 // packets is possible by using xdp in multibuffer mode, but this requires code
 // to handle multi-buffer packets.
-#define HERCULES_MAX_PKTSIZE 3000
+#define HERCULES_MAX_PKTSIZE 9000
+// Size of fragments when constructing jumbo frames for tx.
+// Note that, on rx packets are fragmented by xdp, so this value is irrelevant
+// there.
+#define HERCULES_FRAG_SIZE 3000
 #define HERCULES_FILENAME_SIZE 1000
 // Batch size for send/receive operations
 #define BATCH_SIZE 64

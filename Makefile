@@ -3,7 +3,7 @@ TARGET_MONITOR := hercules-monitor
 TARGET_HCP := hcp/hcp
 
 CC := gcc
-CFLAGS = -O3 -g3 -std=gnu11 -D_GNU_SOURCE -Itomlc99
+CFLAGS = -O3 -g3 -std=gnu11 -D_GNU_SOURCE -Itomlc99 -Ixdp-tools/lib/libbpf/include/uapi -Ixdp-tools/headers
 # CFLAGS += -DNDEBUG
 CFLAGS += -Wall -Wextra
 

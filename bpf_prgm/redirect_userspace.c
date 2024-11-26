@@ -37,7 +37,7 @@ struct {
 static int redirect_count = 0;
 static __u32 zero = 0;
 
-SEC("xdp")
+SEC("xdp.frags")
 int hercules_redirect_userspace(struct xdp_md *ctx)
 {
 	void *data = (void *)(long)ctx->data;

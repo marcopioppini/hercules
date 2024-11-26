@@ -1,6 +1,7 @@
 #include "xdp.h"
 
 #include <asm-generic/errno-base.h>
+#include <linux/if_xdp.h>
 #include <unistd.h>
 #include <xdp/libxdp.h>
 
@@ -209,7 +210,7 @@ int load_bpf(const void *prgm, ssize_t prgm_size, struct xdp_program **prog_o) {
 		return -EXIT_FAILURE;
 	}
 
-	struct xdp_program *prog = xdp_program__open_file(tmp_file, "xdp", NULL);
+	struct xdp_program *prog = xdp_program__open_file(tmp_file, "xdp.frags", NULL);
 	int err = libxdp_get_error(prog);
 	char errmsg[1024];
 	if (err) {
@@ -313,6 +314,23 @@ int load_xsk_redirect_userspace(struct hercules_server *server,
 		fprintf(stderr, "XDP program attached in mode: %d\n", mode);
 		server->ifaces[i].xdp_prog = prog;
 
+		debug_printf("program supports frags? %d", xdp_program__xdp_frags_support(prog));
+
+		// XXX It should be possible to check whether multi-buffer (jumbo-frames) are
+		// supported with the following code, but this always returns 0. However, it
+		// also returns 0 for zero-copy support on machines that are known to support
+		// zero-copy (eg. zapdos), so something is wrong. Same thing happens if you use
+		// the xdp-loader utility (from xdp-tools, it uses the same approach) to query
+		// for feature support.
+		/* LIBBPF_OPTS(bpf_xdp_query_opts, opts); */
+		/* err = bpf_xdp_query(server->ifaces[i].ifid, 0, &opts); */
+		/* if (err) { */
+		/* 	debug_printf("query err"); */
+		/* 	return 1; */
+		/* } */
+		/* debug_printf("opts %#llx, zc frags %#x", opts.feature_flags, opts.xdp_zc_max_segs); */
+
+
 		// push XSKs
 		int xsks_map_fd = bpf_object__find_map_fd_by_name(xdp_program__bpf_obj(prog), "xsks_map");
 		if (xsks_map_fd < 0) {
@@ -410,12 +428,21 @@ int xdp_setup(struct hercules_server *server) {
 			cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 			cfg.xdp_flags = server->config.xdp_flags;
 			cfg.bind_flags = server->config.xdp_mode;
-			ret = xsk_socket__create_shared(
-				&xsk->xsk, server->ifaces[i].ifname, server->config.queue,
-				umem->umem, &xsk->rx, &xsk->tx, &umem->fq, &umem->cq, &cfg);
+
+			cfg.bind_flags |= XDP_USE_SG;
+			ret = xsk_socket__create_shared(&xsk->xsk, server->ifaces[i].ifname,
+											server->config.queue, umem->umem, &xsk->rx,
+											&xsk->tx, &umem->fq, &umem->cq, &cfg);
 			if (ret) {
-				fprintf(stderr, "Error creating XDP socket\n");
-				return -ret;
+				fprintf(stderr, "Error creating XDP socket in multibuffer mode\n");
+				cfg.bind_flags = server->config.xdp_mode;
+				ret = xsk_socket__create_shared(&xsk->xsk, server->ifaces[i].ifname,
+												server->config.queue, umem->umem, &xsk->rx,
+												&xsk->tx, &umem->fq, &umem->cq, &cfg);
+				if (ret) {
+					fprintf(stderr, "Error creating XDP socket\n");
+					return -ret;
+				}
 			}
 			/* ret = bpf_get_link_xdp_id(server->ifaces[i].ifid, */
 			/* 						  &server->ifaces[i].prog_id, */

@@ -45,7 +45,7 @@ int monitor_bind_daemon_socket(char *server, char *monitor);
 // Maximum size of variable-length fields in socket messages. Since we pass
 // entire packets to the monitor to get reply paths, this must be at least as
 // large as HERCULES_MAX_PKT_SIZE.
-#define SOCKMSG_MAX_PAYLOAD 5000
+#define SOCKMSG_MAX_PAYLOAD 10000
 _Static_assert(SOCKMSG_MAX_PAYLOAD >= HERCULES_MAX_PKTSIZE,
 			   "Socket messages too small");
 
