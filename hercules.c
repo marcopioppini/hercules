@@ -540,6 +540,10 @@ static const char *parse_pkt_fast_path(const char *pkt, size_t length, bool chec
 	if(offset == UINT32_MAX) {
 		offset = *(int *)pkt;
 	}
+	if (offset > length) {
+		debug_printf("Offset past end of packet (fragmented?)");
+		return NULL;
+	}
 	if(check) {
 		struct udphdr *l4udph = (struct udphdr *)(pkt + offset) - 1;
 		u16 header_checksum = l4udph->check;
@@ -1091,11 +1095,39 @@ static void rx_receive_batch(struct hercules_server *server,
 
 	u64 frame_addrs[BATCH_SIZE];
 	for (size_t i = 0; i < rcvd; i++) {
-		u64 addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->addr;
-		frame_addrs[i] = addr;
-		u32 len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->len;
-		const char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-		const char *rbudp_pkt = parse_pkt_fast_path(pkt, len, true, UINT32_MAX);
+		u8 pktbuf[9000];
+		u64 pkt_total_len = 0;
+		void *next = pktbuf;
+		for (int f = 0; f < 3; f++) {
+			// For jumbo frames, our packet may consist of up to 3 fragments.
+			// In two cases this is not possible and we just drop the packet:
+			// XXX We currently just drop the packet if it is split across read batches, as
+			// the beginning and ending fragments of the packet may have been read by two
+			// different threads and we have no way of reconstructing it.
+			const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i);
+			u64 addr = desc->addr;
+			assert(i < rcvd);
+			frame_addrs[i] = addr;
+			u32 len = desc->len;
+			/* debug_printf("frag len %u, opts %#x", len, desc->options); */
+			next = mempcpy(next, xsk_umem__get_data(xsk->umem->buffer, addr), len);
+			pkt_total_len += len;
+			bool continues_in_next_frag = (desc->options & XDP_PKT_CONTD);
+			if (continues_in_next_frag) {
+				i++;
+				if (i >= rcvd) {
+				// packet continues in next batch (possibly another thread)
+				// XXX can we do something other than dropping this packet?
+					goto release;
+				}
+				assert(f != 2 && "Packet consisting of more than 3 fragments?");
+			} else {
+				break;
+			}
+		}
+
+		const char *pkt = pktbuf;
+		const char *rbudp_pkt = parse_pkt_fast_path(pkt, pkt_total_len, true, UINT32_MAX);
 		if (!rbudp_pkt) {
 			debug_printf("Unparseable packet on XDP socket, ignoring");
 			continue;
@@ -1142,12 +1174,13 @@ static void rx_receive_batch(struct hercules_server *server,
 											   &old_last_pkt_rcvd, now);
 			}
 			if (!handle_rbudp_data_pkt(session_rx->rx_state, rbudp_pkt,
-									   len - (rbudp_pkt - pkt))) {
+									   pkt_total_len - (rbudp_pkt - pkt))) {
 				debug_printf("Non-data packet on XDP socket? Ignoring.");
 			}
 		}
 		atomic_fetch_add(&session_rx->rx_npkts, 1);
 	}
+release:
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 	submit_rx_frames(xsk->umem, frame_addrs, rcvd);
 }
@@ -1326,7 +1359,7 @@ static bool rx_update_reply_path(
 		return false;
 	}
 	assert(rx_sample_len > 0);
-	assert(rx_sample_len <= XSK_UMEM__DEFAULT_FRAME_SIZE);
+	assert(rx_sample_len <= HERCULES_MAX_PKTSIZE);
 
 	int ret =
 		monitor_get_reply_path(server->usock, rx_sample_buf, rx_sample_len,
@@ -1970,17 +2003,17 @@ static void claim_tx_frames(struct hercules_server *server, struct hercules_inte
 
 	for(size_t i = 0; i < num_frames; i++) {
 		addrs[i] = frame_queue__cons_fetch(&iface->umem->available_frames, i);
+		/* debug_printf("claimed frame %p", addrs[i]); */
 	}
 	frame_queue__pop(&iface->umem->available_frames, num_frames);
 	pthread_spin_unlock(&iface->umem->frames_lock);
 }
 
-static char *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_idx, size_t framelen)
+static struct xdp_desc *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_idx)
 {
-	xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx)->addr = addr;
-	xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx)->len = framelen;
-	char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-	return pkt;
+	struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx);
+	tx_desc->addr = addr;
+	return tx_desc;
 }
 
 #ifdef RANDOMIZE_FLOWID
@@ -1992,9 +2025,10 @@ static _Atomic short src_port_ctr = 0;
 
 static inline void tx_handle_send_queue_unit_for_iface(
 	struct sender_state *tx_state, struct xsk_socket_info *xsk, int ifid,
-	u64 frame_addrs[SEND_QUEUE_ENTRIES_PER_UNIT], struct send_queue_unit *unit,
-	u32 thread_id, bool is_index_transfer) {
+	u64 frame_addrs[3*SEND_QUEUE_ENTRIES_PER_UNIT], struct send_queue_unit *unit,
+	u32 thread_id, bool is_index_transfer, int frames_per_chunk) {
 	u32 num_chunks_in_unit = 0;
+	u8 pktbuf[9000]; /// HACK copy, remove me
 	struct path_set *pathset = pathset_read(tx_state, thread_id);
 	for (u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++) {
 		if (unit->paths[i] == UINT8_MAX) {
@@ -2010,8 +2044,9 @@ static inline void tx_handle_send_queue_unit_for_iface(
 	}
 
 	u32 idx;
-	if (xsk_ring_prod__reserve(&xsk->tx, num_chunks_in_unit, &idx) !=
-		num_chunks_in_unit) {
+	u32 to_reserve = num_chunks_in_unit * frames_per_chunk;
+	if (xsk_ring_prod__reserve(&xsk->tx, to_reserve, &idx) !=
+		to_reserve) {
 		// As there are fewer frames in the loop than slots in the TX ring, this
 		// should not happen
 		exit_with_error(NULL, EINVAL);
@@ -2055,10 +2090,16 @@ static inline void tx_handle_send_queue_unit_for_iface(
 				umin64(tx_state->chunklen, tx_state->index_size - chunk_start);
 		}
 
-		void *pkt = prepare_frame(xsk, frame_addrs[current_frame],
-								  idx + current_frame, path->framelen);
-		frame_addrs[current_frame] = -1;
-		current_frame++;
+		struct xdp_desc *tx_descs[3];
+		void *frames_data[3];
+		for (int i = 0; i < frames_per_chunk; i++){
+			/* debug_printf("using frame %p", frame_addrs[current_frame]); */
+			tx_descs[i] = prepare_frame(xsk, frame_addrs[current_frame], idx+current_frame);
+			frames_data[i] = xsk_umem__get_data(xsk->umem->buffer, frame_addrs[current_frame]);
+			frame_addrs[current_frame] = -1;
+			current_frame++;
+		}
+		void *pkt = pktbuf; // HACK memcpy
 		void *rbudp_pkt = mempcpy(pkt, path->header.header, path->headerlen);
 
 #ifdef RANDOMIZE_FLOWID
@@ -2091,19 +2132,36 @@ static inline void tx_handle_send_queue_unit_for_iface(
 		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, flags, seqnr,
 					   payload + chunk_start, len, path->payloadlen);
 		stitch_checksum_with_dst(path, path->header.checksum, pkt);
+
+		u64 pkt_total_len = path->headerlen + path->payloadlen;
+		u64 pkt_bytes_left = pkt_total_len;
+		u64 pkt_bytes[3];
+		void *next_frag = pktbuf;
+		for (int f = 0; f < frames_per_chunk; f++) {
+			pkt_bytes[f] = pkt_bytes_left > HERCULES_FRAG_SIZE ? HERCULES_FRAG_SIZE
+															   : pkt_bytes_left;
+			memcpy(frames_data[f], next_frag, pkt_bytes[f]);
+			next_frag += pkt_bytes[f];
+			pkt_bytes_left -= pkt_bytes[f];
+			tx_descs[f]->len = pkt_bytes[f];
+			tx_descs[f]->options = (pkt_bytes_left > 0) ? XDP_PKT_CONTD : 0;
+		}
+		/* debug_printf("copied 1:%llu | 2:%llu | 3:%llu", pkt_bytes[0], pkt_bytes[1], */
+		/* 			 pkt_bytes[2]); */
+		assert(pkt_bytes_left == 0 && "Packet did not fit in fragments?");
 	}
-	xsk_ring_prod__submit(&xsk->tx, num_chunks_in_unit);
+	xsk_ring_prod__submit(&xsk->tx, to_reserve);
 }
 
 static inline void tx_handle_send_queue_unit(
 	struct hercules_server *server, struct sender_state *tx_state,
 	struct xsk_socket_info *xsks[],
-	u64 frame_addrs[][SEND_QUEUE_ENTRIES_PER_UNIT],
-	struct send_queue_unit *unit, u32 thread_id, bool is_index_transfer) {
+	u64 frame_addrs[server->num_ifaces][SEND_QUEUE_ENTRIES_PER_UNIT*3],
+	struct send_queue_unit *unit, u32 thread_id, bool is_index_transfer, int frames_per_chunk) {
 	for (int i = 0; i < server->num_ifaces; i++) {
 		tx_handle_send_queue_unit_for_iface(
 			tx_state, xsks[i], server->ifaces[i].ifid, frame_addrs[i], unit,
-			thread_id, is_index_transfer);
+			thread_id, is_index_transfer, frames_per_chunk);
 	}
 }
 
@@ -2145,16 +2203,13 @@ static void produce_batch(struct hercules_server *server,
 }
 
 static inline void allocate_tx_frames(struct hercules_server *server,
-									  u64 frame_addrs[][SEND_QUEUE_ENTRIES_PER_UNIT])
+									  u64 frame_addrs[server->num_ifaces][3*SEND_QUEUE_ENTRIES_PER_UNIT],
+									  int num_chunks,
+									  int frames_per_chunk)
 {
 	for(int i = 0; i < server->num_ifaces; i++) {
-		int num_frames;
-		for(num_frames = 0; num_frames < SEND_QUEUE_ENTRIES_PER_UNIT; num_frames++) {
-			if(frame_addrs[i][num_frames] != (u64) -1) {
-				break;
-			}
-		}
-		claim_tx_frames(server, &server->ifaces[i], frame_addrs[i], num_frames);
+		int num_frames = num_chunks * frames_per_chunk;
+		claim_tx_frames(server, &server->ifaces[i], (u64 *)&(frame_addrs[i]), num_frames);
 	}
 }
 
@@ -2862,17 +2917,27 @@ static void tx_send_p(void *arg) {
 			}
 			num_chunks_in_unit++;
 		}
-		u64 frame_addrs[server->num_ifaces][SEND_QUEUE_ENTRIES_PER_UNIT];
-		memset(frame_addrs, 0xFF, sizeof(frame_addrs));
-		for (u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++) {
-			if (i >= num_chunks_in_unit) {
-				frame_addrs[0][i] = 0;
-			}
+
+		// We need to allocate 1,2 or 3 frames per chunk, depending on the payload length.
+		// TODO move this to session creation, no need to recompute
+		// TODO before setting, check frags supported
+		int frames_per_chunk = 1;
+		if (session_tx->payloadlen + HERCULES_MAX_HEADERLEN > HERCULES_FRAG_SIZE) {
+			frames_per_chunk = 2;
 		}
-		allocate_tx_frames(server, frame_addrs);
+		if (session_tx->payloadlen + HERCULES_MAX_HEADERLEN > 2*HERCULES_FRAG_SIZE) {
+			frames_per_chunk = 3;
+		}
+
+		// We need to claim up to 3 frames per chunk and the chunks may need to be sent
+		// via different interfaces
+		u64 frame_addrs[server->num_ifaces][3*SEND_QUEUE_ENTRIES_PER_UNIT];
+		memset(frame_addrs, 0xFF, sizeof(frame_addrs));
+		allocate_tx_frames(server, frame_addrs, num_chunks_in_unit, frames_per_chunk);
+
 		tx_handle_send_queue_unit(server, session_tx->tx_state, args->xsks,
 								  frame_addrs, &unit, args->id,
-								  is_index_transfer);
+								  is_index_transfer, frames_per_chunk);
 		atomic_fetch_add(&session_tx->tx_npkts, num_chunks_in_unit);
 		if (++batch > 5){
 		for (int i = 0; i < server->num_ifaces; i++){
