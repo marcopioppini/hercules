@@ -53,9 +53,14 @@ func main() {
 	dst_path := flag.Arg(3)
 
 	// Try to parse to catch errors
-	_, err := snet.ParseUDPAddr(dst_addr)
+	dst_parsed, err := snet.ParseUDPAddr(dst_addr)
 	if err != nil {
 		fmt.Println("Invalid destination address.", err)
+		os.Exit(2)
+	}
+
+	if dst_parsed.Host.Port == 0 {
+		fmt.Println("Destination port not set!");
 		os.Exit(2)
 	}
 
