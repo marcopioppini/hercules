@@ -370,6 +370,11 @@ int load_xsk_redirect_userspace(struct hercules_server *server,
 }
 
 int xdp_setup(struct hercules_server *server) {
+	server->have_frags_support = true;
+	if (!server->config.enable_multibuf) {
+		debug_printf("Multibuf disabled by config");
+		server->have_frags_support = false;
+	}
 	for (int i = 0; i < server->num_ifaces; i++) {
 		debug_printf("Preparing interface %d", i);
 		// Prepare UMEM for XSK sockets
@@ -429,6 +434,11 @@ int xdp_setup(struct hercules_server *server) {
 			cfg.xdp_flags = server->config.xdp_flags;
 			cfg.bind_flags = server->config.xdp_mode;
 
+			// Kernel 6.6 is required to bind with the following flag (jumbo frame support).
+			// We try to bind with the flag and again without, if the first one fails, to
+			// test for support.
+			// XXX This does not mean the underlying driver/nic supports it, querying for
+			// that seems not to work. See the comment in load_xsk_redirect_userspace above.
 			cfg.bind_flags |= XDP_USE_SG;
 			ret = xsk_socket__create_shared(&xsk->xsk, server->ifaces[i].ifname,
 											server->config.queue, umem->umem, &xsk->rx,
@@ -443,13 +453,8 @@ int xdp_setup(struct hercules_server *server) {
 					fprintf(stderr, "Error creating XDP socket\n");
 					return -ret;
 				}
+				server->have_frags_support = false;
 			}
-			/* ret = bpf_get_link_xdp_id(server->ifaces[i].ifid, */
-			/* 						  &server->ifaces[i].prog_id, */
-			/* 						  server->config.xdp_flags); */
-			/* if (ret) { */
-			/* 	return -ret; */
-			/* } */
 			server->ifaces[i].xsks[t] = xsk;
 		}
 		server->ifaces[i].num_sockets = server->config.n_threads;

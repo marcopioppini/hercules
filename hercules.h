@@ -215,9 +215,11 @@ struct hercules_session {
 
 	struct hercules_app_addr peer;	//< UDP/SCION address of peer (big endian)
 	u64 jobid;						//< The monitor's ID for this job
-	u32 payloadlen;	 //< The payload length used for this transfer. Note that
-					 // the payload length includes the rbudp header while the
-					 // chunk length does not.
+	u32 payloadlen;		   //< The payload length used for this transfer. Note that
+						   // the payload length includes the rbudp header while the
+						   // chunk length does not.
+	u32 frames_per_chunk;  // How many umem frames required per packet when running
+						   // in multibuffer mode
 };
 
 /// SERVER
@@ -244,6 +246,7 @@ struct hercules_config {
 	int queue;
 	bool configure_queues;
 	bool enable_pcc;
+	bool enable_multibuf;
 	int rate_limit;	 // Sending rate limit, only used when PCC is enabled
 	bool tx_only;	 // Run in send-only mode, do not start RX threads.
 	bool rx_only;	 // Run in receive-only mode, do not start TX threads.
@@ -273,6 +276,8 @@ struct hercules_server {
 													  // waiting to be freed
 
 	unsigned int *ifindices;
+	bool have_frags_support;  // Whether we managed to bind with xdp multibuffer
+							  // support enabled on all interfaces.
 	int num_ifaces;
 	struct hercules_interface ifaces[];
 };

@@ -75,6 +75,7 @@ type MonitorConfig struct {
 	Queue           int
 	ConfigureQueues bool
 	EnablePCC       bool
+	XDPMultiBuffer  bool
 	TxOnly			bool
 	RxOnly			bool
 	RateLimit       int

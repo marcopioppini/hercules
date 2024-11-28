@@ -318,6 +318,13 @@ static struct hercules_session *make_session(
 	s->error = SESSION_ERROR_NONE;
 	s->payloadlen = payloadlen;
 	debug_printf("Using payloadlen %u", payloadlen);
+	s->frames_per_chunk = 1;
+	if (s->payloadlen + HERCULES_MAX_HEADERLEN > HERCULES_FRAG_SIZE) {
+		s->frames_per_chunk = 2;
+	}
+	if (s->payloadlen + HERCULES_MAX_HEADERLEN > 2*HERCULES_FRAG_SIZE) {
+		s->frames_per_chunk = 3;
+	}
 	s->jobid = job_id;
 	s->peer = *peer_addr;
 	s->last_pkt_sent = 0;
@@ -2013,6 +2020,8 @@ static struct xdp_desc *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32
 {
 	struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx);
 	tx_desc->addr = addr;
+	tx_desc->len = 0;
+	tx_desc->options = 0;
 	return tx_desc;
 }
 
@@ -2918,26 +2927,17 @@ static void tx_send_p(void *arg) {
 			num_chunks_in_unit++;
 		}
 
-		// We need to allocate 1,2 or 3 frames per chunk, depending on the payload length.
-		// TODO move this to session creation, no need to recompute
-		// TODO before setting, check frags supported
-		int frames_per_chunk = 1;
-		if (session_tx->payloadlen + HERCULES_MAX_HEADERLEN > HERCULES_FRAG_SIZE) {
-			frames_per_chunk = 2;
-		}
-		if (session_tx->payloadlen + HERCULES_MAX_HEADERLEN > 2*HERCULES_FRAG_SIZE) {
-			frames_per_chunk = 3;
-		}
+		assert (server->have_frags_support || session_tx->frames_per_chunk == 1);
 
 		// We need to claim up to 3 frames per chunk and the chunks may need to be sent
 		// via different interfaces
 		u64 frame_addrs[server->num_ifaces][3*SEND_QUEUE_ENTRIES_PER_UNIT];
 		memset(frame_addrs, 0xFF, sizeof(frame_addrs));
-		allocate_tx_frames(server, frame_addrs, num_chunks_in_unit, frames_per_chunk);
+		allocate_tx_frames(server, frame_addrs, num_chunks_in_unit, session_tx->frames_per_chunk);
 
 		tx_handle_send_queue_unit(server, session_tx->tx_state, args->xsks,
 								  frame_addrs, &unit, args->id,
-								  is_index_transfer, frames_per_chunk);
+								  is_index_transfer, session_tx->frames_per_chunk);
 		atomic_fetch_add(&session_tx->tx_npkts, num_chunks_in_unit);
 		if (++batch > 5){
 		for (int i = 0; i < server->num_ifaces; i++){
@@ -3188,6 +3188,17 @@ static void new_tx_if_available(struct hercules_server *server) {
 	if (sizeof(struct rbudp_initial_pkt) + rbudp_headerlen >
 		(size_t)payloadlen) {
 		debug_printf("supplied payloadlen too small");
+		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE,
+						   SESSION_ERROR_BAD_MTU, 0, 0);
+		free(fname);
+		free(destname);
+		return;
+	}
+	if (!server->have_frags_support &&
+		(size_t)payloadlen + HERCULES_MAX_HEADERLEN > HERCULES_FRAG_SIZE) {
+		debug_printf(
+			"MTU too large: would exceed %uB and running without frags support.",
+			HERCULES_FRAG_SIZE);
 		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE,
 						   SESSION_ERROR_BAD_MTU, 0, 0);
 		free(fname);
@@ -3676,6 +3687,11 @@ static void events_p(void *arg) {
 				continue;
 			}
 
+			// Drop packets larger than a single fragment if running without frags support
+			if (len > HERCULES_FRAG_SIZE && !server->have_frags_support) {
+				continue;
+			}
+
 			u8 scmp_bad_path = PCC_NO_PATH;
 			u16 scmp_bad_port = 0;
 			const char *rbudp_pkt =
@@ -4058,6 +4074,7 @@ int main(int argc, char *argv[]) {
 	config.queue = 0;
 	config.configure_queues = true;
 	config.enable_pcc = true;
+	config.enable_multibuf = true;
 	config.rate_limit = 3333333;
 	config.n_threads = 1;
 	config.xdp_mode = XDP_COPY;
@@ -4225,6 +4242,17 @@ int main(int argc, char *argv[]) {
 	} else {
 		if (toml_key_exists(conf, "XDPZeroCopy")) {
 			fprintf(stderr, "Error parsing XDPZeroCopy\n");
+			exit(1);
+		}
+	}
+
+	// XDP multibuf enable
+	toml_datum_t enable_multibuf = toml_bool_in(conf, "XDPMultiBuffer");
+	if (enable_multibuf.ok) {
+		config.enable_multibuf = (enable_multibuf.u.b);
+	} else {
+		if (toml_key_exists(conf, "XDPMultiBuffer")) {
+			fprintf(stderr, "Error parsing XDPMultiBuffer\n");
 			exit(1);
 		}
 	}
