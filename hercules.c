@@ -534,6 +534,85 @@ u16 scion_udp_checksum(const u8 *buf, int len)
 	return computed_checksum;
 }
 
+// Multibuffer (xdp frags) version of scion_udp_checksum
+u16 scion_udp_checksum_multibuf(const void *pkt_data[3],
+								const struct xdp_desc *pkt_descs[3], int len) {
+	chk_input chk_input_s;
+	chk_input *input = init_chk_input(
+		&chk_input_s, 4);  // initialize checksum_parse for 4 chunks
+	if (!input) {
+		debug_printf("Unable to initialize checksum input: %p", input);
+		return 0;
+	}
+
+	struct scionhdr *scionh =
+		(struct scionhdr *)(pkt_data[0] + sizeof(struct ether_header) +
+							sizeof(struct iphdr) + sizeof(struct udphdr));
+	u8 *scionh_ptr = (u8 *)scionh;
+
+	// XXX construct a pseudo header that is compatible with the checksum
+	// computation in scionproto/go/lib/slayers/scion.go
+	u32 pseudo_header_size = sizeof(struct scionaddrhdr_ipv4) +
+							 sizeof(struct udphdr) + 2 * sizeof(u32);
+	u32 pseudo_header[pseudo_header_size / sizeof(u32)];
+
+	// SCION address header
+	const u32 *addr_hdr = (u32 *)(scionh_ptr + sizeof(struct scionhdr));
+	size_t i = 0;
+	for (; i < sizeof(struct scionaddrhdr_ipv4) / sizeof(u32); i++) {
+		pseudo_header[i] = ntohl(addr_hdr[i]);
+	}
+
+	pseudo_header[i++] = len;
+
+	__u8 next_header = scionh->next_header;
+	size_t next_offset = scionh->header_len * SCION_HEADER_LINELEN;
+	if (next_header == SCION_HEADER_HBH) {
+		next_header = *(scionh_ptr + next_offset);
+		next_offset +=
+			(*(scionh_ptr + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+	if (next_header == SCION_HEADER_E2E) {
+		next_header = *(scionh_ptr + next_offset);
+		next_offset +=
+			(*(scionh_ptr + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+
+	pseudo_header[i++] = next_header;
+
+	// UDP header
+	const u32 *udp_hdr =
+		(const u32 *)(scionh_ptr + next_offset);  // skip over SCION header and
+												  // extension headers
+	for (int offset = i; i - offset < sizeof(struct udphdr) / sizeof(u32);
+		 i++) {
+		pseudo_header[i] = ntohl(udp_hdr[i - offset]);
+	}
+	pseudo_header[i - 1] &= 0xFFFF0000;	 // zero-out UDP checksum
+	chk_add_chunk(input, (u8 *)pseudo_header, pseudo_header_size);
+
+	// Length in UDP header includes header size, so subtract it.
+	struct udphdr *udphdr = (struct udphdr *)udp_hdr;
+	u16 payload_len = ntohs(udphdr->len) - sizeof(struct udphdr);
+	if (payload_len != len - sizeof(struct udphdr)) {
+		debug_printf("Invalid payload_len: Got %u, Expected: %d", payload_len,
+					 len - (int)sizeof(struct udphdr));
+		return 0;
+	}
+	const u8 *payload = (u8 *)(udphdr + 1);	 // skip over UDP header
+	u64 hdr_bytes = ((u64)udphdr) - ((u64)pkt_data[0]);
+	chk_add_chunk(input, payload, pkt_descs[0]->len - hdr_bytes - 8);
+	if (pkt_descs[1]) {
+		chk_add_chunk(input, pkt_data[1], pkt_descs[1]->len);
+	}
+	if (pkt_descs[2]) {
+		chk_add_chunk(input, pkt_data[2], pkt_descs[2]->len);
+	}
+
+	u16 computed_checksum = checksum(input);
+	return computed_checksum;
+}
+
 // Parse ethernet/IP/UDP/SCION/UDP packet,
 // this is an extension to the parse_pkt
 // function below only doing the checking
@@ -570,6 +649,39 @@ static const char *parse_pkt_fast_path(const char *pkt, size_t length, bool chec
 		}
 	}
 	return pkt + offset;
+}
+
+static u64 parse_pkt_fast_path_multibuf(const void *pkt_data[3],
+										const struct xdp_desc *pkt_descs[3],
+										size_t length, bool check,
+										size_t offset) {
+	if (offset == UINT32_MAX) {
+		offset = *(int *)pkt_data[0];
+	}
+	if (offset > length) {
+		debug_printf("Offset past end of packet (fragmented?)");
+		return 0;
+	}
+	if (offset > pkt_descs[0]->len) {
+		debug_printf("Headers extend past end of first fragment!");
+		return 0;
+	}
+	if (check) {
+		struct udphdr *l4udph = (struct udphdr *)(pkt_data[0] + offset) - 1;
+		u16 header_checksum = l4udph->check;
+		if (header_checksum != 0) {
+			u16 computed_checksum = scion_udp_checksum_multibuf(
+				pkt_data, pkt_descs, length - offset + sizeof(struct udphdr));
+			if (header_checksum != computed_checksum) {
+				debug_printf(
+					"Checksum in SCION/UDP header %u "
+					"does not match computed checksum %u",
+					ntohs(header_checksum), ntohs(computed_checksum));
+				return 0;
+			}
+		}
+	}
+	return offset;
 }
 
 // The SCMP packet contains a copy of the offending message we sent, parse it to
@@ -1020,14 +1132,19 @@ static bool rx_received_all(const struct receiver_state *rx_state,
 	return (rx_state->received_chunks.num_set == rx_state->total_chunks);
 }
 
-static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *pkt, size_t length)
+static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const void *pkt_data[3], const struct xdp_desc *pkt_descs[3], size_t rbudp_pkt_offset, u64 pkt_total_len)
 {
-	if(length < rbudp_headerlen + rx_state->chunklen) {
-		debug_printf("packet too short: have %lu, expect %d", length, rbudp_headerlen + rx_state->chunklen );
+	size_t rbudp_length = pkt_total_len - rbudp_pkt_offset;
+	if(rbudp_length < rbudp_headerlen + rx_state->chunklen) {
+		debug_printf("packet too short: have %lu, expect %d", rbudp_length, rbudp_headerlen + rx_state->chunklen );
+		return false;
+	}
+	if (pkt_descs[0]->len < rbudp_pkt_offset + rbudp_headerlen){
+		debug_printf("first fragment too short for rbudp header");
 		return false;
 	}
 
-	struct hercules_header *hdr = (struct hercules_header *)pkt;
+	struct hercules_header *hdr = (struct hercules_header *)( pkt_data[0] + rbudp_pkt_offset);
 	bool is_index_transfer = hdr->flags & PKT_FLAG_IS_INDEX;
 
 	u32 chunk_idx = hdr->chunk_idx;
@@ -1100,7 +1217,6 @@ static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *p
 	}
 	if(!prev) {
 		char *target_ptr = rx_state->mem;
-		const char *payload = pkt + rbudp_headerlen;
 		const size_t chunk_start = (size_t)chunk_idx * rx_state->chunklen;
 		size_t len =
 			umin64(rx_state->chunklen, rx_state->filesize - chunk_start);
@@ -1108,7 +1224,28 @@ static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *p
 			target_ptr = rx_state->index;
 			len = umin64(rx_state->chunklen, rx_state->index_size - chunk_start);
 		}
-		memcpy(target_ptr + chunk_start, payload, len);
+
+		u64 chunk_bytes_left = len;
+		void *copy_dst = target_ptr + chunk_start;
+		for (int f = 0; f < 3; f++){
+			if (!pkt_descs[f]){
+				break;
+			}
+			u64 frag_bytes_left = pkt_descs[f]->len;
+			const void *frag_data_start = pkt_data[f];
+			if (f == 0){
+				frag_bytes_left -= (rbudp_headerlen + rbudp_pkt_offset);
+				frag_data_start = pkt_data[0] + rbudp_headerlen + rbudp_pkt_offset;
+			}
+			u64 to_copy = (chunk_bytes_left > frag_bytes_left) ? frag_bytes_left : chunk_bytes_left;
+			copy_dst = mempcpy(copy_dst, frag_data_start, to_copy);
+			chunk_bytes_left -= to_copy;
+			if (chunk_bytes_left == 0) {
+				break;
+			}
+		}
+		assert(chunk_bytes_left == 0 && "Chunk incomplete after copy?");
+
 		// Update last new pkt timestamp
 		u64 now = get_nsecs();
 		u64 old_ts = atomic_load(&rx_state->session->last_new_pkt_rcvd);
@@ -1202,9 +1339,9 @@ static void rx_receive_batch(struct hercules_server *server,
 
 	u64 frame_addrs[BATCH_SIZE];
 	for (size_t i = 0; i < rcvd; i++) {
-		u8 pktbuf[9000];
+		const void *pkt_data[3] = {NULL, NULL, NULL};
+		const struct xdp_desc *pkt_descs[3] = {NULL, NULL, NULL};
 		u64 pkt_total_len = 0;
-		void *next = pktbuf;
 		for (int f = 0; f < 3; f++) {
 			// For jumbo frames, our packet may consist of up to 3 fragments.
 			// In two cases this is not possible and we just drop the packet:
@@ -1217,7 +1354,8 @@ static void rx_receive_batch(struct hercules_server *server,
 			frame_addrs[i] = addr;
 			u32 len = desc->len;
 			/* debug_printf("frag len %u, opts %#x", len, desc->options); */
-			next = mempcpy(next, xsk_umem__get_data(xsk->umem->buffer, addr), len);
+			pkt_data[f] = xsk_umem__get_data(xsk->umem->buffer, addr);
+			pkt_descs[f] = desc;
 			pkt_total_len += len;
 			bool continues_in_next_frag = (desc->options & XDP_PKT_CONTD);
 			if (continues_in_next_frag) {
@@ -1233,12 +1371,13 @@ static void rx_receive_batch(struct hercules_server *server,
 			}
 		}
 
-		const char *pkt = pktbuf;
-		const char *rbudp_pkt = parse_pkt_fast_path(pkt, pkt_total_len, true, UINT32_MAX);
-		if (!rbudp_pkt) {
+		const u64 rbudp_pkt_offset = parse_pkt_fast_path_multibuf(
+			pkt_data, pkt_descs, pkt_total_len, true, UINT32_MAX);
+		if (!rbudp_pkt_offset) {
 			debug_printf("Unparseable packet on XDP socket, ignoring");
 			continue;
 		}
+		const void *rbudp_pkt = pkt_data[0] + rbudp_pkt_offset;
 		u16 pkt_dst_port = ntohs(*(u16 *)(rbudp_pkt - 6));
 
 		struct hercules_session *session_rx =
@@ -1280,8 +1419,8 @@ static void rx_receive_batch(struct hercules_server *server,
 				atomic_compare_exchange_strong(&session_rx->last_pkt_rcvd,
 											   &old_last_pkt_rcvd, now);
 			}
-			if (!handle_rbudp_data_pkt(session_rx->rx_state, rbudp_pkt,
-									   pkt_total_len - (rbudp_pkt - pkt))) {
+			if (!handle_rbudp_data_pkt(session_rx->rx_state, pkt_data, pkt_descs,
+									   rbudp_pkt_offset, pkt_total_len)) {
 				debug_printf("Non-data packet on XDP socket? Ignoring.");
 			}
 		}
