@@ -852,6 +852,42 @@ static void stitch_checksum_with_dst(const struct hercules_path *path, u16 preco
 	mempcpy(payload - 2, &pkt_checksum, sizeof(pkt_checksum));
 }
 
+// Used when the original header (and, thus, the checksum) does not contain the
+// correct destination port. Multibuffer (xdp fragments) version
+static void stitch_checksum_with_dst_multibuf(const struct hercules_path *path,
+											  u16 precomputed_checksum,
+											  void *frames_data[3],
+											  struct xdp_desc *tx_descs[3]) {
+	chk_input chk_input_s;
+	chk_input *chksum_struc = init_chk_input(&chk_input_s, 6);
+	assert(chksum_struc);
+
+	char *payload = frames_data[0] + path->headerlen;
+	u16 udp_src_le = ntohs(*(u16 *)(payload - 8));
+	u16 udp_dst_le = ntohs(*(u16 *)(payload - 6));
+
+	precomputed_checksum =
+		~precomputed_checksum;	// take one complement of precomputed checksum
+	chk_add_chunk(chksum_struc, (u8 *)&precomputed_checksum,
+				  2);  // add precomputed header checksum
+	chk_add_chunk(chksum_struc, (u8 *)&udp_src_le, 2);
+	chk_add_chunk(chksum_struc, (u8 *)&udp_dst_le, 2);
+
+	chk_add_chunk(chksum_struc, (u8 *)payload,
+				  tx_descs[0]->len - path->headerlen);	// add payload (frag 1)
+	if (tx_descs[1]) {
+		chk_add_chunk(chksum_struc, (u8 *)frames_data[1],
+					  tx_descs[1]->len);  // add payload (frag 2)
+	}
+	if (tx_descs[2]) {
+		chk_add_chunk(chksum_struc, (u8 *)frames_data[2],
+					  tx_descs[2]->len);  // add payload (frag 3)
+	}
+	u16 pkt_checksum = checksum(chksum_struc);
+
+	mempcpy(payload - 2, &pkt_checksum, sizeof(pkt_checksum));
+}
+
 // Used when the original header (and checksum) already contains the correct destination port.
 static void stitch_checksum(const struct hercules_path *path, u16 precomputed_checksum, char *pkt)
 {
@@ -884,6 +920,70 @@ static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx, u8 flags
 			   payloadlen - rbudp_headerlen - n);
 	}
 	debug_print_rbudp_pkt(rbudp_pkt, false);
+}
+
+// Multibuffer (xdp frags) version of fill_rbudp_pkt
+static void fill_pkt_multibuf(void *frame_data[3],
+							  struct xdp_desc *frame_desc[3], u32 chunk_idx,
+							  u8 path_idx, u8 flags, sequence_number seqnr,
+							  const char *data, size_t n,
+							  const struct hercules_path *path) {
+	void *rbudp_pkt =
+		mempcpy(frame_data[0], path->header.header, path->headerlen);
+	struct hercules_header *hdr = (struct hercules_header *)rbudp_pkt;
+	hdr->chunk_idx = chunk_idx;
+	hdr->path = path_idx;
+	hdr->flags = flags;
+	hdr->seqno = seqnr;
+
+	int chunk_bytes_left = n;  // data bytes to be copied
+	int padding_bytes_left = (rbudp_headerlen + n < path->payloadlen)
+								 ? path->payloadlen - rbudp_headerlen - n
+								 : 0;
+
+	for (int f = 0; f < 3; f++) {
+		int frame_space_left = HERCULES_FRAG_SIZE;
+		void *pkt_payload = frame_data[f];
+		if (pkt_payload == NULL) {
+			break;
+		}
+		int frag_len = 0;
+		if (f == 0) {
+			// Fragment 0 already contains the headers
+			frame_space_left = HERCULES_FRAG_SIZE - path->headerlen -
+							   rbudp_headerlen;	 // space left in frame
+			pkt_payload = hdr->data;
+			frag_len = path->headerlen + rbudp_headerlen;
+		}
+
+		int data_bytes = frame_space_left > chunk_bytes_left ? chunk_bytes_left
+															 : frame_space_left;
+		pkt_payload = mempcpy(pkt_payload, data, data_bytes);
+		data += data_bytes;
+		chunk_bytes_left -= data_bytes;
+		frame_space_left -= data_bytes;
+		frag_len += data_bytes;
+
+		int padding_bytes = frame_space_left > padding_bytes_left
+								? padding_bytes_left
+								: frame_space_left;
+		memset(pkt_payload, 0, padding_bytes);
+		pkt_payload += padding_bytes;
+		padding_bytes_left -= padding_bytes;
+		frame_space_left -= padding_bytes;
+		frag_len += padding_bytes;
+
+		frame_desc[f]->len = frag_len;
+		frame_desc[f]->options =
+			(chunk_bytes_left > 0 || padding_bytes_left > 0) ?
+				XDP_PKT_CONTD : 0;
+		/* debug_printf("copied> frag %d: %d bytes", f, frag_len); */
+		if (chunk_bytes_left == 0 && padding_bytes_left == 0) {
+			break;
+		}
+	}
+	assert(chunk_bytes_left == 0 && "Packet did not fit in fragments?");
+	assert(padding_bytes_left == 0 && "Padding did not fit in fragments?");
 }
 
 // Check an initial (HS) packet and return a pointer to it in *parsed_pkt
@@ -2037,7 +2137,6 @@ static inline void tx_handle_send_queue_unit_for_iface(
 	u64 frame_addrs[3*SEND_QUEUE_ENTRIES_PER_UNIT], struct send_queue_unit *unit,
 	u32 thread_id, bool is_index_transfer, int frames_per_chunk) {
 	u32 num_chunks_in_unit = 0;
-	u8 pktbuf[9000]; /// HACK copy, remove me
 	struct path_set *pathset = pathset_read(tx_state, thread_id);
 	for (u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++) {
 		if (unit->paths[i] == UINT8_MAX) {
@@ -2099,8 +2198,8 @@ static inline void tx_handle_send_queue_unit_for_iface(
 				umin64(tx_state->chunklen, tx_state->index_size - chunk_start);
 		}
 
-		struct xdp_desc *tx_descs[3];
-		void *frames_data[3];
+		struct xdp_desc *tx_descs[3] = {NULL, NULL, NULL};
+		void *frames_data[3] = {NULL, NULL, NULL};
 		for (int i = 0; i < frames_per_chunk; i++){
 			/* debug_printf("using frame %p", frame_addrs[current_frame]); */
 			tx_descs[i] = prepare_frame(xsk, frame_addrs[current_frame], idx+current_frame);
@@ -2108,9 +2207,25 @@ static inline void tx_handle_send_queue_unit_for_iface(
 			frame_addrs[current_frame] = -1;
 			current_frame++;
 		}
-		void *pkt = pktbuf; // HACK memcpy
-		void *rbudp_pkt = mempcpy(pkt, path->header.header, path->headerlen);
+		void *pkt = frames_data[0];
 
+		u8 track_path = PCC_NO_PATH;  // put path_idx iff PCC is enabled
+		sequence_number seqnr = 0;
+		if (path->cc_state != NULL) {
+			track_path = unit->paths[i];
+			seqnr = atomic_fetch_add(&path->cc_state->last_seqnr, 1);
+		}
+		u8 flags = 0;
+		char *payload = tx_state->mem;
+		if (is_index_transfer) {
+			flags |= PKT_FLAG_IS_INDEX;
+			payload = tx_state->index;
+		}
+
+		fill_pkt_multibuf(frames_data, tx_descs, chunk_idx, track_path, flags, seqnr,
+						  payload + chunk_start, len, path);
+		stitch_dst_port(path, tx_state->session->peer.port, pkt);
+		stitch_src_port(path, tx_state->src_port, pkt);
 #ifdef RANDOMIZE_FLOWID
 		short *flowId = (short *)&(
 			(char *)pkt)[44];  // ethernet hdr (14), ip hdr (20), udp hdr (8),
@@ -2124,40 +2239,8 @@ static inline void tx_handle_send_queue_unit_for_iface(
 										  // is first 2 bytes of udp header
 		*src_port = atomic_fetch_add(&src_port_ctr, 1);
 #endif
-		u8 track_path = PCC_NO_PATH;  // put path_idx iff PCC is enabled
-		sequence_number seqnr = 0;
-		if (path->cc_state != NULL) {
-			track_path = unit->paths[i];
-			seqnr = atomic_fetch_add(&path->cc_state->last_seqnr, 1);
-		}
-		u8 flags = 0;
-		char *payload = tx_state->mem;
-		if (is_index_transfer) {
-			flags |= PKT_FLAG_IS_INDEX;
-			payload = tx_state->index;
-		}
-		stitch_dst_port(path, tx_state->session->peer.port, pkt);
-		stitch_src_port(path, tx_state->src_port, pkt);
-		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, flags, seqnr,
-					   payload + chunk_start, len, path->payloadlen);
-		stitch_checksum_with_dst(path, path->header.checksum, pkt);
-
-		u64 pkt_total_len = path->headerlen + path->payloadlen;
-		u64 pkt_bytes_left = pkt_total_len;
-		u64 pkt_bytes[3];
-		void *next_frag = pktbuf;
-		for (int f = 0; f < frames_per_chunk; f++) {
-			pkt_bytes[f] = pkt_bytes_left > HERCULES_FRAG_SIZE ? HERCULES_FRAG_SIZE
-															   : pkt_bytes_left;
-			memcpy(frames_data[f], next_frag, pkt_bytes[f]);
-			next_frag += pkt_bytes[f];
-			pkt_bytes_left -= pkt_bytes[f];
-			tx_descs[f]->len = pkt_bytes[f];
-			tx_descs[f]->options = (pkt_bytes_left > 0) ? XDP_PKT_CONTD : 0;
-		}
-		/* debug_printf("copied 1:%llu | 2:%llu | 3:%llu", pkt_bytes[0], pkt_bytes[1], */
-		/* 			 pkt_bytes[2]); */
-		assert(pkt_bytes_left == 0 && "Packet did not fit in fragments?");
+		stitch_checksum_with_dst_multibuf(path, path->header.checksum, frames_data,
+										  tx_descs);
 	}
 	xsk_ring_prod__submit(&xsk->tx, to_reserve);
 }
@@ -2939,11 +3022,11 @@ static void tx_send_p(void *arg) {
 								  frame_addrs, &unit, args->id,
 								  is_index_transfer, session_tx->frames_per_chunk);
 		atomic_fetch_add(&session_tx->tx_npkts, num_chunks_in_unit);
-		if (++batch > 5){
-		for (int i = 0; i < server->num_ifaces; i++){
-			kick_tx(server, args->xsks[i]);
-		}
-		batch = 0;
+		if (++batch > 5) {
+			for (int i = 0; i < server->num_ifaces; i++) {
+				kick_tx(server, args->xsks[i]);
+			}
+			batch = 0;
 		}
 	}
 }
