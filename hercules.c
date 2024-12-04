@@ -3620,6 +3620,7 @@ static void tx_update_paths(struct hercules_server *server, int s, u64 now) {
 			calloc(old_pathset->n_paths, sizeof(*replaced_cc));
 		if (replaced_cc == NULL) {
 			free(paths);
+			free(new_pathset);
 			return;
 		}
 
