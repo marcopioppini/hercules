@@ -156,6 +156,15 @@ The following general configuration options are available:
 > The default value is
 > *false*.
 
+**XDPMultiBuffer**=*bool*
+
+> If the system does not support XDP in multibuffer mode, this option can be used
+> to disable it.
+> As this functionality is required for jumbo frame support,
+> disabling it limits the packet size to 3000B.
+> The default value is
+> *true*.
+
 **Queue**=*int*
 
 > Specify the NIC RX queue on which to receive packets.

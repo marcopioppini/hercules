@@ -2,8 +2,8 @@ TARGET_SERVER := hercules-server
 TARGET_MONITOR := hercules-monitor
 TARGET_HCP := hcp/hcp
 
-CC := clang
-CFLAGS = -O3 -g3 -std=gnu11 -D_GNU_SOURCE -Itomlc99
+CC := gcc
+CFLAGS = -O3 -g3 -std=gnu11 -D_GNU_SOURCE -Itomlc99 -Ixdp-tools/lib/libbpf/include/uapi -Ixdp-tools/headers
 # CFLAGS += -DNDEBUG
 CFLAGS += -Wall -Wextra
 
@@ -25,7 +25,7 @@ CFLAGS += -DPRINT_STATS
 # CFLAGS += -DDEBUG_PRINT_PKTS # print received/sent packets (lots of noise!)
 
 
-LDFLAGS = -g3 -l:libbpf.a -Lbpf/src -Ltomlc99 -lm -lelf -latomic -pthread -lz -ltoml -z noexecstack $(ASAN_FLAG)
+LDFLAGS = -g3 -l:libxdp.a -l:libbpf.a -Ltomlc99 -lm -lelf -latomic -pthread -lz -ltoml -z noexecstack $(ASAN_FLAG)
 DEPFLAGS := -MP -MD
 
 SRCS := $(wildcard *.c)
@@ -79,7 +79,7 @@ docker_%: builder
 $(TARGET_MONITOR): $(MONITORFILES) $(wildcard *.h)
 	cd monitor && go build -o "../$@" -ldflags "-X main.startupVersion=${VERSION}"
 
-$(TARGET_SERVER): $(OBJS) bpf_prgm/redirect_userspace.o bpf/src/libbpf.a tomlc99/libtoml.a
+$(TARGET_SERVER): $(OBJS) bpf_prgm/redirect_userspace.o tomlc99/libtoml.a
 	@# update modification dates in assembly, so that the new version gets loaded
 	@sed -i -e "s/\(load bpf_prgm_redirect_userspace\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/redirect_userspace.c | head -c 32)/g" bpf_prgms.s
 	$(CC) -o $@ $(OBJS) bpf_prgms.s $(LDFLAGS)
@@ -101,15 +101,17 @@ bpf_prgm/%.o: bpf_prgm/%.ll
 # explicitly list intermediates for dependency resolution
 bpf_prgm/redirect_userspace.ll:
 
-bpf/src/libbpf.a:
-	@if [ ! -d bpf/src ]; then \
-		echo "Error: Need libbpf submodule"; \
+.PHONY: libxdp
+libxdp:
+	@if [ ! -d xdp-tools/lib ]; then \
+		echo "Error: Need libxdp submodule"; \
 		echo "May need to run git submodule update --init"; \
 		exit 1; \
 	else \
-		cd bpf/src && $(MAKE) all OBJDIR=.; \
-		mkdir -p build; \
-		$(MAKE) install_headers DESTDIR=build OBJDIR=.; \
+		cd xdp-tools && ./configure && \
+		cd lib && make && \
+		cd libxdp && make install && \
+		cd ../libbpf/src && make install; \
 	fi
 
 tomlc99/libtoml.a:
@@ -133,6 +135,7 @@ builder: builder_image
 		docker run -t --entrypoint cat --name hercules-builder -v $(PWD):/`basename $(PWD)` -w /`basename $(PWD)` -d hercules-builder
 	@docker container ls --format={{.Names}} | grep hercules-builder -q || \
 		docker start hercules-builder
+	@docker exec hercules-builder ls /usr/local/include/xdp >/dev/null 2>&1 || docker exec -u0 hercules-builder make libxdp
 
 builder_image:
 	@docker images | grep hercules-builder -q || \

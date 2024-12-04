@@ -21,7 +21,6 @@
 #include <stdbool.h>
 #include <string.h>
 #include <pthread.h>
-#include "bpf/src/libbpf_util.h"
 
 /** Simple bit-set that keeps track of number of elements in the set. */
 struct bitset {
@@ -50,7 +49,7 @@ static inline bool bitset__check(struct bitset *s, u32 i)
 static inline bool bitset__set_mt_safe(struct bitset *s, u32 i)
 {
 	pthread_spin_lock(&s->lock);
-	libbpf_smp_rmb();
+	asm volatile("":::"memory"); // XXX why is this here?
 	unsigned int bit = 1u << i % HERCULES_BITSET_WORD_BITS;
 	unsigned int prev = atomic_fetch_or(&s->bitmap[i / HERCULES_BITSET_WORD_BITS], bit);
 	if(!(prev & bit)) {
@@ -65,7 +64,7 @@ static inline bool bitset__set_mt_safe(struct bitset *s, u32 i)
 		pthread_spin_unlock(&s->lock);
 		return false;
 	}
-	libbpf_smp_wmb();
+	asm volatile("":::"memory");
 	pthread_spin_unlock(&s->lock);
 	return true;
 }

@@ -129,6 +129,13 @@ If your combination of NIC/drivers supports XDP in zero-copy mode,
 enabling it here will likely improve performance.
 The default value is
 .Ar false .
+.It Ic XDPMultiBuffer Ns = Ns Ar bool
+If the system does not support XDP in multibuffer mode, this option can be used
+to disable it.
+As this functionality is required for jumbo frame support,
+disabling it limits the packet size to 3000B.
+The default value is
+.Ar true .
 .It Ic Queue Ns = Ns Ar int
 Specify the NIC RX queue on which to receive packets.
 The default value is

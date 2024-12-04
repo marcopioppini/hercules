@@ -137,6 +137,9 @@ On Ubuntu you can install the required packages as follows:
 `# apt install build-essential llvm clang git golang libz-dev libelf-dev
 linux-headers-generic gcc-multilib`
 
+You will additionally need `libbpf` and `libxdp`. You can install them manually
+or run `sudo make libxdp` to install them to your system from the git submodules.
+
 To build Hercules, run `make all`.
 This will build the server and monitor executables, as well as the `hcp` tool.
 

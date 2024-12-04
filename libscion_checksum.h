@@ -1,7 +1,7 @@
 #ifndef _CHECKSUM_H_
 #define _CHECKSUM_H_
 
-#define SCION_MAX_CHECKSUM_CHUNKS 5
+#define SCION_MAX_CHECKSUM_CHUNKS 6
 
 typedef struct {
 	uint8_t idx;

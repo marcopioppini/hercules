@@ -3,6 +3,7 @@
 // Copyright(c) 2019 ETH Zurich.
 
 #include "hercules.h"
+#include <xdp/xsk.h>
 #include "packet.h"
 #include <stdatomic.h>
 #include <assert.h>
@@ -38,9 +39,8 @@
 #include <arpa/inet.h>
 #include "linux/bpf_util.h"
 
-#include "bpf/src/libbpf.h"
-#include "bpf/src/bpf.h"
-#include "bpf/src/xsk.h"
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 #include "linux/filter.h" // actually linux/tools/include/linux/filter.h
 
 #include "toml.h"
@@ -318,6 +318,13 @@ static struct hercules_session *make_session(
 	s->error = SESSION_ERROR_NONE;
 	s->payloadlen = payloadlen;
 	debug_printf("Using payloadlen %u", payloadlen);
+	s->frames_per_chunk = 1;
+	if (s->payloadlen + HERCULES_MAX_HEADERLEN > HERCULES_FRAG_SIZE) {
+		s->frames_per_chunk = 2;
+	}
+	if (s->payloadlen + HERCULES_MAX_HEADERLEN > 2*HERCULES_FRAG_SIZE) {
+		s->frames_per_chunk = 3;
+	}
 	s->jobid = job_id;
 	s->peer = *peer_addr;
 	s->last_pkt_sent = 0;
@@ -527,6 +534,85 @@ u16 scion_udp_checksum(const u8 *buf, int len)
 	return computed_checksum;
 }
 
+// Multibuffer (xdp frags) version of scion_udp_checksum
+u16 scion_udp_checksum_multibuf(const void *pkt_data[3],
+								const struct xdp_desc *pkt_descs[3], int len) {
+	chk_input chk_input_s;
+	chk_input *input = init_chk_input(
+		&chk_input_s, 4);  // initialize checksum_parse for 4 chunks
+	if (!input) {
+		debug_printf("Unable to initialize checksum input: %p", input);
+		return 0;
+	}
+
+	struct scionhdr *scionh =
+		(struct scionhdr *)(pkt_data[0] + sizeof(struct ether_header) +
+							sizeof(struct iphdr) + sizeof(struct udphdr));
+	u8 *scionh_ptr = (u8 *)scionh;
+
+	// XXX construct a pseudo header that is compatible with the checksum
+	// computation in scionproto/go/lib/slayers/scion.go
+	u32 pseudo_header_size = sizeof(struct scionaddrhdr_ipv4) +
+							 sizeof(struct udphdr) + 2 * sizeof(u32);
+	u32 pseudo_header[pseudo_header_size / sizeof(u32)];
+
+	// SCION address header
+	const u32 *addr_hdr = (u32 *)(scionh_ptr + sizeof(struct scionhdr));
+	size_t i = 0;
+	for (; i < sizeof(struct scionaddrhdr_ipv4) / sizeof(u32); i++) {
+		pseudo_header[i] = ntohl(addr_hdr[i]);
+	}
+
+	pseudo_header[i++] = len;
+
+	__u8 next_header = scionh->next_header;
+	size_t next_offset = scionh->header_len * SCION_HEADER_LINELEN;
+	if (next_header == SCION_HEADER_HBH) {
+		next_header = *(scionh_ptr + next_offset);
+		next_offset +=
+			(*(scionh_ptr + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+	if (next_header == SCION_HEADER_E2E) {
+		next_header = *(scionh_ptr + next_offset);
+		next_offset +=
+			(*(scionh_ptr + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+
+	pseudo_header[i++] = next_header;
+
+	// UDP header
+	const u32 *udp_hdr =
+		(const u32 *)(scionh_ptr + next_offset);  // skip over SCION header and
+												  // extension headers
+	for (int offset = i; i - offset < sizeof(struct udphdr) / sizeof(u32);
+		 i++) {
+		pseudo_header[i] = ntohl(udp_hdr[i - offset]);
+	}
+	pseudo_header[i - 1] &= 0xFFFF0000;	 // zero-out UDP checksum
+	chk_add_chunk(input, (u8 *)pseudo_header, pseudo_header_size);
+
+	// Length in UDP header includes header size, so subtract it.
+	struct udphdr *udphdr = (struct udphdr *)udp_hdr;
+	u16 payload_len = ntohs(udphdr->len) - sizeof(struct udphdr);
+	if (payload_len != len - sizeof(struct udphdr)) {
+		debug_printf("Invalid payload_len: Got %u, Expected: %d", payload_len,
+					 len - (int)sizeof(struct udphdr));
+		return 0;
+	}
+	const u8 *payload = (u8 *)(udphdr + 1);	 // skip over UDP header
+	u64 hdr_bytes = ((u64)udphdr) - ((u64)pkt_data[0]);
+	chk_add_chunk(input, payload, pkt_descs[0]->len - hdr_bytes - 8);
+	if (pkt_descs[1]) {
+		chk_add_chunk(input, pkt_data[1], pkt_descs[1]->len);
+	}
+	if (pkt_descs[2]) {
+		chk_add_chunk(input, pkt_data[2], pkt_descs[2]->len);
+	}
+
+	u16 computed_checksum = checksum(input);
+	return computed_checksum;
+}
+
 // Parse ethernet/IP/UDP/SCION/UDP packet,
 // this is an extension to the parse_pkt
 // function below only doing the checking
@@ -539,6 +625,10 @@ static const char *parse_pkt_fast_path(const char *pkt, size_t length, bool chec
 {
 	if(offset == UINT32_MAX) {
 		offset = *(int *)pkt;
+	}
+	if (offset > length) {
+		debug_printf("Offset past end of packet (fragmented?)");
+		return NULL;
 	}
 	if(check) {
 		struct udphdr *l4udph = (struct udphdr *)(pkt + offset) - 1;
@@ -559,6 +649,39 @@ static const char *parse_pkt_fast_path(const char *pkt, size_t length, bool chec
 		}
 	}
 	return pkt + offset;
+}
+
+static u64 parse_pkt_fast_path_multibuf(const void *pkt_data[3],
+										const struct xdp_desc *pkt_descs[3],
+										size_t length, bool check,
+										size_t offset) {
+	if (offset == UINT32_MAX) {
+		offset = *(int *)pkt_data[0];
+	}
+	if (offset > length) {
+		debug_printf("Offset past end of packet (fragmented?)");
+		return 0;
+	}
+	if (offset > pkt_descs[0]->len) {
+		debug_printf("Headers extend past end of first fragment!");
+		return 0;
+	}
+	if (check) {
+		struct udphdr *l4udph = (struct udphdr *)(pkt_data[0] + offset) - 1;
+		u16 header_checksum = l4udph->check;
+		if (header_checksum != 0) {
+			u16 computed_checksum = scion_udp_checksum_multibuf(
+				pkt_data, pkt_descs, length - offset + sizeof(struct udphdr));
+			if (header_checksum != computed_checksum) {
+				debug_printf(
+					"Checksum in SCION/UDP header %u "
+					"does not match computed checksum %u",
+					ntohs(header_checksum), ntohs(computed_checksum));
+				return 0;
+			}
+		}
+	}
+	return offset;
 }
 
 // The SCMP packet contains a copy of the offending message we sent, parse it to
@@ -841,6 +964,42 @@ static void stitch_checksum_with_dst(const struct hercules_path *path, u16 preco
 	mempcpy(payload - 2, &pkt_checksum, sizeof(pkt_checksum));
 }
 
+// Used when the original header (and, thus, the checksum) does not contain the
+// correct destination port. Multibuffer (xdp fragments) version
+static void stitch_checksum_with_dst_multibuf(const struct hercules_path *path,
+											  u16 precomputed_checksum,
+											  void *frames_data[3],
+											  struct xdp_desc *tx_descs[3]) {
+	chk_input chk_input_s;
+	chk_input *chksum_struc = init_chk_input(&chk_input_s, 6);
+	assert(chksum_struc);
+
+	char *payload = frames_data[0] + path->headerlen;
+	u16 udp_src_le = ntohs(*(u16 *)(payload - 8));
+	u16 udp_dst_le = ntohs(*(u16 *)(payload - 6));
+
+	precomputed_checksum =
+		~precomputed_checksum;	// take one complement of precomputed checksum
+	chk_add_chunk(chksum_struc, (u8 *)&precomputed_checksum,
+				  2);  // add precomputed header checksum
+	chk_add_chunk(chksum_struc, (u8 *)&udp_src_le, 2);
+	chk_add_chunk(chksum_struc, (u8 *)&udp_dst_le, 2);
+
+	chk_add_chunk(chksum_struc, (u8 *)payload,
+				  tx_descs[0]->len - path->headerlen);	// add payload (frag 1)
+	if (tx_descs[1]) {
+		chk_add_chunk(chksum_struc, (u8 *)frames_data[1],
+					  tx_descs[1]->len);  // add payload (frag 2)
+	}
+	if (tx_descs[2]) {
+		chk_add_chunk(chksum_struc, (u8 *)frames_data[2],
+					  tx_descs[2]->len);  // add payload (frag 3)
+	}
+	u16 pkt_checksum = checksum(chksum_struc);
+
+	mempcpy(payload - 2, &pkt_checksum, sizeof(pkt_checksum));
+}
+
 // Used when the original header (and checksum) already contains the correct destination port.
 static void stitch_checksum(const struct hercules_path *path, u16 precomputed_checksum, char *pkt)
 {
@@ -873,6 +1032,70 @@ static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx, u8 flags
 			   payloadlen - rbudp_headerlen - n);
 	}
 	debug_print_rbudp_pkt(rbudp_pkt, false);
+}
+
+// Multibuffer (xdp frags) version of fill_rbudp_pkt
+static void fill_pkt_multibuf(void *frame_data[3],
+							  struct xdp_desc *frame_desc[3], u32 chunk_idx,
+							  u8 path_idx, u8 flags, sequence_number seqnr,
+							  const char *data, size_t n,
+							  const struct hercules_path *path) {
+	void *rbudp_pkt =
+		mempcpy(frame_data[0], path->header.header, path->headerlen);
+	struct hercules_header *hdr = (struct hercules_header *)rbudp_pkt;
+	hdr->chunk_idx = chunk_idx;
+	hdr->path = path_idx;
+	hdr->flags = flags;
+	hdr->seqno = seqnr;
+
+	int chunk_bytes_left = n;  // data bytes to be copied
+	int padding_bytes_left = (rbudp_headerlen + n < path->payloadlen)
+								 ? path->payloadlen - rbudp_headerlen - n
+								 : 0;
+
+	for (int f = 0; f < 3; f++) {
+		int frame_space_left = HERCULES_FRAG_SIZE;
+		void *pkt_payload = frame_data[f];
+		if (pkt_payload == NULL) {
+			break;
+		}
+		int frag_len = 0;
+		if (f == 0) {
+			// Fragment 0 already contains the headers
+			frame_space_left = HERCULES_FRAG_SIZE - path->headerlen -
+							   rbudp_headerlen;	 // space left in frame
+			pkt_payload = hdr->data;
+			frag_len = path->headerlen + rbudp_headerlen;
+		}
+
+		int data_bytes = frame_space_left > chunk_bytes_left ? chunk_bytes_left
+															 : frame_space_left;
+		pkt_payload = mempcpy(pkt_payload, data, data_bytes);
+		data += data_bytes;
+		chunk_bytes_left -= data_bytes;
+		frame_space_left -= data_bytes;
+		frag_len += data_bytes;
+
+		int padding_bytes = frame_space_left > padding_bytes_left
+								? padding_bytes_left
+								: frame_space_left;
+		memset(pkt_payload, 0, padding_bytes);
+		pkt_payload += padding_bytes;
+		padding_bytes_left -= padding_bytes;
+		frame_space_left -= padding_bytes;
+		frag_len += padding_bytes;
+
+		frame_desc[f]->len = frag_len;
+		frame_desc[f]->options =
+			(chunk_bytes_left > 0 || padding_bytes_left > 0) ?
+				XDP_PKT_CONTD : 0;
+		/* debug_printf("copied> frag %d: %d bytes", f, frag_len); */
+		if (chunk_bytes_left == 0 && padding_bytes_left == 0) {
+			break;
+		}
+	}
+	assert(chunk_bytes_left == 0 && "Packet did not fit in fragments?");
+	assert(padding_bytes_left == 0 && "Padding did not fit in fragments?");
 }
 
 // Check an initial (HS) packet and return a pointer to it in *parsed_pkt
@@ -909,14 +1132,19 @@ static bool rx_received_all(const struct receiver_state *rx_state,
 	return (rx_state->received_chunks.num_set == rx_state->total_chunks);
 }
 
-static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *pkt, size_t length)
+static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const void *pkt_data[3], const struct xdp_desc *pkt_descs[3], size_t rbudp_pkt_offset, u64 pkt_total_len)
 {
-	if(length < rbudp_headerlen + rx_state->chunklen) {
-		debug_printf("packet too short: have %lu, expect %d", length, rbudp_headerlen + rx_state->chunklen );
+	size_t rbudp_length = pkt_total_len - rbudp_pkt_offset;
+	if(rbudp_length < rbudp_headerlen + rx_state->chunklen) {
+		debug_printf("packet too short: have %lu, expect %d", rbudp_length, rbudp_headerlen + rx_state->chunklen );
+		return false;
+	}
+	if (pkt_descs[0]->len < rbudp_pkt_offset + rbudp_headerlen){
+		debug_printf("first fragment too short for rbudp header");
 		return false;
 	}
 
-	struct hercules_header *hdr = (struct hercules_header *)pkt;
+	struct hercules_header *hdr = (struct hercules_header *)( pkt_data[0] + rbudp_pkt_offset);
 	bool is_index_transfer = hdr->flags & PKT_FLAG_IS_INDEX;
 
 	u32 chunk_idx = hdr->chunk_idx;
@@ -989,7 +1217,6 @@ static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *p
 	}
 	if(!prev) {
 		char *target_ptr = rx_state->mem;
-		const char *payload = pkt + rbudp_headerlen;
 		const size_t chunk_start = (size_t)chunk_idx * rx_state->chunklen;
 		size_t len =
 			umin64(rx_state->chunklen, rx_state->filesize - chunk_start);
@@ -997,7 +1224,28 @@ static bool handle_rbudp_data_pkt(struct receiver_state *rx_state, const char *p
 			target_ptr = rx_state->index;
 			len = umin64(rx_state->chunklen, rx_state->index_size - chunk_start);
 		}
-		memcpy(target_ptr + chunk_start, payload, len);
+
+		u64 chunk_bytes_left = len;
+		void *copy_dst = target_ptr + chunk_start;
+		for (int f = 0; f < 3; f++){
+			if (!pkt_descs[f]){
+				break;
+			}
+			u64 frag_bytes_left = pkt_descs[f]->len;
+			const void *frag_data_start = pkt_data[f];
+			if (f == 0){
+				frag_bytes_left -= (rbudp_headerlen + rbudp_pkt_offset);
+				frag_data_start = pkt_data[0] + rbudp_headerlen + rbudp_pkt_offset;
+			}
+			u64 to_copy = (chunk_bytes_left > frag_bytes_left) ? frag_bytes_left : chunk_bytes_left;
+			copy_dst = mempcpy(copy_dst, frag_data_start, to_copy);
+			chunk_bytes_left -= to_copy;
+			if (chunk_bytes_left == 0) {
+				break;
+			}
+		}
+		assert(chunk_bytes_left == 0 && "Chunk incomplete after copy?");
+
 		// Update last new pkt timestamp
 		u64 now = get_nsecs();
 		u64 old_ts = atomic_load(&rx_state->session->last_new_pkt_rcvd);
@@ -1091,15 +1339,45 @@ static void rx_receive_batch(struct hercules_server *server,
 
 	u64 frame_addrs[BATCH_SIZE];
 	for (size_t i = 0; i < rcvd; i++) {
-		u64 addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->addr;
-		frame_addrs[i] = addr;
-		u32 len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->len;
-		const char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-		const char *rbudp_pkt = parse_pkt_fast_path(pkt, len, true, UINT32_MAX);
-		if (!rbudp_pkt) {
+		const void *pkt_data[3] = {NULL, NULL, NULL};
+		const struct xdp_desc *pkt_descs[3] = {NULL, NULL, NULL};
+		u64 pkt_total_len = 0;
+		for (int f = 0; f < 3; f++) {
+			// For jumbo frames, our packet may consist of up to 3 fragments.
+			// In two cases this is not possible and we just drop the packet:
+			// XXX We currently just drop the packet if it is split across read batches, as
+			// the beginning and ending fragments of the packet may have been read by two
+			// different threads and we have no way of reconstructing it.
+			const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i);
+			u64 addr = desc->addr;
+			assert(i < rcvd);
+			frame_addrs[i] = addr;
+			u32 len = desc->len;
+			/* debug_printf("frag len %u, opts %#x", len, desc->options); */
+			pkt_data[f] = xsk_umem__get_data(xsk->umem->buffer, addr);
+			pkt_descs[f] = desc;
+			pkt_total_len += len;
+			bool continues_in_next_frag = (desc->options & XDP_PKT_CONTD);
+			if (continues_in_next_frag) {
+				i++;
+				if (i >= rcvd) {
+				// packet continues in next batch (possibly another thread)
+				// XXX can we do something other than dropping this packet?
+					goto release;
+				}
+				assert(f != 2 && "Packet consisting of more than 3 fragments?");
+			} else {
+				break;
+			}
+		}
+
+		const u64 rbudp_pkt_offset = parse_pkt_fast_path_multibuf(
+			pkt_data, pkt_descs, pkt_total_len, true, UINT32_MAX);
+		if (!rbudp_pkt_offset) {
 			debug_printf("Unparseable packet on XDP socket, ignoring");
 			continue;
 		}
+		const void *rbudp_pkt = pkt_data[0] + rbudp_pkt_offset;
 		u16 pkt_dst_port = ntohs(*(u16 *)(rbudp_pkt - 6));
 
 		struct hercules_session *session_rx =
@@ -1141,13 +1419,14 @@ static void rx_receive_batch(struct hercules_server *server,
 				atomic_compare_exchange_strong(&session_rx->last_pkt_rcvd,
 											   &old_last_pkt_rcvd, now);
 			}
-			if (!handle_rbudp_data_pkt(session_rx->rx_state, rbudp_pkt,
-									   len - (rbudp_pkt - pkt))) {
+			if (!handle_rbudp_data_pkt(session_rx->rx_state, pkt_data, pkt_descs,
+									   rbudp_pkt_offset, pkt_total_len)) {
 				debug_printf("Non-data packet on XDP socket? Ignoring.");
 			}
 		}
 		atomic_fetch_add(&session_rx->rx_npkts, 1);
 	}
+release:
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 	submit_rx_frames(xsk->umem, frame_addrs, rcvd);
 }
@@ -1326,7 +1605,7 @@ static bool rx_update_reply_path(
 		return false;
 	}
 	assert(rx_sample_len > 0);
-	assert(rx_sample_len <= XSK_UMEM__DEFAULT_FRAME_SIZE);
+	assert(rx_sample_len <= HERCULES_MAX_PKTSIZE);
 
 	int ret =
 		monitor_get_reply_path(server->usock, rx_sample_buf, rx_sample_len,
@@ -1594,7 +1873,7 @@ static void rx_send_path_nacks(struct hercules_server *server, struct receiver_s
 	//sequence_number start = nack_end;
 	bool sent = false;
 	pthread_spin_lock(&path_state->seq_rcvd.lock);
-	libbpf_smp_rmb();
+	asm volatile("":::"memory"); // XXX why is this here?
 	for(u32 curr = path_state->nack_end; curr < path_state->seq_rcvd.num;) {
 		// Data to send
 		curr = fill_nack_pkt(curr, &control_pkt.payload.ack, max_entries, &path_state->seq_rcvd);
@@ -1624,7 +1903,7 @@ static void rx_send_path_nacks(struct hercules_server *server, struct receiver_s
 		send_eth_frame(server, &path, buf);
 		atomic_fetch_add(&rx_state->session->tx_npkts, 1);
 	}
-	libbpf_smp_wmb();
+	asm volatile("":::"memory"); // XXX why is this here?
 	pthread_spin_unlock(&path_state->seq_rcvd.lock);
 	path_state->nack_end = nack_end;
 }
@@ -1707,11 +1986,11 @@ static void tx_register_acks_index(const struct rbudp_ack_pkt *ack, struct sende
 static void pop_completion_ring(struct hercules_server *server, struct xsk_umem_info *umem)
 {
 	u32 idx;
-	size_t entries = xsk_ring_cons__peek(&umem->cq, SIZE_MAX, &idx);
+	u32 entries = xsk_ring_cons__peek(&umem->cq, INT32_MAX, &idx);
 	if(entries > 0) {
 		u16 num = frame_queue__prod_reserve(&umem->available_frames, entries);
 		if(num < entries) { // there are less frames in the loop than the number of slots in frame_queue
-			debug_printf("trying to push %ld frames, only got %d slots in frame_queue", entries, num);
+			debug_printf("trying to push %u frames, only got %d slots in frame_queue", entries, num);
 			exit_with_error(server, EINVAL);
 		}
 		for(u16 i = 0; i < num; i++) {
@@ -1970,17 +2249,19 @@ static void claim_tx_frames(struct hercules_server *server, struct hercules_inte
 
 	for(size_t i = 0; i < num_frames; i++) {
 		addrs[i] = frame_queue__cons_fetch(&iface->umem->available_frames, i);
+		/* debug_printf("claimed frame %p", addrs[i]); */
 	}
 	frame_queue__pop(&iface->umem->available_frames, num_frames);
 	pthread_spin_unlock(&iface->umem->frames_lock);
 }
 
-static char *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_idx, size_t framelen)
+static struct xdp_desc *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_idx)
 {
-	xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx)->addr = addr;
-	xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx)->len = framelen;
-	char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-	return pkt;
+	struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx);
+	tx_desc->addr = addr;
+	tx_desc->len = 0;
+	tx_desc->options = 0;
+	return tx_desc;
 }
 
 #ifdef RANDOMIZE_FLOWID
@@ -1992,8 +2273,8 @@ static _Atomic short src_port_ctr = 0;
 
 static inline void tx_handle_send_queue_unit_for_iface(
 	struct sender_state *tx_state, struct xsk_socket_info *xsk, int ifid,
-	u64 frame_addrs[SEND_QUEUE_ENTRIES_PER_UNIT], struct send_queue_unit *unit,
-	u32 thread_id, bool is_index_transfer) {
+	u64 frame_addrs[3*SEND_QUEUE_ENTRIES_PER_UNIT], struct send_queue_unit *unit,
+	u32 thread_id, bool is_index_transfer, int frames_per_chunk) {
 	u32 num_chunks_in_unit = 0;
 	struct path_set *pathset = pathset_read(tx_state, thread_id);
 	for (u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++) {
@@ -2010,8 +2291,9 @@ static inline void tx_handle_send_queue_unit_for_iface(
 	}
 
 	u32 idx;
-	if (xsk_ring_prod__reserve(&xsk->tx, num_chunks_in_unit, &idx) !=
-		num_chunks_in_unit) {
+	u32 to_reserve = num_chunks_in_unit * frames_per_chunk;
+	if (xsk_ring_prod__reserve(&xsk->tx, to_reserve, &idx) !=
+		to_reserve) {
 		// As there are fewer frames in the loop than slots in the TX ring, this
 		// should not happen
 		exit_with_error(NULL, EINVAL);
@@ -2055,12 +2337,34 @@ static inline void tx_handle_send_queue_unit_for_iface(
 				umin64(tx_state->chunklen, tx_state->index_size - chunk_start);
 		}
 
-		void *pkt = prepare_frame(xsk, frame_addrs[current_frame],
-								  idx + current_frame, path->framelen);
-		frame_addrs[current_frame] = -1;
-		current_frame++;
-		void *rbudp_pkt = mempcpy(pkt, path->header.header, path->headerlen);
+		struct xdp_desc *tx_descs[3] = {NULL, NULL, NULL};
+		void *frames_data[3] = {NULL, NULL, NULL};
+		for (int i = 0; i < frames_per_chunk; i++){
+			/* debug_printf("using frame %p", frame_addrs[current_frame]); */
+			tx_descs[i] = prepare_frame(xsk, frame_addrs[current_frame], idx+current_frame);
+			frames_data[i] = xsk_umem__get_data(xsk->umem->buffer, frame_addrs[current_frame]);
+			frame_addrs[current_frame] = -1;
+			current_frame++;
+		}
+		void *pkt = frames_data[0];
 
+		u8 track_path = PCC_NO_PATH;  // put path_idx iff PCC is enabled
+		sequence_number seqnr = 0;
+		if (path->cc_state != NULL) {
+			track_path = unit->paths[i];
+			seqnr = atomic_fetch_add(&path->cc_state->last_seqnr, 1);
+		}
+		u8 flags = 0;
+		char *payload = tx_state->mem;
+		if (is_index_transfer) {
+			flags |= PKT_FLAG_IS_INDEX;
+			payload = tx_state->index;
+		}
+
+		fill_pkt_multibuf(frames_data, tx_descs, chunk_idx, track_path, flags, seqnr,
+						  payload + chunk_start, len, path);
+		stitch_dst_port(path, tx_state->session->peer.port, pkt);
+		stitch_src_port(path, tx_state->src_port, pkt);
 #ifdef RANDOMIZE_FLOWID
 		short *flowId = (short *)&(
 			(char *)pkt)[44];  // ethernet hdr (14), ip hdr (20), udp hdr (8),
@@ -2074,36 +2378,21 @@ static inline void tx_handle_send_queue_unit_for_iface(
 										  // is first 2 bytes of udp header
 		*src_port = atomic_fetch_add(&src_port_ctr, 1);
 #endif
-		u8 track_path = PCC_NO_PATH;  // put path_idx iff PCC is enabled
-		sequence_number seqnr = 0;
-		if (path->cc_state != NULL) {
-			track_path = unit->paths[i];
-			seqnr = atomic_fetch_add(&path->cc_state->last_seqnr, 1);
-		}
-		u8 flags = 0;
-		char *payload = tx_state->mem;
-		if (is_index_transfer) {
-			flags |= PKT_FLAG_IS_INDEX;
-			payload = tx_state->index;
-		}
-		stitch_dst_port(path, tx_state->session->peer.port, pkt);
-		stitch_src_port(path, tx_state->src_port, pkt);
-		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, flags, seqnr,
-					   payload + chunk_start, len, path->payloadlen);
-		stitch_checksum_with_dst(path, path->header.checksum, pkt);
+		stitch_checksum_with_dst_multibuf(path, path->header.checksum, frames_data,
+										  tx_descs);
 	}
-	xsk_ring_prod__submit(&xsk->tx, num_chunks_in_unit);
+	xsk_ring_prod__submit(&xsk->tx, to_reserve);
 }
 
 static inline void tx_handle_send_queue_unit(
 	struct hercules_server *server, struct sender_state *tx_state,
 	struct xsk_socket_info *xsks[],
-	u64 frame_addrs[][SEND_QUEUE_ENTRIES_PER_UNIT],
-	struct send_queue_unit *unit, u32 thread_id, bool is_index_transfer) {
+	u64 frame_addrs[server->num_ifaces][SEND_QUEUE_ENTRIES_PER_UNIT*3],
+	struct send_queue_unit *unit, u32 thread_id, bool is_index_transfer, int frames_per_chunk) {
 	for (int i = 0; i < server->num_ifaces; i++) {
 		tx_handle_send_queue_unit_for_iface(
 			tx_state, xsks[i], server->ifaces[i].ifid, frame_addrs[i], unit,
-			thread_id, is_index_transfer);
+			thread_id, is_index_transfer, frames_per_chunk);
 	}
 }
 
@@ -2145,16 +2434,13 @@ static void produce_batch(struct hercules_server *server,
 }
 
 static inline void allocate_tx_frames(struct hercules_server *server,
-									  u64 frame_addrs[][SEND_QUEUE_ENTRIES_PER_UNIT])
+									  u64 frame_addrs[server->num_ifaces][3*SEND_QUEUE_ENTRIES_PER_UNIT],
+									  int num_chunks,
+									  int frames_per_chunk)
 {
 	for(int i = 0; i < server->num_ifaces; i++) {
-		int num_frames;
-		for(num_frames = 0; num_frames < SEND_QUEUE_ENTRIES_PER_UNIT; num_frames++) {
-			if(frame_addrs[i][num_frames] != (u64) -1) {
-				break;
-			}
-		}
-		claim_tx_frames(server, &server->ifaces[i], frame_addrs[i], num_frames);
+		int num_frames = num_chunks * frames_per_chunk;
+		claim_tx_frames(server, &server->ifaces[i], (u64 *)&(frame_addrs[i]), num_frames);
 	}
 }
 
@@ -2862,23 +3148,24 @@ static void tx_send_p(void *arg) {
 			}
 			num_chunks_in_unit++;
 		}
-		u64 frame_addrs[server->num_ifaces][SEND_QUEUE_ENTRIES_PER_UNIT];
+
+		assert (server->have_frags_support || session_tx->frames_per_chunk == 1);
+
+		// We need to claim up to 3 frames per chunk and the chunks may need to be sent
+		// via different interfaces
+		u64 frame_addrs[server->num_ifaces][3*SEND_QUEUE_ENTRIES_PER_UNIT];
 		memset(frame_addrs, 0xFF, sizeof(frame_addrs));
-		for (u32 i = 0; i < SEND_QUEUE_ENTRIES_PER_UNIT; i++) {
-			if (i >= num_chunks_in_unit) {
-				frame_addrs[0][i] = 0;
-			}
-		}
-		allocate_tx_frames(server, frame_addrs);
+		allocate_tx_frames(server, frame_addrs, num_chunks_in_unit, session_tx->frames_per_chunk);
+
 		tx_handle_send_queue_unit(server, session_tx->tx_state, args->xsks,
 								  frame_addrs, &unit, args->id,
-								  is_index_transfer);
+								  is_index_transfer, session_tx->frames_per_chunk);
 		atomic_fetch_add(&session_tx->tx_npkts, num_chunks_in_unit);
-		if (++batch > 5){
-		for (int i = 0; i < server->num_ifaces; i++){
-			kick_tx(server, args->xsks[i]);
-		}
-		batch = 0;
+		if (++batch > 5) {
+			for (int i = 0; i < server->num_ifaces; i++) {
+				kick_tx(server, args->xsks[i]);
+			}
+			batch = 0;
 		}
 	}
 }
@@ -3123,6 +3410,17 @@ static void new_tx_if_available(struct hercules_server *server) {
 	if (sizeof(struct rbudp_initial_pkt) + rbudp_headerlen >
 		(size_t)payloadlen) {
 		debug_printf("supplied payloadlen too small");
+		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE,
+						   SESSION_ERROR_BAD_MTU, 0, 0);
+		free(fname);
+		free(destname);
+		return;
+	}
+	if (!server->have_frags_support &&
+		(size_t)payloadlen + HERCULES_MAX_HEADERLEN > HERCULES_FRAG_SIZE) {
+		debug_printf(
+			"MTU too large: would exceed %uB and running without frags support.",
+			HERCULES_FRAG_SIZE);
 		monitor_update_job(server->usock, jobid, SESSION_STATE_DONE,
 						   SESSION_ERROR_BAD_MTU, 0, 0);
 		free(fname);
@@ -3611,6 +3909,11 @@ static void events_p(void *arg) {
 				continue;
 			}
 
+			// Drop packets larger than a single fragment if running without frags support
+			if (len > HERCULES_FRAG_SIZE && !server->have_frags_support) {
+				continue;
+			}
+
 			u8 scmp_bad_path = PCC_NO_PATH;
 			u16 scmp_bad_port = 0;
 			const char *rbudp_pkt =
@@ -3993,6 +4296,7 @@ int main(int argc, char *argv[]) {
 	config.queue = 0;
 	config.configure_queues = true;
 	config.enable_pcc = true;
+	config.enable_multibuf = true;
 	config.rate_limit = 3333333;
 	config.n_threads = 1;
 	config.xdp_mode = XDP_COPY;
@@ -4160,6 +4464,17 @@ int main(int argc, char *argv[]) {
 	} else {
 		if (toml_key_exists(conf, "XDPZeroCopy")) {
 			fprintf(stderr, "Error parsing XDPZeroCopy\n");
+			exit(1);
+		}
+	}
+
+	// XDP multibuf enable
+	toml_datum_t enable_multibuf = toml_bool_in(conf, "XDPMultiBuffer");
+	if (enable_multibuf.ok) {
+		config.enable_multibuf = (enable_multibuf.u.b);
+	} else {
+		if (toml_key_exists(conf, "XDPMultiBuffer")) {
+			fprintf(stderr, "Error parsing XDPMultiBuffer\n");
 			exit(1);
 		}
 	}

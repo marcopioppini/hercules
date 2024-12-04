@@ -50,6 +50,11 @@ XDPZeroCopy = true
 # Specify the NIC RX queue on which to receive packets
 Queue = 0
 
+# If the system does not support XDP in multibuffer mode, it can be disabled.
+# As this functionality is required for jumbo frame support,
+# disabling it limits the packet size to 3000B.
+XDPMultiBuffer = false
+
 # For Hercules to receive traffic, packets must be redirected to the queue
 # specified above. Hercules will try to configure this automatically, but this
 # behaviour can be overridden, e.g. if you wish to set custom rules or automatic
