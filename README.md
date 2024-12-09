@@ -189,7 +189,10 @@ Depending on your performance requirements and your specific bottlenecks, the fo
 - On machines with multiple NUMA nodes, it may be beneficial to bind the Hercules server process to CPU cores "closer" to the network card. 
   To do so, install the `numactl` utility and adjust the file `/usr/local/lib/systemd/system/hercules-server.service` so it reads `ExecStart=/usr/bin/numactl -l --cpunodebind=netdev:<device> -- /usr/local/bin/hercules-server`, replacing `<device>` with your network interface.
 
-- Setting the option `XDPZeroCopy = true` can substantially improve performance, but whether it is supported depends on the combination of network card and driver in your setup.
+- Using XDP in zero-copy mode can substantially improve performance, but whether it is supported depends on the combination of network card and driver in your setup. Hercules will attempt to use zero-copy mode automatically, if it appears to be supported. Note that some network cards require updating drivers/firmware to enable zero-copy mode.
+
+- Using larger packets (jumbo frames) can also improve performance. Hercules supports jumbo frames up to a MTU of 9000 bytes. Note, however, that support for jumbo frames (via XDP multibuffer/fragments) requires at least kernel 6.6. On older versions the packet size is limited to 3000 bytes.
+  Further, support for jumbo frames in combination with zero-copy mode is device-dependent. To use jumbo frames on such a device, disable zero-copy in Hercules' file.
 
 - Increasing the number of worker threads via the option `NumThreads` can also improve performance.
 

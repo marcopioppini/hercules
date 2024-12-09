@@ -2,6 +2,7 @@
 
 #include <asm-generic/errno-base.h>
 #include <linux/if_xdp.h>
+#include <linux/netdev.h>
 #include <unistd.h>
 #include <xdp/libxdp.h>
 
@@ -298,7 +299,7 @@ int load_xsk_redirect_userspace(struct hercules_server *server,
 			}
 		}
 
-		err = xdp_program__attach(prog, server->ifaces[i].ifid, XDP_MODE_UNSPEC, 0);
+		err = xdp_program__attach(prog, server->ifaces[i].ifid, server->config.xdp_mode, 0);
 		if (err) {
 			libxdp_strerror(err, errmsg, sizeof(errmsg));
 			fprintf(stderr, "Error attaching XDP program to interface %s: %s\n",
@@ -315,20 +316,6 @@ int load_xsk_redirect_userspace(struct hercules_server *server,
 		server->ifaces[i].xdp_prog = prog;
 
 		debug_printf("program supports frags? %d", xdp_program__xdp_frags_support(prog));
-
-		// XXX It should be possible to check whether multi-buffer (jumbo-frames) are
-		// supported with the following code, but this always returns 0. However, it
-		// also returns 0 for zero-copy support on machines that are known to support
-		// zero-copy (eg. zapdos), so something is wrong. Same thing happens if you use
-		// the xdp-loader utility (from xdp-tools, it uses the same approach) to query
-		// for feature support.
-		/* LIBBPF_OPTS(bpf_xdp_query_opts, opts); */
-		/* err = bpf_xdp_query(server->ifaces[i].ifid, 0, &opts); */
-		/* if (err) { */
-		/* 	debug_printf("query err"); */
-		/* 	return 1; */
-		/* } */
-		/* debug_printf("opts %#llx, zc frags %#x", opts.feature_flags, opts.xdp_zc_max_segs); */
 
 
 		// push XSKs
@@ -418,6 +405,32 @@ int xdp_setup(struct hercules_server *server) {
 			return EINVAL;
 		}
 
+		// XXX It should be possible to check whether multi-buffer (jumbo-frames) are
+		// supported with the following code, but this always returns 0. However, it
+		// also returns 0 for zero-copy support on machines that are known to support
+		// zero-copy (eg. zapdos), so something is wrong. Same thing happens if you use
+		// the xdp-loader utility (from xdp-tools, it uses the same approach) to query
+		// for feature support.
+		LIBBPF_OPTS(bpf_xdp_query_opts, opts);
+		int err = bpf_xdp_query(server->ifaces[i].ifid, 0, &opts);
+		if (err) {
+			fprintf(stderr, "Error querying device features");
+			return 1;
+		}
+		// If the device does ZC, check it supports the required number of fragments,
+		// too (this value is different for ZC/non-ZC).
+		// Skip check if the user disabled zc via config.
+		debug_printf("opts %#llx, zc frags %#x", opts.feature_flags,
+					 opts.xdp_zc_max_segs);
+		if (opts.feature_flags & NETDEV_XDP_ACT_XSK_ZEROCOPY &&
+			opts.xdp_zc_max_segs < 3 && (server->config.xdp_mode != XDP_MODE_SKB)) {
+			fprintf(stderr,
+					"Device supports zero-copy, but not with enough fragments. "
+					"Disabling jumbo frame support.\n Try disabling zero-copy if you "
+					"want to use jumbo frames.\n");
+			server->have_frags_support = false;
+		}
+
 		// Create XSK sockets
 		for (int t = 0; t < server->config.n_threads; t++) {
 			struct xsk_socket_info *xsk;
@@ -432,7 +445,7 @@ int xdp_setup(struct hercules_server *server) {
 			cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
 			cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 			cfg.xdp_flags = server->config.xdp_flags;
-			cfg.bind_flags = server->config.xdp_mode;
+			cfg.bind_flags = 0;
 
 			// Kernel 6.6 is required to bind with the following flag (jumbo frame support).
 			// We try to bind with the flag and again without, if the first one fails, to
@@ -444,8 +457,10 @@ int xdp_setup(struct hercules_server *server) {
 											server->config.queue, umem->umem, &xsk->rx,
 											&xsk->tx, &umem->fq, &umem->cq, &cfg);
 			if (ret) {
-				fprintf(stderr, "Error creating XDP socket in multibuffer mode\n");
-				cfg.bind_flags = server->config.xdp_mode;
+				fprintf(stderr,
+						"Error creating XDP socket in multibuffer mode. Disabling jumbo "
+						"frames.\n");
+				cfg.bind_flags = 0;
 				ret = xsk_socket__create_shared(&xsk->xsk, server->ifaces[i].ifname,
 												server->config.queue, umem->umem, &xsk->rx,
 												&xsk->tx, &umem->fq, &umem->cq, &cfg);

@@ -3,6 +3,7 @@
 // Copyright(c) 2019 ETH Zurich.
 
 #include "hercules.h"
+#include <xdp/libxdp.h>
 #include <xdp/xsk.h>
 #include "packet.h"
 #include <stdatomic.h>
@@ -4300,7 +4301,7 @@ int main(int argc, char *argv[]) {
 	config.enable_multibuf = true;
 	config.rate_limit = 3333333;
 	config.n_threads = 1;
-	config.xdp_mode = XDP_COPY;
+	config.xdp_mode = XDP_MODE_UNSPEC;
 
 	// Parse command line args (there is only one)
 	int opt;
@@ -4461,7 +4462,7 @@ int main(int argc, char *argv[]) {
 	// XDP Zerocopy
 	toml_datum_t zerocopy_enabled = toml_bool_in(conf, "XDPZeroCopy");
 	if (zerocopy_enabled.ok) {
-		config.xdp_mode = (zerocopy_enabled.u.b) ? XDP_ZEROCOPY : XDP_COPY;
+		config.xdp_mode = (zerocopy_enabled.u.b) ? XDP_MODE_NATIVE : XDP_MODE_SKB;
 	} else {
 		if (toml_key_exists(conf, "XDPZeroCopy")) {
 			fprintf(stderr, "Error parsing XDPZeroCopy\n");

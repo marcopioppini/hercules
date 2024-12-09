@@ -153,8 +153,8 @@ The following general configuration options are available:
 
 > If your combination of NIC/drivers supports XDP in zero-copy mode,
 > enabling it here will likely improve performance.
-> The default value is
-> *false*.
+> Zero-copy mode should be enabled automatically, if supported,
+> so only set this option if you need to override that.
 
 **XDPMultiBuffer**=*bool*
 

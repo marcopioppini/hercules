@@ -127,8 +127,8 @@ The default value is
 .It Ic XDPZeroCopy Ns = Ns Ar bool
 If your combination of NIC/drivers supports XDP in zero-copy mode,
 enabling it here will likely improve performance.
-The default value is
-.Ar false .
+Zero-copy mode should be enabled automatically, if supported,
+so only set this option if you need to override that.
 .It Ic XDPMultiBuffer Ns = Ns Ar bool
 If the system does not support XDP in multibuffer mode, this option can be used
 to disable it.

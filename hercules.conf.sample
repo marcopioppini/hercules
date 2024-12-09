@@ -45,6 +45,8 @@ Interfaces = [
 
 # If the NIC/drivers support XDP in zerocopy mode, enabling it
 # will improve performance.
+# Zerocopy should be used automatically, if supported,
+# so there should be no need to set this option manually.
 XDPZeroCopy = true
 
 # Specify the NIC RX queue on which to receive packets
