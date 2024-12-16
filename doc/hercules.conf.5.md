@@ -49,7 +49,7 @@ The following general configuration options are available:
 
 **DefaultNumPaths**=*int*
 
-> Specify how many SCION path to use for data transfers.
+> Specify how many SCION paths to use for data transfers.
 > This is an upper limit, if fewer paths are available only those will be used.
 > This value may be overridden on a per-destination basis, see
 > *PER-DESTINATION OVERRIDES*.
@@ -103,7 +103,7 @@ The following general configuration options are available:
 > When setting this option, note that the file paths supplied by users will be
 > interpreted relative to this new directory.
 
-> Example: DropUser = "/mnt/data/"
+> Example: ChrootDir = "/mnt/data/"
 
 **EnablePCC**=*bool*
 
@@ -271,7 +271,7 @@ Example: The following set of rules specifies that
 *	For transfers to any other host in AS
 	*18-a:b:c*:
 
-	*	A payload length of 1400 should be used.
+	*	A payload length of 1400B should be used.
 
 Example:
 

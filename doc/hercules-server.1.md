@@ -12,7 +12,7 @@ HERCULES-SERVER(1) - General Commands Manual
 # DESCRIPTION
 
 **hercules-server**
-is the server component of the Hercules file transfer sytem.
+is the server component of the Hercules file transfer system.
 The server's task is to run the actual file transfers.
 The server receives tasks from the monitor and informs the monitor of
 transfer progress via a local Unix socket.

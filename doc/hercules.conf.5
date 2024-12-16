@@ -45,7 +45,7 @@ for more information.
 The following general configuration options are available:
 .Bl -tag -width Ds
 .It Ic DefaultNumPaths Ns = Ns Ar int
-Specify how many SCION path to use for data transfers.
+Specify how many SCION paths to use for data transfers.
 This is an upper limit, if fewer paths are available only those will be used.
 This value may be overridden on a per-destination basis, see
 .Sx PER-DESTINATION OVERRIDES .
@@ -89,7 +89,7 @@ for more information.
 When setting this option, note that the file paths supplied by users will be
 interpreted relative to this new directory.
 .Pp
-Example: DropUser = "/mnt/data/"
+Example: ChrootDir = "/mnt/data/"
 .It Ic EnablePCC Ns = Ns Ar bool
 Setting this option to
 .Ar false
@@ -236,7 +236,7 @@ For transfers to any other host in AS
 .Em 18-a:b:c :
 .Bl -bullet -compact
 .It
-A payload length of 1400 should be used.
+A payload length of 1400B should be used.
 .El
 .El
 .Pp

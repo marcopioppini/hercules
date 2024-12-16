@@ -70,7 +70,7 @@ Hence, you should ensure the specified user has the appropriate read/write permi
 If you omit this option, Hercules will run as root.
 See [the configuration documentation](doc/hercules.conf.5.md#CAVEATS) for a discussion of the security implications.
 
-See [hercules(5)](doc/hercules.conf.5.md) or the sample configuration file, [`hercules.conf.sample`](hercules.conf.sample) for an example illustrating all
+See [hercules.conf(5)](doc/hercules.conf.5.md) or the sample configuration file, [`hercules.conf.sample`](hercules.conf.sample) for an example illustrating all
 available configuration options.
 
 ### Starting Hercules
@@ -192,7 +192,7 @@ Depending on your performance requirements and your specific bottlenecks, the fo
 - Using XDP in zero-copy mode can substantially improve performance, but whether it is supported depends on the combination of network card and driver in your setup. Hercules will attempt to use zero-copy mode automatically, if it appears to be supported. Note that some network cards require updating drivers/firmware to enable zero-copy mode.
 
 - Using larger packets (jumbo frames) can also improve performance. Hercules supports jumbo frames up to a MTU of 9000 bytes. Note, however, that support for jumbo frames (via XDP multibuffer/fragments) requires at least kernel 6.6. On older versions the packet size is limited to 3000 bytes.
-  Further, support for jumbo frames in combination with zero-copy mode is device-dependent. To use jumbo frames on such a device, disable zero-copy in Hercules' file.
+  Further, support for jumbo frames in combination with zero-copy mode is device-dependent. To use jumbo frames on a device that does not support jumbo frames in zero-copy mode, disable zero-copy in Hercules' configuration file.
 
 - Increasing the number of worker threads via the option `NumThreads` can also improve performance.
 

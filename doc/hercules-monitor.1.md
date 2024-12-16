@@ -12,7 +12,7 @@ HERCULES-MONITOR(1) - General Commands Manual
 # DESCRIPTION
 
 **hercules-monitor**
-is the monitor component of the Hercules file transfer sytem.
+is the monitor component of the Hercules file transfer system.
 The monitor is the link between users and the Hercules server.
 Users interact with the monitor via its HTTP API.
 The monitor interacts with the server component via a local Unix socket.
