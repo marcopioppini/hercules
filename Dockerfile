@@ -8,7 +8,7 @@ ARG UID=1001
 ARG GID=1001
 
 # to avoid interactive timezone query
-ENV TZ Europe/Zürich
+ENV TZ UTC
 ENV DEBIAN_FRONTEND noninteractive
 
 # install cgo-related dependencies
