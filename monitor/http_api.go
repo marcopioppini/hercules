@@ -167,8 +167,10 @@ func http_status(w http.ResponseWriter, r *http.Request) {
 // Dump info on all transfers for dashboard
 // GET Params: None
 // Returns OK num_transfers \n
-// then, line-by-line: id status state err seconds_elapsed chucks_acked
-// TODO: not documented
+// then, line-by-line: id status state err seconds_elapsed chucks_acked src_file dst_file
+// BUG: Does not handle file names with spaces
+// TODO: funciton not documented
+// XXX: maybe copy transfers map, add a "key", remove old transfers after a while
 func http_alltransfers(w http.ResponseWriter, r *http.Request) {
 
 	transfersLock.Lock()
@@ -176,7 +178,8 @@ func http_alltransfers(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, fmt.Sprintf("OK %d\n", len(transfers)))
 
 	for	id, info := range transfers {
-		io.WriteString(w, fmt.Sprintf("%d %d %d %d %d\n", id, info.status, info.state, info.err, info.time_elapsed, info.bytes_acked))
+		io.WriteString(w, fmt.Sprintf("%d %d %d %d %d %d %s %s\n", id, info.status, info.state, info.err, info.time_elapsed, info.bytes_acked, info.file, info.destFile))
+		info.
 	}
 
 	transfersLock.Unlock()
