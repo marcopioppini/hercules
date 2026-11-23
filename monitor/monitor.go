@@ -167,6 +167,7 @@ func main() {
 	http.HandleFunc("/cancel", http_cancel)
 	http.HandleFunc("/server", http_server)
 	http.HandleFunc("/stat", http_stat)
+	http.HandleFunc("/alltransfers", http_alltransfers)
 	if config.MonitorHTTP != "disabled" {
 		go http.ListenAndServe(config.MonitorHTTP, nil)
 	}

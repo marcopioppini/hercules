@@ -164,6 +164,24 @@ func http_status(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, fmt.Sprintf("OK %d %d %d %d %d\n", info.status, info.state, info.err, info.time_elapsed, info.bytes_acked))
 }
 
+// Dump info on all transfers for dashboard
+// GET Params: None
+// Returns OK num_transfers \n
+// then, line-by-line: id status state err seconds_elapsed chucks_acked
+// TODO: not documented
+func http_alltransfers(w http.ResponseWriter, r *http.Request) {
+
+	transfersLock.Lock()
+
+	io.WriteString(w, fmt.Sprintf("OK %d\n", len(transfers)))
+
+	for	id, info := range transfers {
+		io.WriteString(w, fmt.Sprintf("%d %d %d %d %d\n", id, info.status, info.state, info.err, info.time_elapsed, info.bytes_acked))
+	}
+
+	transfersLock.Unlock()
+}
+
 // Handle cancelling a transfer
 // GET Params:
 // id: An ID obtained by submitting a transfer
