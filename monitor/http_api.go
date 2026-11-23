@@ -179,7 +179,6 @@ func http_alltransfers(w http.ResponseWriter, r *http.Request) {
 
 	for	id, info := range transfers {
 		io.WriteString(w, fmt.Sprintf("%d %d %d %d %d %d %s %s\n", id, info.status, info.state, info.err, info.time_elapsed, info.bytes_acked, info.file, info.destFile))
-		info.
 	}
 
 	transfersLock.Unlock()
