@@ -51,7 +51,7 @@ install: all
 	install $(TARGET_HCP) $(DESTDIR)$(PREFIX)/bin/
 
 	install -d $(DESTDIR)$(PREFIX)/etc/
-	install hercules.conf $(DESTDIR)$(PREFIX)/etc/
+	test -e $(DESTDIR)$(PREFIX)/etc/hercules.conf || install hercules.conf $(DESTDIR)$(PREFIX)/etc/
 
 	install -d $(DESTDIR)$(PREFIX)/share/doc/hercules/
 	install hercules.conf.sample $(DESTDIR)$(PREFIX)/share/doc/hercules/
