@@ -3497,6 +3497,23 @@ static void new_tx_if_available(struct hercules_server *server) {
 	atomic_store(&server->sessions_tx[session_slot], session);
 }
 
+// Bytes acknowledged by the receiver so far. Both factors are u32, so widen
+// before multiplying: the product exceeds 32 bits for files of 4 GiB or more.
+static u64 tx_bytes_acked(const struct sender_state *tx_state) {
+	return (u64)tx_state->chunklen * (u64)tx_state->acked_chunks.num_set;
+}
+
+// Seconds the transfer has been running: from the start of the data transfer
+// until it stopped (end_time), or until now if it is still running. 0 if the
+// transfer never got past the handshake.
+static u64 tx_seconds_elapsed(const struct sender_state *tx_state, u64 now) {
+	if (tx_state->start_time == 0) {
+		return 0;
+	}
+	u64 end = tx_state->end_time != 0 ? tx_state->end_time : now;
+	return (end - tx_state->start_time) / (u64)1e9;
+}
+
 // Remove and free finished sessions
 static void cleanup_finished_sessions(struct hercules_server *server, int s, u64 now) {
 	// Wait for twice the session timeout before removing the finished
@@ -3506,9 +3523,8 @@ static void cleanup_finished_sessions(struct hercules_server *server, int s, u64
 	struct hercules_session *session_tx = atomic_load(&server->sessions_tx[s]);
 	if (session_tx && session_tx->state == SESSION_STATE_DONE) {
 		if (now > session_tx->last_pkt_rcvd + session_timeout * 2) {
-			u64 sec_elapsed = (now - session_tx->last_pkt_rcvd) / (int)1e9;
-			u64 bytes_acked = session_tx->tx_state->chunklen *
-							  session_tx->tx_state->acked_chunks.num_set;
+			u64 sec_elapsed = tx_seconds_elapsed(session_tx->tx_state, now);
+			u64 bytes_acked = tx_bytes_acked(session_tx->tx_state);
 			// OK to ignore return value: We're done with the transfer and don't
 			// care if the monitor wants us to stop it
 			monitor_update_job(server->usock, session_tx->jobid,
@@ -3828,9 +3844,9 @@ static void stop_finished_sessions(struct hercules_server *server, int slot,
 		session_tx->error != SESSION_ERROR_NONE) {
 		fprintf(stderr, "Stopping TX %d\n", slot);
 		session_tx->state = SESSION_STATE_DONE;
-		u64 sec_elapsed = (now - session_tx->last_pkt_rcvd) / (int)1e9;
-		u64 bytes_acked = session_tx->tx_state->chunklen *
-						  session_tx->tx_state->acked_chunks.num_set;
+		session_tx->tx_state->end_time = now;
+		u64 sec_elapsed = tx_seconds_elapsed(session_tx->tx_state, now);
+		u64 bytes_acked = tx_bytes_acked(session_tx->tx_state);
 		// OK to ignore return value: We're done with the transfer and don't
 		// care if the monitor wants us to stop it
 		monitor_update_job(server->usock, session_tx->jobid, session_tx->state,
