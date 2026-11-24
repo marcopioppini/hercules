@@ -177,6 +177,7 @@ type transferInfo struct {
 	SrcFile     string `json:"src_file"`
 	DstFile     string `json:"dst_file"`
 	Dest        string `json:"dest"` // destination SCION address
+	Paths		[]string `json:"paths"`
 }
 
 // Dump info on all transfers for dashboard
@@ -188,6 +189,10 @@ func http_alltransfers(w http.ResponseWriter, r *http.Request) {
 	transfersLock.Lock()
 	list := make([]transferInfo, 0, len(transfers))
 	for id, info := range transfers {
+		paths := []string{}
+		for _, p := range info.pm.dst.paths {
+			paths = append(paths, fmt.Sprintf("%s", p.path))
+		}
 		list = append(list, transferInfo{
 			ID:          id,
 			Status:      int(info.status),
@@ -198,6 +203,7 @@ func http_alltransfers(w http.ResponseWriter, r *http.Request) {
 			SrcFile:     info.file,
 			DstFile:     info.destFile,
 			Dest:        info.dest.String(),
+			Paths:		 paths,
 		})
 	}
 	transfersLock.Unlock()
