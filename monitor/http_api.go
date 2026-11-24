@@ -15,12 +15,14 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"syscall"
 
@@ -164,24 +166,51 @@ func http_status(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, fmt.Sprintf("OK %d %d %d %d %d\n", info.status, info.state, info.err, info.time_elapsed, info.bytes_acked))
 }
 
+// One entry of the /alltransfers response
+type transferInfo struct {
+	ID          int    `json:"id"`
+	Status      int    `json:"status"`       // TransferStatus
+	State       int    `json:"state"`        // session_state, see errors.h
+	Error       int    `json:"error"`        // session_error, see errors.h
+	TimeElapsed int    `json:"time_elapsed"` // seconds
+	BytesAcked  int    `json:"bytes_acked"`
+	SrcFile     string `json:"src_file"`
+	DstFile     string `json:"dst_file"`
+	Dest        string `json:"dest"` // destination SCION address
+}
+
 // Dump info on all transfers for dashboard
 // GET Params: None
-// Returns OK num_transfers \n
-// then, line-by-line: id status state err seconds_elapsed chucks_acked src_file dst_file
-// BUG: Does not handle file names with spaces
-// TODO: funciton not documented
+// Returns a JSON object {"transfers": [...]}, one entry per transfer known to
+// the monitor (see transferInfo), sorted by id.
 // XXX: maybe copy transfers map, add a "key", remove old transfers after a while
 func http_alltransfers(w http.ResponseWriter, r *http.Request) {
-
 	transfersLock.Lock()
-
-	io.WriteString(w, fmt.Sprintf("OK %d\n", len(transfers)))
-
-	for	id, info := range transfers {
-		io.WriteString(w, fmt.Sprintf("%d %d %d %d %d %d %s %s\n", id, info.status, info.state, info.err, info.time_elapsed, info.bytes_acked, info.file, info.destFile))
+	list := make([]transferInfo, 0, len(transfers))
+	for id, info := range transfers {
+		list = append(list, transferInfo{
+			ID:          id,
+			Status:      int(info.status),
+			State:       int(info.state),
+			Error:       int(info.err),
+			TimeElapsed: info.time_elapsed,
+			BytesAcked:  info.bytes_acked,
+			SrcFile:     info.file,
+			DstFile:     info.destFile,
+			Dest:        info.dest.String(),
+		})
 	}
-
 	transfersLock.Unlock()
+
+	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
+
+	w.Header().Set("Content-Type", "application/json")
+	err := json.NewEncoder(w).Encode(struct {
+		Transfers []transferInfo `json:"transfers"`
+	}{list})
+	if err != nil {
+		fmt.Println("Error encoding transfer list:", err)
+	}
 }
 
 // Handle cancelling a transfer
